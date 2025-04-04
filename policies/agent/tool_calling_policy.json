@@ -1,0 +1,4 @@
+{
+    "allow_custom_system_prompt": false,
+    "allowed_models": ["llama3.2:latest", "llama3.2:1b", "llama3.1:8b"]
+}

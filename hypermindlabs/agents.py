@@ -1,0 +1,1055 @@
+##########################################################################
+#                                                                        #
+#  This file (agents.py) contains the agents modules for Hypermind Labs  #
+#                                                                        #
+#  Created by:  Jessie W                                                 #
+#  Github: jessiepdx                                                     #
+#  Contributors:                                                         #
+#      Robit                                                             #
+#  Created: February 1st, 2025                                           #
+#  Modified: April 3rd, 2025                                             #
+#                                                                        #
+##########################################################################
+
+
+###########
+# IMPORTS #
+###########
+
+from datetime import datetime, timedelta, timezone
+import json
+import logging
+import requests
+from hypermindlabs.utils import (
+    ChatHistoryManager, 
+    ConfigManager, 
+    ConsoleColors, 
+    KnowledgeManager, 
+    UsageManager, 
+    MemberManager
+)
+from ollama import AsyncClient, ChatResponse, Message
+from pydantic import BaseModel
+
+# Tweepy logic eventual goes into the Twitter / X UI code
+import tweepy
+import tweepy.asynchronous
+
+
+
+###########
+# GLOBALS #
+###########
+
+chatHistory = ChatHistoryManager()
+config = ConfigManager()
+knowledge = KnowledgeManager()
+members = MemberManager()
+toolInference = config._instance.inference.get("tool")
+chatInference = config._instance.inference.get("chat")
+usage = UsageManager()
+
+# Enable logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+
+logger = logging.getLogger(__name__)
+
+# Set timezone for time
+timezone(-timedelta(hours=7), "Pacific")
+
+
+
+################
+# ORCHESTRATOR #
+################
+
+class ConversationOrchestrator:
+    _messages = list()
+    
+    def __init__(self, message: str, memberID: int, context: dict=None, messageID: int=None, options: dict=None):
+        
+        # Get member data to 
+        ## A. Make sure they exist in the DB
+        ## B. Use member information in context
+        self._memberData = members.getMemberByID(memberID)
+        self._message = message
+        self._messageID = messageID
+        #self._context = context
+        self._options = options
+
+        # Check the context and get a short collection of recent chat history into the orchestrator's messages list
+        self._chatHostID = None if context is None else context.get("chat_host_id")
+        self._chatType = None if context is None else context.get("chat_type")
+        self._communityID = None if context is None else context.get("community_id")
+        self._platform = None if context is None else context.get("platform")
+        self._topicID = None if context is None else context.get("topic_id")
+
+        if self._chatHostID is None:
+            if self._communityID is None:
+                self._chatHostID = memberID
+                self._chatType = "member"
+            else:
+                self._chatHostID = self._communityID
+                self._chatType = "community"
+
+        # Get the most recent chat history records for the given context
+        availablePlatforms = ["cli", "telegram"]
+        availableChatTypes = ["member", "community"]
+        if self._platform in availablePlatforms and self._chatType in availableChatTypes:
+            shortHistory = chatHistory.getChatHistory(self._chatHostID, self._chatType, self._platform, self._topicID, limit=20)
+            for historyMessage in shortHistory:
+                role = "assistant" if historyMessage.get("member_id") is None else "user"
+                content = historyMessage.get("message_text")
+                self._messages.append(Message(role=role, content=content))
+
+            # If no message ID provided, increment one from the last message's id
+            if self._messageID is None:
+                self._messageID = 1 if not shortHistory else shortHistory[-1].get("message_id")
+                self._responseID = self._messageID + 1
+                
+        # Add the newest message to local list and the database
+        newMessage = Message(role="user", content=message)
+        self._messages.append(newMessage)
+        # Need to update this to pass all the available context, such as community_id, topic_id... even if None
+        self._promptHistoryID = chatHistory.addChatHistory(
+            messageID=self._messageID, 
+            messageText=self._message, 
+            platform=self._platform, 
+            memberID=memberID, 
+            communityID=self._communityID,
+            chatHostID=self._chatHostID,
+            topicID=self._topicID
+        )
+
+        # TODO Check options and pass to agents if necessary
+        
+    
+    async def runAgents(self):
+        # Create all the agent calls in the flow as methods to call, each handles the messages passed to the actual agent
+        # Make a copy of the local messages list and add the known context data. 
+        # "Known Context is only in the message history for the analysis agent"
+        analysisMessages = self._messages.copy()
+        # Create a pseudo tool call with the known context
+        knownContext = {
+            "tool_name": "Known Context",
+            "tool_results": {
+                "user_interface": self._platform,
+                "member_first_name": self._memberData.get("first_name"),
+                "telegram_username": self._memberData.get("username"),
+                "chat_type": self._chatType,
+                "timestamp": datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+            }
+        }
+        
+        analysisMessages.append(Message(role="tool", content=json.dumps(knownContext)))
+        self._analysisAgent = MessageAnalysisAgent(analysisMessages)
+        self._analysisResponse = await self._analysisAgent.generateResponse()
+
+        analysisResponseMessage = ""
+        
+        print(f"{ConsoleColors["purple"]}Analysis Agent > ", end="")
+        chunk: ChatResponse
+        async for chunk in self._analysisResponse:
+            # Call the streaming response method. This is intended to be over written by the UI for cutom handling
+            self.streamingResponse(streamingChunk=chunk.message.content)
+            analysisResponseMessage = analysisResponseMessage + chunk.message.content
+            if chunk.done:
+                self._analysisStats = {
+                    "total_duration": chunk.total_duration,
+                    "load_duration": chunk.load_duration,
+                    "prompt_eval_count": chunk.prompt_eval_count,
+                    "prompt_eval_duration": chunk.prompt_eval_duration,
+                    "eval_count": chunk.eval_count,
+                    "eval_duration": chunk.eval_duration,
+                }
+
+        print(ConsoleColors["default"])
+        
+        # TODO Just send the last USER message to the tools followed by the thoughts from analysis agent
+        self._toolsAgent = ToolCallingAgent(self._messages)
+        toolResponses = await self._toolsAgent.generateResponse()
+        # Non Streaming results
+        # Waited to add the analysis agents response to chat history because it throws off the tool calling agent
+        analysisMessage = Message(role="tool",content=analysisResponseMessage)
+        self._messages.append(analysisMessage)
+
+        for toolResponse in toolResponses:
+            self._messages.append(Message(role="tool", content=json.dumps(toolResponse)))
+        
+        # TODO Tools to thoughts "thinking" agent next, will produce thoughts based analysis and tool responses, outputs thoughts followed by a prompt
+        
+        # TODO Passes only the prompt to the response agent
+        # Pass options=options to override the langauge model
+
+        self._chatConversationAgent = ChatConversationAgent(messages=self._messages)
+        response = await self._chatConversationAgent.generateResponse()
+
+        responseMessage = ""
+        
+        print(f"{ConsoleColors["blue"]}Assistant > ", end="")
+        chunk: ChatResponse
+        async for chunk in response:
+            self.streamingResponse(streamingChunk=chunk.message.content)
+            responseMessage = responseMessage + chunk.message.content
+            if chunk.done:
+                self._devStats = {
+                    "total_duration": chunk.total_duration,
+                    "load_duration": chunk.load_duration,
+                    "prompt_eval_count": chunk.prompt_eval_count,
+                    "prompt_eval_duration": chunk.prompt_eval_duration,
+                    "eval_count": chunk.eval_count,
+                    "eval_duration": chunk.eval_duration,
+                }
+
+        self._chatResponseMessage = responseMessage
+        print(ConsoleColors["default"])
+
+        if hasattr(self, "_responseID"):
+            print("autogen response ID, store message")
+            self.storeResponse(self._responseID)
+        
+        assistantMessage = Message(role="assistant", content=responseMessage)
+        # Add the final response to the overall chat history (role ASSISTANT)
+        self._messages.append(assistantMessage)
+
+        return responseMessage
+
+    def storeResponse(self, messageID: int=None):
+        responseID = messageID if messageID is not None else self._messageID + 1
+        self._responseHistoryID = chatHistory.addChatHistory(
+            messageID=responseID, 
+            messageText=self._chatResponseMessage, 
+            platform=self._platform, 
+            memberID=None, 
+            communityID=self._communityID,
+            chatHostID=self._chatHostID, 
+            topicID=self._topicID
+        )
+    
+    def streamingResponse(self, streamingChunk: str):
+        return
+
+    @property
+    def messages(self):
+        return self._messages
+    
+    @property
+    def messageID(self):
+        return self._messageID
+    
+    @property
+    def promptHistoryID(self):
+        return self._promptHistoryID
+    
+    @property
+    def responseHistoryID(self):
+        return self._responseHistoryID
+    
+    @property
+    def stats(self):
+        # Eventually add up the stats from all agents
+        return self._devStats
+
+
+
+##################
+# POLICY MANAGER #
+##################
+
+# TODO Need to create a Policy Manager that will load the agent's policy and allow for edits and save edits to file
+# Perhaps policy manager belongs in utils?
+
+
+
+###############
+# AGENT TOOLS #
+###############
+
+def braveSearch(queryString: str, count: int = 5) -> list:
+    """
+    Search the web using Brave search API
+
+    Args:
+        queryString (str): The search query to look up
+        count (int): (Optional) The number of search results to return. Defaults to 5
+
+    Returns:
+        list: A list of JSON structures containing the search result details
+    """
+    brave_key = config._instance.brave_keys
+    braveUrl = "https://api.search.brave.com/res/v1/web/search"
+    braveHeaders = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": brave_key
+    }
+
+    queryParams = {
+        "q": queryString,
+        "count": count,
+        "result_filter": "web"
+    }
+    results = requests.get(url=braveUrl, params=queryParams, headers=braveHeaders)
+    braveResults = results.json()
+
+    if braveWebResults := braveResults.get("web"):
+        webResultsList = list()
+        for webResult in braveWebResults.get("results"):
+            webSearchData = {k: webResult[k] for k in webResult.keys() if k in ["title", "url", "description", "extra_snippets"]}
+            webResultsList.append(webSearchData)
+    
+        return webResultsList
+    
+    return None
+
+
+# Need to limit this only search within the context of the current conversation
+def chatHistorySearch(queryString: str, count: int = 2) -> list:
+    """
+    Search the chat history database for a vector match on text. 
+
+    Args:
+        queryString (str): The search query to look up related messages in the chat history
+        count (int): (Optional) The number of search results to return. Defaults to 1
+
+    Returns:
+        list: A list of search results. Each search result is a JSON structure
+    """
+
+    # Need to limit this only search within the context of the current conversation
+    results = chatHistory.searchChatHistory(text=queryString, limit=1)
+    print(results)
+    
+    convertedResults = list()
+    for result in results:
+        chatHistoryRecord = dict()
+        for key, value in result.items():
+            chatHistoryRecord[key] = value.strftime("%Y-%m-%d %H:%M:%S") if key == "message_timestamp" else value
+
+        convertedResults.append(chatHistoryRecord)
+
+    return convertedResults
+
+
+def knowledgeSearch(queryString: str, count: int = 2) -> list:
+    """
+    Search the knowledge database for a vector match on text. 
+    Knowledge database contains information specific to the following topics: 
+    Hypermind Labs, Dropbear Robot, the Egg and mini Egg project.
+
+    Args:
+        queryString (str): The search query to look up related documents
+        count (int): (Optional) The number of search results to return. Defaults to 2
+
+    Returns:
+        list: A list of search results. Each search result is a JSON structure
+    """
+
+    results = knowledge.searchKnowledge(text=queryString, limit=count)
+    convertedResults = list()
+    for result in results:
+        knowledgeRecord = dict()
+        for key, value in result.items():
+            knowledgeRecord[key] = value.strftime("%Y-%m-%d %H:%M:%S") if key == "record_timestamp" else value
+
+        convertedResults.append(knowledgeRecord)
+    
+    return convertedResults
+
+
+#########################
+# MANUALLY DEFINE TOOLS #
+#-----------------------#
+
+# Even though function names alone can be passed to Ollama,
+# this will aid in validating arguments generated by tool calling agents.
+
+# Manually defining knowledge tool so that the description value can be dynamic
+toolDesc = """Search the knowledge database for a vector match on text. 
+Knowledge database contains information specific to the following topics:  """
+
+knowledgeTool = {
+    "type": "function",
+    "function": {
+        "name": "knowledgeSearch",
+        "description": toolDesc + str(", ".join(config.knowledgeDomains)),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "queryString": {
+                    "type": "string",
+                    "description": "The search query to look up related documents"
+                },
+                "count": {
+                    "type": "int",
+                    "description": "The number of search results to return. Defaults to 2"
+                }
+            },
+            "required": ["queryString"]
+        }
+    }
+}
+
+print(knowledgeTool)
+
+# Manually creating a skip tools tool so that the agent can decide not to use tools
+# This is a work around to some tool calling models calling a tool always
+skipTool = {
+  "type": 'function',
+  "function": {
+    "name": "skipTools",
+    "description": "This tool allows you to skip calling any other tools and move on to the next agent.",
+  }
+}
+
+# This is for validating the functions returned by tool calling agents exist
+available_functions = {
+  "braveSearch": braveSearch,
+  "chatHistorySearch": chatHistorySearch,
+  "knowledgeSearch": knowledgeSearch
+}
+
+
+
+################
+# BEGIN AGENTS #
+################
+
+class ToolCallingAgent():
+    # Defaults (in case of policy load failure)
+    _host = toolInference.get("url")
+
+    def __init__(self, messages: list, options: dict=None):
+        logger.info(f"New instance of the tool calling agent.")
+        
+        # Over write defaults with loaded policy
+        agentName = "tool_calling"
+        # TODO have defaults to use if policy fails to load or missing key values
+        policy = loadAgentPolicy(agentName)
+        self._systemPrompt = loadAgentSystemPrompt(agentName)
+        self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
+        self._allowed_models = policy.get("allowed_models")
+        self._model = self._allowed_models[0]
+
+        # Check for options passed and if policy allows for those options
+        if options:
+            modelRequested = options.get("model_requested")
+            if modelRequested in self._allowed_models:
+                self._model = modelRequested
+
+        self._ollamaClient = AsyncClient(host=self._host)
+
+        self._messages = list()
+        systemPrompt = Message(role="system", content=self._systemPrompt)
+        self._messages.append(systemPrompt)
+        # Only allow system messages in passed messages container if the policy allows for a system prompt override
+        if self._allowCustomSystemPrompt:
+            self._messages += messages
+        else:
+            histMessage: Message
+            self._messages += [histMessage for histMessage in messages if histMessage.role != "system"]   
+
+    async def generateResponse(self):
+        logger.info(f"Generate a response for the tool calling agent.")
+
+        self._response: ChatResponse = await self._ollamaClient.chat(
+            model=self._model, 
+            messages=self._messages,
+            stream=False,
+            tools=[braveSearch, chatHistorySearch, knowledgeSearch, skipTool]
+        )
+        toolResults = list()
+        
+        if self._response.message.tool_calls:
+            for tool in self._response.message.tool_calls:
+                # TODO replace below with the following: toolCaller(function_to_call, args_to_call) once that function is built
+                # Ensure the function is available, and then call it
+                if function_to_call := available_functions.get(tool.function.name):
+                    print('Calling function:', tool.function.name)
+                    print('Arguments:', tool.function.arguments)
+                    toolArgs = tool.function.arguments if tool.function.arguments.get("properties") is None else tool.function.arguments.get("properties")
+                    
+                    output = function_to_call(**toolArgs)
+                    toolResult = {
+                        "tool_name": tool.function.name,
+                        "tool_results" : output
+                    }
+                    toolResults.append(toolResult)
+                else:
+                    print('Function', tool.function.name, 'not found')
+        
+        return toolResults
+    
+    @property
+    def messages(self):
+        return self._messages
+
+
+class MessageAnalysisAgent():
+    # Defaults (in case of policy load failure)
+    _host = toolInference.get("url")
+
+    def __init__(self, messages: list, options: dict=None):
+        logger.info(f"New instance of the message analysis agent.")
+        
+        # Over write defaults with loaded policy
+        agentName = "message_analysis"
+        # TODO have defaults to use if policy fails to load or missing key values
+        policy = loadAgentPolicy(agentName)
+        self._systemPrompt = loadAgentSystemPrompt(agentName)
+        self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
+        self._allowed_models = policy.get("allowed_models")
+        self._model = self._allowed_models[0]
+
+        # Check for options passed and if policy allows for those options
+        if options:
+            modelRequested = options.get("model_requested")
+            if modelRequested in self._allowed_models:
+                self._model = modelRequested
+
+        self._ollamaClient = AsyncClient(host=self._host)
+
+        self._messages = list()
+        systemPrompt = Message(role="system", content=self._systemPrompt)
+        self._messages.append(systemPrompt)
+        # Only allow system messages in passed messages container if the policy allows for a system prompt override
+        if self._allowCustomSystemPrompt:
+            self._messages += messages
+        else:
+            histMessage: Message
+            self._messages += [histMessage for histMessage in messages if histMessage.role != "system"]
+        
+    async def generateResponse(self):
+        logger.info(f"Generate a response for the message analysis agent.")
+        
+        self._response = await self._ollamaClient.chat(
+            model=self._model, 
+            messages=self._messages,
+            stream=True,
+            format="json"
+        )
+        
+        return self._response
+    
+    @property
+    def messages(self):
+        return self._messages
+
+
+class DevTestAgent():
+    # Defaults (in case of policy load failure)
+    _host = chatInference.get("url")
+
+    def __init__(self, messages: list, options: dict=None):
+        logger.info(f"New instance of the dev test agent.")
+        
+        # Over write defaults with loaded policy
+        agentName = "dev_test"
+        # TODO have defaults to use if policy fails to load or missing key values
+        policy = loadAgentPolicy(agentName)
+        self._systemPrompt = loadAgentSystemPrompt(agentName)
+        self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
+        self._allowed_models = policy.get("allowed_models")
+        self._model = self._allowed_models[0]
+
+        # Check for options passed and if policy allows for those options
+        if options:
+            modelRequested = options.get("model_requested")
+            if modelRequested in self._allowed_models:
+                self._model = modelRequested
+
+        # TODO Create the ollamaClient based on the policy
+        self._ollamaClient = AsyncClient(host=self._host)
+
+        # TODO Check to see if policy allows for system prompt overrides
+
+        self._messages = list()
+        systemPrompt = Message(role="system", content=self._systemPrompt)
+        self._messages.append(systemPrompt)
+        # Only allow system messages in passed messages container if the policy allows for a system prompt override
+        if self._allowCustomSystemPrompt:
+            self._messages += messages
+        else:
+            histMessage: Message
+            self._messages += [histMessage for histMessage in messages if histMessage.role != "system"]
+        
+    async def generateResponse(self):
+        logger.info(f"Generate a response for the dev test agent.")
+        
+        self._response = await self._ollamaClient.chat(
+            model=self._model, 
+            messages=self._messages,
+            stream=True
+        )
+        
+        return self._response
+    
+    @property
+    def messages(self):
+        return self._messages
+
+
+class ChatConversationAgent():
+    # Defaults (in case of policy load failure)
+    _host = chatInference.get("url")
+
+    def __init__(self, messages: list, options: dict=None):
+        logger.info(f"New instance of the chat conversation agent.")
+        
+        # Over write defaults with loaded policy
+        agentName = "chat_conversation"
+        # TODO have defaults to use if policy fails to load or missing key values
+        policy = loadAgentPolicy(agentName)
+        self._systemPrompt = loadAgentSystemPrompt(agentName)
+        self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
+        self._allowed_models = policy.get("allowed_models")
+        self._model = self._allowed_models[0]
+
+        # Check for options passed and if policy allows for those options
+        if options:
+            modelRequested = options.get("model_requested")
+            if modelRequested in self._allowed_models:
+                self._model = modelRequested
+
+        # TODO Create the ollamaClient based on the policy
+        self._ollamaClient = AsyncClient(host=self._host)
+
+        # TODO Check to see if policy allows for system prompt overrides
+
+        self._messages = list()
+        systemPrompt = Message(role="system", content=self._systemPrompt)
+        self._messages.append(systemPrompt)
+        # Only allow system messages in passed messages container if the policy allows for a system prompt override
+        if self._allowCustomSystemPrompt:
+            self._messages += messages
+        else:
+            histMessage: Message
+            self._messages += [histMessage for histMessage in messages if histMessage.role != "system"]
+        
+    async def generateResponse(self):
+        logger.info(f"Generate a response for the chat conversation agent.")
+        
+        self._response = await self._ollamaClient.chat(
+            model=self._model, 
+            messages=self._messages,
+            stream=True
+        )
+        
+        return self._response
+    
+    @property
+    def messages(self):
+        return self._messages
+
+
+
+####################
+# ORINGINAL AGENTS #
+####################
+
+class ConversationalAgent():
+    _documents = list()
+
+    def __init__(self, message_data: str, memberID: int):
+        logger.info(f"New instance of the conversational agent.")
+        self.messageData = message_data
+        self.fromUser = MemberManager().getMemberByID(memberID)
+
+    async def generateResponse(self):
+        logger.info(f"Generate a response for the conversational agent via async Ollama call.")
+        # This is passed to ollama for the messages array
+        messageHistory = []
+        # First add the system messages to messageHistory
+        messageHistory.append({
+            "role" : "system",
+            "content" : config.defaults["system_prompt"] + config.defaults["chat_sys_prompt"]
+        })
+        # Get chat history from new DB
+
+        communityID = self.messageData.get("community_id")
+        memberID = self.messageData.get("member_id")
+        chatHostID = communityID if communityID else memberID
+        if not chatHostID:
+            return
+        chatType = "community" if communityID else "member"
+        
+        platform = self.messageData.get("platform")
+        topicID = self.messageData.get("topic_id")
+        
+        chatHistoryResults = chatHistory.getChatHistoryWithSenderData(chatHostID, chatType, platform, topicID)
+        for history in chatHistoryResults:
+            contextJson = {
+                "sent_from" : {
+                    "first_name" : history.get("first_name"),
+                    "last_name" : history.get("last_name")
+                },
+                "sent_at" : history.get("message_timestamp").strftime("%Y-%m-%d %H:%M:%S")
+            }
+            messageContext = {
+                "role" : "tool",
+                "content" : json.dumps(contextJson)
+            }
+            messageHistory.append(messageContext)
+
+            historyMessage = {
+                "role" : "assistant" if history.get("member_id") is None else "user",
+                "content" : history.get("message_text")
+            }
+            messageHistory.append(historyMessage)
+
+        # Create new message entity
+
+        contextJson = {
+            "sent_from" : {
+                "username" : self.fromUser.get("username"),
+                "first_name" : self.fromUser.get("first_name"),
+                "last_name" : self.fromUser.get("last_name")
+            },
+            "sent_at" : datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        # Search the vectorDB if there is a knowledge db and add to contextJson
+        message = self.messageData.get("message_text")
+        wordCount = 0 if message is None else len(message.split(" "))
+        if wordCount > 6:
+            # Add the documents to the agent instance so the UI can access them and store retrieval records
+            self._documents = knowledge.searchKnowledge(message, limit=2)
+            knowledgeDocuments = list()
+            for doc in self._documents:
+                knowledgeDocuments.append(doc.get("knowledge_document"))
+
+            contextJson["knowledge_documents"] = knowledgeDocuments
+        
+        # Add search results to the new message prompt
+        newContext = {
+            "role" : "tool",
+            "content" : json.dumps(contextJson)
+        }
+        messageHistory.append(newContext)
+        
+        newMessage = {
+            "role" : "user", 
+            "content" : message
+        }
+        # Add the new message to the messageHistory
+        messageHistory.append(newMessage)
+
+        logger.info(f"Message sent to Ollama:\n\n{newMessage}\n")
+
+        # Set additional Ollama options
+        ollamaOptions = {
+            "num_ctx" : 4096
+        }
+        
+        # Call the Ollama CHAT API
+        output = await AsyncClient(host=config.inference["chat"]["url"]).chat(
+            messages=messageHistory,
+            model=config.inference["chat"]["model"],
+            options=ollamaOptions,
+            stream=False
+        )
+
+        # Update the chat history database with the newest message
+        self.promptHistoryID = chatHistory.addChatHistory(
+            messageID=self.messageData.get("message_id"), 
+            messageText=self.messageData.get("message_text"), 
+            platform=platform, 
+            memberID=self.fromUser.get("member_id"), 
+            communityID=self.messageData.get("community_id"), 
+            topicID=self.messageData.get("topic_id"), 
+            timestamp=self.messageData.get("message_timestamp")
+        )
+
+        # Store the response
+        self.response = output["message"]["content"]
+        # Add the response to the chat history
+
+        # Store the statistics from Ollama
+        self.stats = {k: output[k] for k in ("total_duration", "load_duration", "prompt_eval_count", "prompt_eval_duration", "eval_count", "eval_duration", "created_at")}
+        
+        logger.info(f"Response from Ollama:\n\n{self.response}\n")
+        return self.response
+#good
+
+# TODO Add the prompt to chat history
+class ImageAgent():
+
+    def __init__(self, message_data: str, memberID):
+        logger.info(f"New instance of the image agent.")
+        self.fromUser = MemberManager().getMemberByID(memberID)
+        self.messageData = message_data
+        self.images = message_data.get("message_images")
+        self.text = message_data.get("message_text")
+
+    async def generateResponse(self):
+        logger.info(f"Generating a response for the image agent using Ollama async client.")
+        # This is passed to ollama for the messages array
+        messageHistory = []
+        # First add the system messages to messageHistory
+        messageHistory.append({
+            "role" : "system",
+            "content" : config.defaults["system_prompt"] + config.defaults["chat_sys_prompt"]
+        })
+
+        # Create new message entity
+        contextJson = {
+            "sent_from" : {
+                "username" : self.fromUser.get("username"),
+                "first_name" : self.fromUser.get("first_name"),
+                "last_name" : self.fromUser.get("last_name")
+            },
+            "sent_at" : datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        # Add search results to the new message prompt
+        newContext = {
+            "role" : "tool",
+            "content" : json.dumps(contextJson)
+        }
+
+        messageHistory.append(newContext)
+        
+        newMessage = {
+            "role" : "user", 
+            "content" : self.text,
+            "images" : self.images
+        }
+        
+        # Add the new message to the messageHistory
+        messageHistory.append(newMessage)
+
+        logger.info(f"Image sent to Ollama with the follwoing prompt:\n\n{self.text}\n")
+
+        output = await AsyncClient(host=config.inference["multimodal"]["url"]).chat(
+            model=config.inference["multimodal"]["model"], 
+            stream=False,
+            messages=messageHistory
+        )
+
+        # Store the response
+        self.response = output["message"]["content"]
+        # Store the statistics from Ollama
+        self.stats = {k: output[k] for k in ("total_duration", "load_duration", "prompt_eval_count", "prompt_eval_duration", "eval_count", "eval_duration", "created_at")}
+        
+        logger.info(f"Response from Ollama:\n\n{self.response}\n")
+
+        return self.response
+#good
+
+class TweetAgent():
+    systemPrompt = "You are an AI Agent that writes tweets for the X platform (formerly known as Twitter). You are using a premium account which has a charater limit of 25,000 characters so you can write tweets at longer than the standard 256 character limit! Your response should only be the tweet text and nothing else. "
+    systemPromptROKO = """You are the human voice of the ROKO Network, a cryptic, futuristic, and community-driven decentralized AI and robotics project focused on building networks for human-robot interaction and edge computing. Engage the Twitter community with cryptic, thought-provoking language infused with technical jargon, futuristic themes, and a hint of casual internet culture. Highlight the project's advancements in decentralized AI, blockchain, robotics, and edge computing while maintaining an air of mystery and exclusivity.
+
+Stylization
+
+Visionary and Ambitious: Speak with authority as a pioneer in decentralized AI and robotics. Inspire imagination while grounding ideas in technical relevance.
+Cryptic Yet Informative: Balance mystery with meaningful updates. Keep followers intrigued while ensuring they stay informed about project milestones.
+Tech-Savvy and Relatable: Use technical jargon strategically, paired with approachable internet slang.
+Exclusive and Community-Focused: Make the audience feel like insiders in a groundbreaking movement.
+Emojis as Symbols: Use 🕳️, 🐇, 🦾, 🔮, and others creatively to add intrigue and emphasize key ideas.
+
+
+Core Practices
+
+Stay Balanced: Every post should intrigue and inform. Tease cryptic ideas while ensuring relevant updates give followers a sense of progress.
+Encourage Engagement: Invite followers to participate actively in votes, discussions, or milestones.
+Keep Replies Short and Engaging: Spark curiosity and maintain a consistent tone.
+
+Key Objectives
+
+Keep followers feeling like insiders to the project's bold vision.
+Balance cryptic elements with relevant, transparent updates to maintain trust and engagement.
+Foster curiosity and enthusiasm, encouraging interaction without cluttered visuals or hashtags.
+
+DO NOT respond in JSON.
+DO NOT put quotes around the tweet."""
+
+    tweetText = None
+    messageHistory = []
+    
+    def __init__(self, message_data: str, from_user: dict):
+        logger.info(f"New instance of the tweet Agent.")
+        self.messageData = message_data
+        self.fromUser = from_user
+        self.tweetPrompt = message_data.get("tweet_prompt")
+        
+        # Start the message history with the system prompts
+        self.messageHistory.append({
+            "role" : "system",
+            "content" : self.systemPrompt + self.systemPromptROKO
+        })
+
+        
+    async def ComposeTweet(self) -> str:
+        logger.info(f"Composing Tweet.")
+        # Load the message history if there is a chat history
+        
+        chatID = self.messageData.get("chat_id")
+        topicID = self.messageData.get("topic_id")
+        ch = chatHistory.getChatHistory(chatID, topicID=topicID)
+        for record in ch:
+            contextJson = {
+                "sent_from" : {
+                    "username" : record.get("from_user").get("username"),
+                    "first_name" : record.get("from_user").get("first_name"),
+                    "last_name" : record.get("from_user").get("last_name")
+                },
+                "sent_at" : record.get("message_timestamp").strftime("%Y-%m-%d %H:%M:%S")
+            }
+            messageContext = {
+                "role" : "tool",
+                "content" : json.dumps(contextJson)
+            }
+            self.messageHistory.append(messageContext)
+            
+            historyMessage = {
+                "role" : record.get("from_user").get("role"),
+                "content" : record.get("message_text")
+            }
+            self.messageHistory.append(historyMessage)
+
+        # Search the vectorDB if there is a knowledge db and add to contextJson
+        prompt = self.messageData.get("tweet_prompt")
+        wordCount = 0 if prompt is None else len(prompt.split(" "))
+
+        if wordCount > 6:
+            documents = knowledge.searchKnowledge(prompt, limit=2)
+            knowledgeDocuments = list()
+            for doc in documents:
+                knowledgeDocuments.append(doc.get("knowledge_document"))
+
+            contextJson = {
+                "knowledge_documents": knowledgeDocuments
+            }
+
+            # Add search results to the new message prompt
+            newContext = {
+                "role" : "tool",
+                "content" : json.dumps(contextJson)
+            }
+
+            self.messageHistory.append(newContext)
+
+        newMessage = {
+            "role" : "user", 
+            "content" : self.tweetPrompt
+        }
+        
+        # Add the new message to the messageHistory
+        self.messageHistory.append(newMessage)
+
+        logger.info(f"Prompt sent to Ollama:\n\n{newMessage}\n")
+        
+        # Set additional Ollama options
+        ollamaOptions = {
+            "num_ctx" : 4096
+        }
+
+        output = await AsyncClient(host=config.inference["chat"]["url"]).chat(
+            keep_alive="15m",
+            messages=self.messageHistory,
+            model=config.inference["chat"]["model"],
+            options=ollamaOptions,
+            stream=False
+        )
+        responseText = output["message"]["content"]
+        logger.info(f"Response from Ollama:\n\n{responseText}\n")
+
+        responseMessage = {
+            "role" : "assistant",
+            "content" : responseText
+        }
+        self.messageHistory.append(responseMessage)
+
+        self.tweetText = responseText
+
+        return responseText
+    
+    async def ModifyTweet(self, newPrompt: str) -> str:
+        logger.info(f"Modify tweet.")
+
+        newMessage = {
+            "role" : "user", 
+            "content" : newPrompt
+        }
+        
+        # Add the new message to the messageHistory
+        self.messageHistory.append(newMessage)
+
+        logger.info(f"Prompt sent to Ollama:\n\n{newMessage}\n")
+        
+        output = await AsyncClient(host=config.inference["chat"]["url"]).chat(
+            model=config.inference["chat"]["model"], 
+            stream=False,
+            messages=self.messageHistory,
+            keep_alive="15m"
+        )
+        responseText = output["message"]["content"]
+        logger.info(f"Response from Ollama:\n\n{responseText}\n")
+
+        responseMessage = {
+            "role" : "assistant",
+            "content" : responseText
+        }
+        self.messageHistory.append(responseMessage)
+
+        self.tweetText = responseText
+
+        return responseText
+    
+    async def SendTweet(self):
+        logger.info(f"Send the tweet.")
+        print(self.tweetText)
+        
+        try:
+            client = tweepy.asynchronous.AsyncClient(
+                consumer_key=config.twitter_keys["consumer_key"],
+                consumer_secret=config.twitter_keys["consumer_secret"],
+                access_token=config.twitter_keys["access_token"],
+                access_token_secret=config.twitter_keys["access_token_secret"]
+            )
+            t = await client.create_tweet(text=self.tweetText)
+            print(t)
+            return t
+        except tweepy.errors.Forbidden:
+            logger.warning("Not authorized")
+        
+
+
+####################
+# HELPER FUNCTIONS #
+####################
+
+def loadAgentPolicy(policyName: str) -> dict:
+    logger.info(f"Loading agent policy for:  {policyName}")
+    policiesDir = "policies/agent/"
+    f = open(policiesDir + policyName + "_policy.json", "r")
+    policy_json = json.load(f)
+
+    return policy_json
+
+
+def loadAgentSystemPrompt(policyName: str) -> str:
+    logger.info(f"Loading agent system prompt for:  {policyName}")
+    systemPromptDir = "policies/agent/system_prompt/"
+    f = open(systemPromptDir + policyName + "_sp.txt", "r")
+    systemPrompt_txt = f.read()
+
+    return systemPrompt_txt
+
+
+def toolCaller(toolName: str, toolArgs: dict) -> dict:
+    """Validates the tool name and arguments generated by a tool calling agent.
+    Once validated, runs the tool with areguments and returns the results."""
+    logger.info("Tool Validator called")
+
+    # TODO Validate the tool name and arguments
+    # Look up tool DEFINITION
+    # Get the property names list and make a copy dict from passed ARGS with only the keys that exist in the tool definition
+    # Check new dict for the required properties are present
+
+    # run the tool with args if VALID and return the results
+
+    return dict()

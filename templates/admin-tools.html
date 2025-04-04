@@ -1,0 +1,36 @@
+{% extends "base-html.html" %}
+
+{% block title %}{{ contentData.title }}{% endblock %}
+
+{% block content %}
+<h3>Admin Tools stuff</h3>
+<p>More preprossing and out put here</p>
+{% endblock %}
+
+{% block rightTopPanel %}
+<div id="right-top-panel">
+    <div class="panel-header" onclick="panelMan.togglePanel('right');">
+    </div>
+    <div class="panel-content">
+        <b>Admin Tools</b> - all the community engagement display we want in the <i>top</i> panel
+    </div>
+    <div class="panel-footer">
+    </div>
+</div>
+{% endblock %}
+
+{% block rightBottomPanel %}
+<div id="right-bottom-panel">          
+    <div class="panel-header">
+    </div>
+    <div class="panel-content">
+        <b>Admin Tools</b> - all the community engagement display we want in the <i>bottom</i> panel
+    </div>
+    <div class="panel-footer">
+    </div>
+</div>
+{% endblock %}
+
+{% block footer %}
+A live updated <b>Admin Tools</b> feed
+{% endblock %}

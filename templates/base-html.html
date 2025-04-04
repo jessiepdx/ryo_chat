@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test page</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='base-style.css') }}" />
+    <link rel="shortcut icon" href="{{ url_for('static', filename='favicon.ico') }}" type="image/x-icon" />
+    
+    {% if memberData %}
+    <script>
+        // NOTE Jinja in javascript causes a linting error
+        const memberJSON = {{ memberData|tojson }};
+        // Store in session
+        sessionStorage.setItem("member_data", JSON.stringify(memberJSON));
+
+        function inputFocus(inp) {
+            if (inp.value == "none") {
+                inp.value = "";
+            }
+        }
+
+        async function validateInput(inputElement, type) {
+            console.log(inputElement);
+            const inputValue = inputElement.value;
+            const propertyName = inputElement.name;
+            console.log(propertyName);
+
+            const valid = member.validateData(inputValue, type); 
+            console.log(valid);
+
+            // Get the input feedback element
+            const inputContainer = inputElement.parentNode;
+            const inputFeedback = inputContainer.querySelector(".input-feedback");
+            if (valid) {
+                inputElement.style.color = "green";
+                inputFeedback.innerHTML = null;
+                
+                const storeBtn = document.createElement("button");
+                storeBtn.innerText = "store";
+                storeBtn.addEventListener("click", (event) => {
+                    member.storeData(inputValue, propertyName, type).then((results) => {
+                        if (results) {
+                            // Clear the feed
+                            inputFeedback.innerHTML = null;
+                            inputElement.style.color = "white";
+                            inputFeedback.style.display = "none";
+
+                            console.log(member)
+                        }
+                        else {
+                            // An error occured, update feedback div
+                        }
+                    });
+                });
+                const revertBtn = document.createElement("button");
+                revertBtn.innerText = "revert"
+                revertBtn.addEventListener("click", (event) => {
+                    console.log(event);
+                });
+
+                inputFeedback.appendChild(storeBtn);
+                inputFeedback.appendChild(revertBtn);
+            }
+            else {
+                inputElement.style.color = "red";
+                inputFeedback.innerHTML = null;
+                inputFeedback.innerText = "Invalid format";
+            }
+            
+            inputFeedback.style.display = "block";
+
+            // Get the field type that we are validating
+
+            // Validate with the data manager
+
+            // Handle UI based on valid / invalid
+        }
+
+    </script>
+    {% else %}
+    <script>
+        // Clear the previous session storage
+        sessionStorage.removeItem("member_data");
+
+        
+        // Login Code
+        // Flag to track if the password field is currently empty after deletion.
+        let passwordEmptyFlag = false;
+
+        function contentLoaded() {
+            // Get references to the form elements.
+            const loginForm = document.getElementById("login-form");
+            const usernameInput = loginForm.elements["username"];
+            const passwordInput = loginForm.elements["userpass"];
+            const submitLoginBtn = loginForm.elements["login-btn"];
+
+            // Click handler for the submit/next button.
+            submitLoginBtn.addEventListener("click", (event) => {
+                event.preventDefault();
+
+                // Check if we are in the email entry step.
+                if (usernameInput.style.display !== "none") {
+                    // Handle username input
+                    const username = usernameInput.value.trim();
+                    if (username === "") {
+                        alert("Please enter your username.");
+                        return;
+                    }
+
+                    // Validate the username input before moving forward
+
+                    // Show the password input
+                    usernameInput.style.display = "none";
+                    passwordInput.style.display = "inline-block";
+                    passwordInput.focus();
+                    submitLoginBtn.value = "Login";
+                    passwordEmptyFlag = true;
+                } else {
+                    // Handle the password input
+                    const password = passwordInput.value.trim();
+                    if (password === "") {
+                        alert("Please enter your password or press backspace to return to the email input.");
+                        return;
+                    }
+
+                    // Validate the password input before submitting
+
+                    loginForm.submit();
+                }
+            });
+
+            // Update password empty flag boolean
+            passwordInput.addEventListener("input", (event) => {
+                passwordEmptyFlag = passwordInput.value.length === 0;
+            });
+
+            // Listen for keydown events on the password field to handle backspace.
+            passwordInput.addEventListener("keydown", (event) => {
+                // Switch back to username if the user presses backspace on an empty password field
+                if (event.key === "Backspace" && passwordInput.value === "" && !event.repeat && passwordEmptyFlag) {
+                    event.preventDefault();
+
+                    // Show the username input
+                    usernameInput.style.display = "inline-block";
+                    passwordInput.style.display = "none";
+                    usernameInput.focus();
+                    submitLoginBtn.value = "Next";
+                }
+            });
+        }
+
+        
+        // Set up Callback Listeners
+        document.addEventListener("DOMContentLoaded", contentLoaded);
+    </script>
+    {% endif %}
+
+    <script type="module" src="{{ url_for('static', filename='base-javascript.js') }}"></script>
+    <script type="module">
+        import { PanelsManager, MenuManager } from "{{ url_for('static', filename='ui-managers.js') }}"
+        import { MemberData } from "{{ url_for('static', filename='data-managers.js') }}"
+
+        // Set the Panels and Menu Manager to the global window for access from within the HTML
+        // Due to module style javascript
+        window.panelMan = new PanelsManager();
+        window.menuMan = new MenuManager();
+        window.member = new MemberData();
+    </script>
+
+    {% block javascript %}
+
+    {% endblock %}
+</head>
+<body>
+    <div id="container">
+        <header>
+            <div onclick="location.href = '/';" id="logo">
+                <img src="/static/favicon.ico" style="height:100%;" alt="">
+            </div>
+            <div id="icons">
+                <nav id="account-btn" onclick="menuMan.buttonCallback(event);">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <script xmlns="" />
+                        <g id="System / Bar_Top">
+                            <path id="Vector"
+                                d="M18 19C18 16.7909 15.3137 15 12 15C8.68629 15 6 16.7909 6 19M12 12C9.79086 12 8 10.2091 8 8C8 5.79086 9.79086 4 12 4C14.2091 4 16 5.79086 16 8C16 10.2091 14.2091 12 12 12Z"
+                                stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round"
+                                stroke-linejoin="round" />
+                        </g>
+                    </svg>
+                </nav>
+                <nav id="menu-btn" onclick="menuMan.buttonCallback(event);">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <script xmlns="" />
+                        <g id="System / Bar_Top">
+                            <path id="Vector" d="M5 15H19M5 9H19" stroke="var(--accent-primary)" stroke-width="2"
+                                stroke-linecap="round" stroke-linejoin="round" />
+                        </g>
+                    </svg>
+                </nav>
+            </div>
+        </header>
+        <div id="panel-sections">
+            {% block leftPanel %}
+            <div id="left-panel" class="panel-section-left panel-no-footer">
+                <div class="panel-header" onclick="panelMan.togglePanel('left');">
+                </div>
+                <div class="panel-content">
+                    <p>Default</p>
+                    <p>Left</p>
+                    <p>Panel</p>
+                </div>
+                <div class="panel-footer footer-detached">
+                </div>
+            </div>
+            {% endblock %}
+
+            <div id="center-panel" class="panel-section-center">
+                {% if contentData %}
+                <div id="section-header" class="panel-header header-detached" onclick="toggle('center');">
+                    {% if contentData.sections %}
+                    <nav id="prevBtn">
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <script xmlns="" />
+                            <g id="Arrow / Chevron_Left">
+                                <path id="Vector" d="M15 19L8 12L15 5" stroke="var(--accent-primary)" stroke-width="2"
+                                    stroke-linecap="round" stroke-linejoin="round" />
+                            </g>
+                        </svg>
+                    </nav>
+                    <div id="section-title">
+                        <span>{{ contentData.title }} :: </span> <select>
+                            {% for section in contentData.sections %}
+                            <option>{{ section }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <nav id="nextBtn">
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <script xmlns="" />
+                            <g id="Arrow / Chevron_Right">
+                                <path id="Vector" d="M9 5L16 12L9 19" stroke="var(--accent-primary)" stroke-width="2"
+                                    stroke-linecap="round" stroke-linejoin="round" />
+                            </g>
+                        </svg>
+                    </nav>                    {% else %}
+                    <div id="section-title">
+                        <h3>{{ contentData.title }}</h3>
+                    </div>
+                    {% endif %}
+                </div>
+                {% else %}
+                <div class="panel-header header-detached" onclick="toggle('center');"></div>
+                {% endif %}
+                
+                
+                <div class="panel-content header-detached footer-detached">
+                    {% block content %}
+                    <h2>Center Panel Content</h2>
+                    <div class="row">
+                    <button type="button" onclick="panelMan.togglePanel('left');">left</button>
+                    <button type="button" onclick="panelMan.togglePanel('right');">right</button>
+                </div>
+                    {% endblock %}
+                </div>
+                <div class="panel-footer footer-detached">
+                    {% block footer %}
+                    {% endblock %}
+                </div>
+                
+            </div>
+
+            <div id="account-panel" class="panel-section-right ">
+                {% if memberData %}
+                <div id="account-top-panel" class="panel-no-header">
+                    <div class="panel-header"></div>
+                    <div class="panel-content profile-small">
+                        <div id="image-placeholder"></div>
+                        <div class="profile-big center"> {{ memberData["first_name"] }} {{ memberData["last_name"] }}</div>
+                        <div class="profile-data-row">
+                            <label for="tg-username">
+                                <svg class="icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none">
+                                    <g id="Communication / Paper_Plane">
+                                        <path id="Vector"
+                                            d="M10.3078 13.6923L15.1539 8.84619M20.1113 5.88867L16.0207 19.1833C15.6541 20.3747 15.4706 20.9707 15.1544 21.1683C14.8802 21.3396 14.5406 21.3683 14.2419 21.2443C13.8975 21.1014 13.618 20.5433 13.0603 19.428L10.4694 14.2461C10.3809 14.0691 10.3366 13.981 10.2775 13.9043C10.225 13.8363 10.1645 13.7749 10.0965 13.7225C10.0215 13.6647 9.93486 13.6214 9.76577 13.5369L4.57192 10.9399C3.45662 10.3823 2.89892 10.1032 2.75601 9.75879C2.63207 9.4601 2.66033 9.12023 2.83169 8.84597C3.02928 8.52974 3.62523 8.34603 4.81704 7.97932L18.1116 3.88867C19.0486 3.60038 19.5173 3.45635 19.8337 3.57253C20.1094 3.67373 20.3267 3.89084 20.4279 4.16651C20.544 4.48283 20.3999 4.95126 20.1119 5.88729L20.1113 5.88867Z"
+                                            stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round"
+                                            stroke-linejoin="round" />
+                                    </g>
+                                </svg>
+                            </label>
+                            <input type="text" id="tg-username" name="tg-username"
+                                placeholder="Add your Telegram username" value="{{ memberData['username'] }}" />
+                            <div class="input-feedback" style="display: none;"></div>
+                            <button>
+                                <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                    <script xmlns="" />
+                                    <g id="Arrow / Chevron_Right">
+                                        <path id="Vector" d="M9 5L16 12L9 19" stroke="var(--accent-primary)"
+                                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                                    </g>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="profile-data-row">
+                            <label for="x-username">
+                                <svg class="icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none">
+                                    <g xmlns="http://www.w3.org/2000/svg" id="Menu / Close_MD">
+                                        <path id="Vector" d="M18 18L12 12M12 12L6 6M12 12L18 6M12 12L6 18"
+                                            stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round"
+                                            stroke-linejoin="round" />
+                                    </g>
+                                </svg>
+
+                            </label>
+                            <input type="text" id="x-username" name="x-username" placeholder="Add your X username"
+                                value="" />
+                            <div class="input-feedback" style="display: none;"></div>
+                            <button>
+                                <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                    <script xmlns="" />
+                                    <g id="Arrow / Chevron_Right">
+                                        <path id="Vector" d="M9 5L16 12L9 19" stroke="var(--accent-primary)"
+                                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                                    </g>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="profile-data-row">
+                            <label for="member-email">
+                                <svg class="icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none">
+
+                                    <g id="Communication / Mail">
+                                        <path id="Vector"
+                                            d="M4 6L10.1076 10.6123L10.1097 10.614C10.7878 11.1113 11.1271 11.3601 11.4988 11.4562C11.8272 11.5412 12.1725 11.5412 12.501 11.4562C12.8729 11.36 13.2132 11.1105 13.8926 10.6123C13.8926 10.6123 17.8101 7.60594 20 6M3 15.8002V8.2002C3 7.08009 3 6.51962 3.21799 6.0918C3.40973 5.71547 3.71547 5.40973 4.0918 5.21799C4.51962 5 5.08009 5 6.2002 5H17.8002C18.9203 5 19.4796 5 19.9074 5.21799C20.2837 5.40973 20.5905 5.71547 20.7822 6.0918C21 6.5192 21 7.07899 21 8.19691V15.8036C21 16.9215 21 17.4805 20.7822 17.9079C20.5905 18.2842 20.2837 18.5905 19.9074 18.7822C19.48 19 18.921 19 17.8031 19H6.19691C5.07899 19 4.5192 19 4.0918 18.7822C3.71547 18.5905 3.40973 18.2842 3.21799 17.9079C3 17.4801 3 16.9203 3 15.8002Z"
+                                            stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round"
+                                            stroke-linejoin="round" />
+                                    </g>
+                                </svg>
+                            </label>
+                            <input type="text" id="member-email" name="member-email" placeholder="Add your email"
+                                value="{{ memberData['email'] }}" onchange="validateInput(this, 'email');"
+                                onfocus="inputFocus(this);" />
+                            <div class="input-feedback" style="display: none;"></div>
+                            <button>
+                                <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                    <script xmlns="" />
+                                    <g id="Arrow / Chevron_Right">
+                                        <path id="Vector" d="M9 5L16 12L9 19" stroke="var(--accent-primary)"
+                                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                                    </g>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="profile-data-row">
+                            <label for="member-roles">
+                                <svg class="icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none">
+                                        <g id="Warning / Wavy_Check">
+                                        <path id="Vector" d="M15 9.99981L11 13.9998L8.99995 11.9998M13.246 3.45879L14.467 4.49929C14.7746 4.76143 15.1566 4.91991 15.5594 4.95206L17.1585 5.0795C18.0986 5.15452 18.8453 5.9008 18.9204 6.84093L19.0475 8.44024C19.0797 8.8431 19.2387 9.22559 19.5008 9.53319L20.5409 10.7538C21.1526 11.4716 21.1527 12.5275 20.541 13.2454L19.5009 14.4662C19.2388 14.7738 19.08 15.1564 19.0478 15.5593L18.9199 17.1583C18.8449 18.0984 18.0993 18.8452 17.1591 18.9202L15.5595 19.0478C15.1567 19.08 14.7744 19.2381 14.4667 19.5002L13.246 20.5407C12.5282 21.1525 11.4717 21.1526 10.7539 20.5409L9.53316 19.5003C9.22555 19.2382 8.84325 19.0798 8.44038 19.0477L6.84077 18.9202C5.90064 18.8452 5.15505 18.0986 5.08003 17.1585L4.9521 15.5594C4.91995 15.1565 4.76111 14.7742 4.49898 14.4666L3.45894 13.2454C2.84721 12.5276 2.84693 11.472 3.45865 10.7542L4.49963 9.53301C4.76176 9.22541 4.91908 8.84311 4.95122 8.44024L5.07915 6.84112C5.15417 5.90099 5.90192 5.15442 6.84205 5.0794L8.43989 4.95196C8.84276 4.91981 9.22525 4.76146 9.53285 4.49932L10.754 3.45879C11.4718 2.84707 12.5282 2.84707 13.246 3.45879Z" stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                        </g>
+                                </svg>
+                            </label>
+                            <input disabled="disabled" type="text" id="member-roles" name="member-roles"
+                                value="{{ ', '.join(memberData['roles']) }}">
+                                <button style="opacity: 0;">
+                                    <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                        <script xmlns="" />
+                                        <g id="Arrow / Chevron_Right">
+                                            <path id="Vector" d="M9 5L16 12L9 19" stroke="var(--accent-primary)"
+                                                stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                                        </g>
+                                    </svg>
+                                </button>
+                        </div>
+                    </div>
+                    <div class="panel-footer button-bar">
+                        Member Details and Settings
+                    </div>
+                </div>
+                {% else %}
+                <div id="account-top-panel" class="panel-no-header">
+                    <div class="panel-header"></div>
+                    <div class="panel-content login-area">
+                        <h3>Login</h3>
+                        <form action="/login" id="login-form" method="post">
+                            <input id="username" placeholder="username" type="text" name="username" />
+                            <input id="userpass" placeholder="password" type="password" name="userpass" />
+                            <input id="submit-login" name="login-btn" type="submit" value="Next" />
+                        </form>
+                    </div>
+                    <div class="panel-footer">
+                    </div>
+                </div>
+                {% endif %}
+
+                <div id="account-bottom-panel" class="panel-no-header">
+                    <div class="panel-header"></div>
+                    <div class="panel-content">
+                        {% if memberData %}
+                        <p>Community Score: {{ memberData["community_score"] }} </p>
+                        {% endif %}
+                    </div>
+                    <div class="panel-footer button-bar" onclick="location.href = '/logout';">
+                        {% if memberData %}
+                        Logout
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+
+            <div id="main-menu-panel" class="panel-section-right ">
+                <div id="main-menu-top-panel" class="panel-no-header panel-no-footer">
+                    <div class="panel-header"></div>
+                    <div class="menu panel-content">
+                        {% if memberData %}
+                            {% for menuItem in menuData %}
+                            <a href="{{ menuItem.route }}"><div class="menu-item">{{ menuItem.title }}</div></a>
+                            {% endfor %}
+                        {% else %}
+                        <div class="menu-item">Sign up!</div>
+                        {% endif %}
+                        <div class="menu-item">About</div>
+                        <div class="menu-item">Contact</div>
+                    </div>
+                    <div class="panel-footer"></div>
+                </div>
+
+                <div id="main-menu-bottom-panel" class="panel-no-header">
+                    <div class="panel-header"></div>
+                    <div class="panel-content">
+                        
+                    </div>
+                    <div class="panel-footer icons-bar">
+                        <nav id="toggle-left-panel" onclick="panelMan.togglePanel('left');">
+                            <svg class="icon" viewBox="0 0 24 24"
+                                fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <script xmlns="" />
+                                <g id="System / Bar_Top">
+                                    <path id="Vector"
+                                        d="M9 20V4M9 20H16.8031C17.921 20 18.48 20 18.9074 19.7822C19.2837 19.5905 19.5905 19.2837 19.7822 18.9074C20 18.48 20 17.921 20 16.8031V7.19691C20 6.07899 20 5.5192 19.7822 5.0918C19.5905 4.71547 19.2837 4.40973 18.9074 4.21799C18.4796 4 17.9203 4 16.8002 4H9M9 20H7.19692C6.07901 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2837 4.21799 18.9074C4 18.4796 4 17.9203 4 16.8002V7.2002C4 6.08009 4 5.51962 4.21799 5.0918C4.40973 4.71547 4.71547 4.40973 5.0918 4.21799C5.51962 4 6.08009 4 7.2002 4H9"
+                                        stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round" />
+                                </g>
+                            </svg>
+                        </nav>
+                        <nav id="toggle-bottom-panel" onclick="panelMan.togglePanel('bottom');">
+                            <svg class="icon" viewBox="0 0 24 24"
+                                fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <script xmlns="" />
+                                <g xmlns="http://www.w3.org/2000/svg" id="System / Bar_Bottom">
+                                    <path id="Vector"
+                                        d="M20 15H4M20 15V7.19691C20 6.07899 20 5.5192 19.7822 5.0918C19.5905 4.71547 19.2837 4.40973 18.9074 4.21799C18.4796 4 17.9203 4 16.8002 4H7.2002C6.08009 4 5.51962 4 5.0918 4.21799C4.71547 4.40973 4.40973 4.71547 4.21799 5.0918C4 5.51962 4 6.08009 4 7.2002V15M20 15V16.8031C20 17.921 20 18.48 19.7822 18.9074C19.5905 19.2837 19.2837 19.5905 18.9074 19.7822C18.48 20 17.921 20 16.8031 20H7.19691C6.07899 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2837 4.21799 18.9074C4 18.4796 4 17.9203 4 16.8002V15"
+                                        stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round" />
+                                </g>
+                            </svg>
+                        </nav>
+                        <nav id="toggle-right-panel" onclick="menuMan.hideMenu(); panelMan.togglePanel('right');">
+                            <svg class="icon" viewBox="0 0 24 24"
+                                fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <script xmlns="" />
+                                <g id="System / Bar_Top">
+                                    <path id="Vector"
+                                        d="M15 4L15 20M15 4H7.2002C6.08009 4 5.51962 4 5.0918 4.21799C4.71547 4.40973 4.40973 4.71547 4.21799 5.0918C4 5.51962 4 6.08009 4 7.2002V16.8002C4 17.9203 4 18.4796 4.21799 18.9074C4.40973 19.2837 4.71547 19.5905 5.0918 19.7822C5.51921 20 6.07901 20 7.19694 20L15 20M15 4H16.8002C17.9203 4 18.4796 4 18.9074 4.21799C19.2837 4.40973 19.5905 4.71547 19.7822 5.0918C20 5.5192 20 6.079 20 7.19691L20 16.8031C20 17.921 20 18.48 19.7822 18.9074C19.5905 19.2837 19.2837 19.5905 18.9074 19.7822C18.48 20 17.921 20 16.8031 20H15"
+                                        stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round" />
+                                </g>
+                            </svg>
+                        </nav>
+                    </div>
+                </div>
+            </div>
+
+            <div id="right-panel" class="panel-section-right">
+                {% block rightTopPanel %}
+                <div id="right-top-panel">
+                    <div class="panel-header" onclick="panelMan.togglePanel('right');">
+                    </div>
+                    <div class="panel-content">
+                        right top panel content<br />
+                    </div>
+                    <div class="panel-footer">
+                    </div>
+                </div>
+                {% endblock %}
+
+                {% block rightBottomPanel %}
+                <div id="right-bottom-panel" class="panel-no-header">
+                    
+                    <div class="panel-header">
+                        
+                    </div>
+                    <div class="panel-content">
+                        right bottom panel content<br />
+                    </div>
+                    <div class="panel-footer">
+                    </div>
+                </div>
+                {% endblock %}
+            </div>
+        </div>
+    </div>
+</body>
+</html>

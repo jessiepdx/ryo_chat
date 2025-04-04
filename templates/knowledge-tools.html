@@ -1,0 +1,122 @@
+{% extends "base-html.html" %}
+
+{% block title %}{{ contentData.title }}{% endblock %}
+
+{% block javascript %}
+<script>
+    // Variable to store the last clicked knowledge item
+    var lastClickedKnowledgeItem = null;
+
+    function knowledgeItemClicked(item) {
+        // Get the trimmed knowledge document content
+        var knowledgeContent = item.querySelector('.list-item-body').textContent.trim();
+
+        // If the same item is clicked again, toggle (close) the panel
+        if (lastClickedKnowledgeItem === item) {
+            panelMan.togglePanel('right');
+            lastClickedKnowledgeItem = null;
+        } else {
+            // Otherwise, update the textarea with the new content
+            document.getElementById('knowledgeDataEditor').value = knowledgeContent;
+            // Update the last clicked item reference
+            lastClickedKnowledgeItem = item;
+            // Open the right panel if it's not already open
+            if (!panelMan.panelStates['right']) {
+                panelMan.showPanel('right');
+            }
+        }
+    }
+</script>
+
+{% endblock %}
+
+{% block leftPanel %}
+<div id="left-panel" class="panel-section-left panel-no-footer">
+    <div class="panel-header" onclick="panelMan.togglePanel('left');">
+    </div>
+    <div class="panel-content">
+        <p>Knowledge</p>
+        <p>Sort</p>
+        <p>Panel</p>
+    </div>
+    <div class="panel-footer footer-detached">
+    </div>
+</div>
+{% endblock %}
+
+{% block content %}
+
+<h3>Knowledge Tools stuff</h3>
+{% for knowledge in knowledgeData %}
+<div class="list-item-container" onclick="knowledgeItemClicked(this);">
+    <div class="list-item-header"></div>
+    <div class="list-item-body">
+        {{ knowledge["knowledge_document"] }}
+    </div>
+    <div class="list-item-footer">
+        {% if knowledge["categories"] %}
+        <div class="list-item-categories">
+            {{ ', '.join(knowledge["categories"]) }}
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endfor %}
+<div class="list-item-container" onclick="addKnowledgeItem();"> <h3>ADD KNOWLEDGE ENTRY</h3></div>
+
+
+
+{% endblock %}
+
+{% block rightTopPanel %}
+<div id="right-top-panel">
+    <div class="panel-header" onclick="panelMan.togglePanel('right');"></div>
+    <div class="panel-content">
+
+        <h3>Knowledge Editor Panel</h3>
+
+        <div class="domain-selection">
+            <label for="domain">Domain Dropdown</label>
+            <select name="domain" id="">
+                <option value=""></option>
+            </select>
+        </div>
+
+        <div class="primary-editor">
+            <label for="knowledgeData">Knowledge Entry Editor</label>
+            <textarea name="knowledgeData" id="knowledgeDataEditor"></textarea>
+            <label for="knowledgeTag">Knowledge Tags</label>
+            <input type="text" name="knowledgeTag" id="">
+            <div id="knowledgeTags">
+                <div class="knowledgeTagBlock">
+                    <span>Tag1</span>
+                    <span>X</span>
+                </div>
+            </div>
+        </div>
+
+        <input type="submit" name="submitKnowledge" id="submitKnowledgeChanges">
+
+
+
+    </div>
+    <div class="panel-footer">
+    </div>
+</div>
+{% endblock %}
+
+{% block rightBottomPanel %}
+<div id="right-bottom-panel">          
+    <div class="panel-header">
+    </div>
+    <div class="panel-content">
+        <b>Knowledge Tools</b> - all the Knowledge display we want in the <i>bottom</i> panel
+    </div>
+    <div class="panel-footer">
+    </div>
+</div>
+{% endblock %}
+
+{% block footer %}
+Knowledge footer here
+{% endblock %}

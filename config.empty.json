@@ -1,0 +1,52 @@
+{
+  "bot_name": "Telegram bot username",
+  "bot_id": 12345,
+  "bot_token": "Telegram bot token",
+  "web_ui_url": "https://web.ui.url/",
+  "owner_info": {
+    "first_name": "First name",
+    "last_name": "Last name",
+    "user_id": 12345,
+    "username": "Telegram username"
+  },
+  "database": {
+      "db_name": "Database name",
+      "user": "Database user", 
+      "password": "Database password", 
+      "host": "Postgres URL",
+      "port": "Postgres port"
+  },
+  "knowledge": {
+    "domains": ["Short List", "Of Main", "Knowledge Domains"]
+  },
+  "defaults": {
+    "system_prompt": "You are a helpful Telegram Chatbot having conversations with users in the Telegram Messager App. Do your best to respond truthfully and factually. If you  don't know the answer, let the user know. You may need to ask the user questions to gather more information. ",
+    "generate_sys_prompt": "To keep the conversation flow going smoothly, it may make sense to keep responses short and concise while other times you should give a thorough response. ",
+    "chat_sys_prompt": "Using the message history of our conversations and you vast collection of training knowledge, respond to user prompts as best as you are able. If recalling information from previous parts of the conversation, make sure to summarize a response and don't be verbatum."
+  },
+  "inference": {
+    "embedding": {
+      "url": "Ollama location",
+      "model": "Embedding model"
+    },
+    "generate": {
+      "url": "Ollama location",
+      "model": "Generate model"
+    },
+    "chat": {
+      "url": "Ollama location",
+      "model": "Chat model"
+    },
+    "tool": {
+      "url": "Ollama location",
+      "model": "Tool model"
+    },
+    "multimodal": {
+      "url": "Ollama location",
+      "model": "Multimodal model"
+    }
+  },
+  "api_keys": {
+    "brave_search": "Brave search for AI keys"
+  }
+}
