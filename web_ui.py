@@ -218,7 +218,7 @@ def knowledgeTools():
             }
 
             knowledgeData = KnowledgeManager().getKnowledge()
-            print(knowledgeData[0]["document_metadata"])
+            #print(knowledgeData[0]["document_metadata"])
             
             return render_template("knowledge-tools.html", 
                 contentData=contentData,

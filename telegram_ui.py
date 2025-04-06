@@ -179,9 +179,11 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if config.webUIUrl is None:
         # TODO message the user / owner account that the config for the dashboard is missing
+        print("missing webUI URL from config")
         return
     
     logger.info(f"Dashboard command issued by {user.name} (user_id: {user.id}).")
+    print(config.webUIUrl + "miniapp/dashboard")
     
     keyboard = [
         [
