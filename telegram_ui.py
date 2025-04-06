@@ -1995,6 +1995,15 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if member is None:
         logger.info(f"Unregistered user {user.name} (user_id: {user.id}) sent an image in a {chat.type} chat.")
         await message.delete()
+        # Ban user if they sent image within 60 seconds of joining the group chat
+        userJoined = context.chat_data.get(user.id)
+        if userJoined is not None:
+            # compare the timestamps
+            if userJoined > (datetime.now() - timedelta(seconds=60)):
+                print("ban user for spam")
+                await chat.ban_member(user.id)
+                return
+
         await context.bot.send_message(
             chat_id=chat.id,
             message_thread_id=topicID,
@@ -2257,7 +2266,7 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Other Update Handlers #
 #########################
 
-async def botStatusChanged(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def botStatusChanged(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Update handler for when the bot's status has changed.
     Use to register group chat accounts when bot is added to a group."""
     logger.info(f"The bot's status has been updated.")
@@ -2334,6 +2343,21 @@ async def botStatusChanged(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     else:
         return
 #good
+
+async def newChatUser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Chat member status update, check for new user in group.")
+    newUserData = update.chat_member.new_chat_member
+
+    # test
+    print(update.chat_member.difference())
+
+    if newUserData.status == constants.ChatMemberStatus.MEMBER:
+        print(newUserData.user)
+        # Store a timestamp for when the telegram user joined the group
+        context.chat_data[newUserData.user.id] = datetime.now()
+
+    
+
 
 ####################
 # Helper Functions #
@@ -2624,6 +2648,7 @@ def main() -> None:
 
     # Other update type handlers
     application.add_handler(ChatMemberHandler(botStatusChanged, chat_member_types=ChatMemberHandler.MY_CHAT_MEMBER))
+    application.add_handler(ChatMemberHandler(newChatUser, chat_member_types=ChatMemberHandler.CHAT_MEMBER))
 
     application.add_error_handler(errorHandler)
 
