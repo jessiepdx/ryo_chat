@@ -222,7 +222,7 @@ def knowledgeTools():
             
             return render_template("knowledge-tools.html", 
                 contentData=contentData,
-                knowledgeData=knowledgeData
+                knowledgeData=list() if knowledgeData is None else knowledgeData
             )
 
     print("Not authorized")
