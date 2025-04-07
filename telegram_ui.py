@@ -32,6 +32,7 @@ from telegram import (
     helpers,
     InlineKeyboardButton, 
     InlineKeyboardMarkup,
+    MessageEntity,
     ReplyKeyboardMarkup, 
     ReplyKeyboardRemove, 
     Update,
@@ -2356,7 +2357,35 @@ async def newChatUser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # Store a timestamp for when the telegram user joined the group
         context.chat_data[newUserData.user.id] = datetime.now()
 
-    
+
+async def linkHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("A message was sent with a link")
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    topicID = message.message_thread_id if message.is_topic_message else None
+
+    member = members.getMemberByTelegramID(user.id)
+    if member is None:
+        logger.info(f"Unregistered user {user.name} (user_id: {user.id}) sent a link in a {chat.type} chat.")
+        await message.delete()
+        # Ban user if they sent image within 60 seconds of joining the group chat
+        userJoined = context.chat_data.get(user.id)
+        if userJoined is not None:
+            # compare the timestamps
+            if userJoined > (datetime.now() - timedelta(seconds=60)):
+                print("ban user for spam")
+                await chat.ban_member(user.id)
+                return
+
+        await context.bot.send_message(
+            chat_id=chat.id,
+            message_thread_id=topicID,
+            text=f"Start a private chat with the @{config.botName} to send images in this chat."
+        )
+        
+    # Exit the function
+    return
 
 
 ####################
@@ -2484,6 +2513,15 @@ async def handleForwardedMessage(update: Update, context: ContextTypes.DEFAULT_T
         logger.info(f"An unregistered user {user.name} (user_id: {user.id}) attempted to forward a message into the group chat.")
 
         await message.delete()
+        # Ban user if they sent image within 60 seconds of joining the group chat
+        userJoined = context.chat_data.get(user.id)
+        if userJoined is not None:
+            # compare the timestamps
+            if userJoined > (datetime.now() - timedelta(seconds=60)):
+                print("ban user for spam")
+                await chat.ban_member(user.id)
+                return
+        
         await context.bot.send_message(
             chat_id=chat.id,
             message_thread_id=topicID,
@@ -2644,6 +2682,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, directChatPrivate))
     application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND, otherGroupChat))
     application.add_handler(MessageHandler(filters.PHOTO, handleImage))
+    #application.add_handler(MessageHandler(filters.Entity("url") | filters.Entity(MessageEntity.URL), linkHandler))
     application.add_handler(MessageHandler(filters.ALL, catchAllMessages))
 
     # Other update type handlers
