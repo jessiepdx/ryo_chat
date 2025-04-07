@@ -372,7 +372,7 @@ def miniappLogin():
 
 if __name__ == "__main__":
     #print("Begin Flask Application")
-    logger.info("Begin Flask Application")
+    logger.info("RYO - begin web ui application.")
 
     app.run(
         host="0.0.0.0",

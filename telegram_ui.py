@@ -1768,6 +1768,18 @@ async def openProposal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def catchAllMessages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"A message was captured by the catch all function.")
 
+    # TEST
+    print(update.message.entities)
+    entities = update.message.parse_entities([MessageEntity.URL, MessageEntity.TEXT_LINK])
+    links = []
+    for entity in entities:
+            if entity == MessageEntity.TEXT_LINK:
+                links.append(entities[entity].url)
+            elif entities[entity].type == MessageEntity.URL:
+                links.append(entities[entity])
+
+    print(links)
+
 # TODO when incoming message, check if the model is loaded and if not preload the main chat model before doing embeddings and db lookup. This may increase response time.
 
 
@@ -1839,7 +1851,8 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message_thread_id=topicID
         )
     except Exception as err:
-        logger.error(msg="Exception while sending a chat action for typing:  ", exc_info=err, stack_info=False)
+        logger.error(msg="Exception while sending a chat action for typing:  %s", args=err, exc_info=True)
+        #logger.error("The following error occured:  %s", err, exc_info=True)
         #logger.warning(f"The following error occurred while sending chat action to telegram:  {err}.")
 
     response = await conversation.runAgents()
@@ -1852,7 +1865,8 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
         )
     except Exception as err:
-        logger.error(msg="Exception while sending a telegram message:  ", exc_info=err, stack_info=False)
+        #logger.error(msg="Exception while sending a telegram message:  ", exc_info=err, stack_info=False)
+        logger.error(msg="Exception while sending a telegram message:  %s", args=err, exc_info=True)
         #logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
         return
 
@@ -1950,7 +1964,9 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             action=constants.ChatAction.TYPING
         )
     except Exception as err:
-        logger.error(msg="Exception while sending a chat action for typing.", exc_info=err, stack_info=False)
+        #logger.error(msg="Exception while sending a chat action for typing.", exc_info=err, stack_info=False)
+        logger.error(msg="Exception while sending a chat action for typing:  %s", args=err, exc_info=True)
+        
         #logger.warning(f"The following error occurred while sending chat action to telegram:  {err}.")
     
     response = await conversation.runAgents()
@@ -1960,7 +1976,8 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=response
         )
     except Exception as err:
-        logger.error(msg="Exception while replying to a telegram message", exc_info=err, stack_info=False)
+        #logger.error(msg="Exception while replying to a telegram message", exc_info=err, stack_info=False)
+        logger.error(msg="Exception while replying to a telegram message:  %s", args=err, exc_info=True)
         #logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
         return
     
@@ -2035,7 +2052,7 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         # Combine the user and group roles into rolesAvailable
-        rolesAvailable = set(member["roles"] + community["roles"])    
+        rolesAvailable = set(member["roles"] + community["roles"])
         # Get rate limits for group chat
         rateLimits = communityScore.getRateLimits(memberID, "community") 
     else:
@@ -2368,23 +2385,59 @@ async def linkHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     member = members.getMemberByTelegramID(user.id)
     if member is None:
         logger.info(f"Unregistered user {user.name} (user_id: {user.id}) sent a link in a {chat.type} chat.")
-        await message.delete()
-        # Ban user if they sent image within 60 seconds of joining the group chat
-        userJoined = context.chat_data.get(user.id)
-        if userJoined is not None:
-            # compare the timestamps
-            if userJoined > (datetime.now() - timedelta(seconds=60)):
-                print("ban user for spam")
-                await chat.ban_member(user.id)
-                return
+        try:
+            await message.delete()
+            # Ban user if they sent image within 60 seconds of joining the group chat
+            userJoined = context.chat_data.get(user.id)
+            if userJoined is not None:
+                # compare the timestamps
+                if userJoined > (datetime.now() - timedelta(seconds=60)):
+                    print("ban user for spam")
+                    await chat.ban_member(user.id)
+                    return
 
-        await context.bot.send_message(
-            chat_id=chat.id,
-            message_thread_id=topicID,
-            text=f"Start a private chat with the @{config.botName} to send images in this chat."
-        )
+            await context.bot.send_message(
+                chat_id=chat.id,
+                message_thread_id=topicID,
+                text=f"Start a private chat with the @{config.botName} to send links in this chat."
+            )
         
-    # Exit the function
+            # Exit the function
+            return
+        except Exception as err:
+            logger.error("The following error occured:  %s", err, exc_info=True)
+            return
+        
+    memberID = member.get("member_id")
+    minimumCommunityScore = 20
+    # Set the allowed roles
+    allowedRoles = ["tester", "marketing", "admin", "owner"]
+
+    community = communities.getCommunityByTelegramID(chat.id)
+    if community is None:
+        # This should technically not be able to happen
+        logger.info(f"User {user.name} (user_id: {user.id}) attempted to send an link in an unregistered group chat.")
+        await message.delete()
+        # Exit the function
+        return
+    
+    # Combine the user and group roles into rolesAvailable
+    rolesAvailable = set(member["roles"] + community["roles"])
+
+    if (not any(role in rolesAvailable for role in allowedRoles)) and member["community_score"] < minimumCommunityScore:
+        logger.info(f"User {user.name} (user_id: {user.id}) does not meet the minimum community score to send links in a {chat.type} chat.")
+        try:
+            await message.delete()
+            await context.bot.send_message(
+                chat_id=chat.id,
+                message_thread_id=topicID,
+                text=f"You need a minimum community score of {minimumCommunityScore} to send images in a {chat.type} chat."
+            )
+        except Exception as err:
+            logger.error("The following error occured:  %s", err, exc_info=True)
+        finally:
+            return
+    
     return
 
 
@@ -2543,6 +2596,7 @@ async def errorHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 #################
 
 def main() -> None:
+    logger.info("RYO - begin telegram ui application.")
     # Run the bot
     # Create the Application and pass it your bot's token.
     # .get_updates_write_timeout(100)
@@ -2671,10 +2725,13 @@ def main() -> None:
     application.add_handler(CommandHandler("password", setPassword, filters=filters.ChatType.PRIVATE))
 
     application.add_handler(MessageReactionHandler(reactionsHandler))
+    # Add spam checks
     application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS & filters.FORWARDED, handleForwardedMessage))
+    application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS & (filters.Entity("url") | filters.Entity("text_link")), linkHandler))
     
     # Add conversational chains
     application.add_handlers([generateHandler, knowledgeHandler, newsletterHandler, promoteHandler, proposalsHandler, tweetHandler])
+
 
     # Add message handlers
     application.add_handler(MessageHandler(filters.Mention(config.botName) & filters.ChatType.GROUPS & ~filters.COMMAND, directChatGroup))
@@ -2682,7 +2739,6 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, directChatPrivate))
     application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND, otherGroupChat))
     application.add_handler(MessageHandler(filters.PHOTO, handleImage))
-    #application.add_handler(MessageHandler(filters.Entity("url") | filters.Entity(MessageEntity.URL), linkHandler))
     application.add_handler(MessageHandler(filters.ALL, catchAllMessages))
 
     # Other update type handlers

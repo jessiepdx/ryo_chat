@@ -190,7 +190,7 @@ async def main():
         
 
 if __name__ == "__main__":
-    logger.info(f"{ConsoleColors['green']}Ollama / Agent testing.{ConsoleColors['default']}")
+    logger.info("RYO - begin cli ui application.")
     # Create an event loop object
     loop = asyncio.new_event_loop()
     loop.run_until_complete(main())
