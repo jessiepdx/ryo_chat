@@ -1772,9 +1772,6 @@ async def catchAllMessages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"A message was captured by the catch all function.")
 
 
-# TODO when incoming message, check if the model is loaded and if not preload the main chat model before doing embeddings and db lookup. This may increase response time.
-
-
 async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Bot messaged in group chat.")
     chat = update.effective_chat
@@ -1820,7 +1817,7 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await message.reply_text(text=f"You have reached your hourly rate limit.")
             except Exception as err:
-                logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+                logger.error(f"The following error occurred while sending a telegram message:\n{err}")
             finally:
                 # User has reach rate limit, exit function
                 return
@@ -1843,9 +1840,8 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message_thread_id=topicID
         )
     except Exception as err:
-        logger.error(msg="Exception while sending a chat action for typing:  %s", args=err, exc_info=True)
-        #logger.error("The following error occured:  %s", err, exc_info=True)
-        #logger.warning(f"The following error occurred while sending chat action to telegram:  {err}.")
+        logger.error(f"Exception while sending a chat action for typing:\n{err}")
+        # Non critical to the overall function, continue
 
     response = await conversation.runAgents()
     
@@ -1857,9 +1853,8 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
         )
     except Exception as err:
-        #logger.error(msg="Exception while sending a telegram message:  ", exc_info=err, stack_info=False)
-        logger.error(msg="Exception while sending a telegram message:  %s", args=err, exc_info=True)
-        #logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while sending a telegram message:\n{err}")
+        # Error is critical to the remaining functionality, exit
         return
 
     # Score the message if the message is greater than 20 words
@@ -1888,7 +1883,7 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await sendStats(stats=conversation.stats, chatID=chat.id, context=context, threadID=topicID)
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"The following error occurred while sending a telegram message:\n{err}")
 
 
 async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1907,7 +1902,7 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await message.reply_text("Use the /start command to begin chatting with the chatbot.")
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"The following error occurred while sending a telegram message:\n{err}")
         finally:
             # No member account, exit the function
             return
@@ -1934,7 +1929,7 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly message rate in private chat.")
                     await message.reply_text(text=f"You have reached your hourly rate limit.")
             except Exception as err:
-                logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+                logger.error(f"The following error occurred while sending a telegram message:\n{err}")
             finally:
                 # User has reach rate limit, exit function
                 return
@@ -1956,10 +1951,8 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             action=constants.ChatAction.TYPING
         )
     except Exception as err:
-        #logger.error(msg="Exception while sending a chat action for typing.", exc_info=err, stack_info=False)
-        logger.error(msg="Exception while sending a chat action for typing:  %s", args=err, exc_info=True)
-        
-        #logger.warning(f"The following error occurred while sending chat action to telegram:  {err}.")
+        logger.error(f"Exception while sending a chat action for typing:\n{err}")
+        # Non critical to the remaining functionality, continue
     
     response = await conversation.runAgents()
     
@@ -1968,9 +1961,8 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=response
         )
     except Exception as err:
-        #logger.error(msg="Exception while replying to a telegram message", exc_info=err, stack_info=False)
-        logger.error(msg="Exception while replying to a telegram message:  %s", args=err, exc_info=True)
-        #logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error("Exception while replying to a telegram message:\n{err}")
+        # Error is critical to the remaining functionality, exit
         return
     
     # Score the message if the message is greater than 20 words
@@ -1989,7 +1981,7 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await sendStats(stats=conversation.stats, chatID=chat.id, context=context)
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"The following error occurred while sending a telegram message:\n{err}")
 
 
 # TODO Still need to handle chat history and usage storage for images
@@ -2003,25 +1995,28 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Need user account regardless of chat type
     member = members.getMemberByTelegramID(user.id)
     if member is None:
-        logger.info(f"Unregistered user {user.name} (user_id: {user.id}) sent an image in a {chat.type} chat.")
-        await message.delete()
-        # Ban user if they sent image within 60 seconds of joining the group chat
-        userJoined = context.chat_data.get(user.id)
-        if userJoined is not None:
-            # compare the timestamps
-            if userJoined > (datetime.now() - timedelta(seconds=60)):
-                print("ban user for spam")
-                await chat.ban_member(user.id)
-                return
+        logger.warning(f"Unregistered user {user.name} (user_id: {user.id}) sent an image in a {chat.type} chat.")
+        try:
+            await message.delete()
+            # Ban user if they sent image within 60 seconds of joining the group chat
+            userJoined = context.chat_data.get(user.id)
+            if userJoined is not None:
+                # compare the timestamps
+                if userJoined > (datetime.now() - timedelta(seconds=60)):
+                    logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
+                    await chat.ban_member(user.id)
+                    return
 
-        await context.bot.send_message(
-            chat_id=chat.id,
-            message_thread_id=topicID,
-            text=f"Start a private chat with the @{config.botName} to send images in this chat."
-        )
-        
-        # Exit the function
-        return
+            await context.bot.send_message(
+                chat_id=chat.id,
+                message_thread_id=topicID,
+                text=f"Start a private chat with the @{config.botName} to send images in this chat."
+            )
+        except Exception as err:
+            logger.error(f"Exception while handling potential spam image:\n{err}")
+        finally:
+            # Exit the function
+            return
     
     memberID = member.get("member_id")
     minimumCommunityScore = 70 if chat.type == "private" else 20
@@ -2038,10 +2033,14 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif chat.type == "group" or chat.type == "supergroup":
         community = communities.getCommunityByTelegramID(chat.id)
         if community is None:
-            logger.info(f"User {user.name} (user_id: {user.id}) attempted to send an image in an unregistered group chat.")
-            await message.delete()
-            # Exit the function
-            return
+            logger.warning(f"User {user.name} (user_id: {user.id}) attempted to send an image in an unregistered group chat.")
+            try:
+                await message.delete()
+            except Exception as err:
+                logger.error(f"Exception while deleting an image message in a group chat:\n{err}")
+            finally:
+                # Exit the function
+                return
         
         # Combine the user and group roles into rolesAvailable
         rolesAvailable = set(member["roles"] + community["roles"])
@@ -2056,20 +2055,23 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check if user has exceeded hourly rate
         memberUsage = usage.getUsageForMember(memberID)
         if len(memberUsage) >= rateLimits["image"]:
-            if member["community_score"] < minimumCommunityScore:
-                logger.info(f"User {user.name} (user_id: {user.id}) does not meet the minimum community score to send images in a {chat.type} chat.")
-                await message.delete()
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    message_thread_id=topicID,
-                    text=f"You need a minimum community score of {minimumCommunityScore} to send images in a {chat.type} chat."
-                )
-            else:
-                logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly message rate in {community['chat_title']} group chat.")
-                await message.reply_text(text=f"You have reached your hourly rate limit.")
-            
-            # User has reach rate limit, exit function
-            return
+            try:
+                if member["community_score"] < minimumCommunityScore:
+                    logger.info(f"User {user.name} (user_id: {user.id}) does not meet the minimum community score to send images in a {chat.type} chat.")
+                    await message.delete()
+                    await context.bot.send_message(
+                        chat_id=chat.id,
+                        message_thread_id=topicID,
+                        text=f"You need a minimum community score of {minimumCommunityScore} to send images in this chat."
+                    )
+                else:
+                    logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly message rate in {community['chat_title']} group chat.")
+                    await message.reply_text(text=f"You have reached your hourly rate limit.")
+            except Exception as err:
+                logger.error(f"Exception while handling image rate limits in a group chat:\n{err}")
+            finally:
+                # User has reach rate limit, exit function
+                return
 
     # Convert images to base64
     photoFile = await message.effective_attachment[-1].get_file()
@@ -2091,23 +2093,29 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     imageAgent = ImageAgent(messageData, memberID)
     
     # Shows the bot as "typing"
-    await context.bot.send_chat_action(
-        chat_id=chat.id, 
-        action=constants.ChatAction.TYPING,
-        message_thread_id=topicID
-    )
+    try:
+        await context.bot.send_chat_action(
+            chat_id=chat.id, 
+            action=constants.ChatAction.TYPING,
+            message_thread_id=topicID
+        )
+    except Exception as err:
+        logger.error(f"Exception while sending a chat action for typing:\n{err}")
+        # Non critical to the remaining functionality, continue
     
     response = await imageAgent.generateResponse()
 
     # Send the conversational agent response
-    responseMessage = await context.bot.send_message(
-        chat_id=chat.id,
-        message_thread_id=topicID,
-        text=f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
-    )
-
+    try:
+        responseMessage = await context.bot.send_message(
+            chat_id=chat.id,
+            message_thread_id=topicID,
+            text=f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
+        )
+    except Exception as err:
+        logger.error(f"Exception while sending a telegram message:\n{err}")
     # TODO Handle adding prompt and response into the chat history collection.
-#good
+
 
 async def otherGroupChat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Other messages (not directed at the chatbot) from group chats.")
@@ -2135,7 +2143,7 @@ async def otherGroupChat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Score the message if the user account exist and the message is greater than 20 words
         if len(message.text.split(" ")) > 20:
             communityScore.scoreMessage(messageHistoryID)
-#good
+
 
 # TODO only include chat history from the reply chain
 async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2157,7 +2165,7 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await message.reply_text(text="Chatbot is not registered with this group chat.")
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"Exception while replying to a telegram message:\n{err}")
         finally:
             return
     
@@ -2174,7 +2182,7 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"Message is image type. Forward message to handleImage function.")
                 await handleImage(update=update, context=context)
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"Exception while forwarding a reply update to the appropriate function:\n{err}")
         finally:
             return
 
@@ -2184,11 +2192,11 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     member = members.getMemberByTelegramID(user.id)
 
     if member is None:
-        logger.info(f"An unregistered user {user.name} (user_id: {user.id}) attempted to reply to a message from the chatbot in {community['chat_title']} group chat.")
+        logger.warning(f"An unregistered user {user.name} (user_id: {user.id}) attempted to reply to a message from the chatbot in {community['chat_title']} group chat.")
         try:
             await message.reply_text(text=f"To reply to {config.botName}, open a private message to the chatbot @{config.botName} and click start.")
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"Exception while replying to a telegram message:\n{err}")
         finally:
             # No user account, exit the function
             return
@@ -2209,7 +2217,7 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await message.reply_text(text=f"You have reached your hourly rate limit.")
             except Exception as err:
-                logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+                logger.error(f"Exception while replying to a telegram message:\n{err}")
             finally:
                 # User has reach rate limit, exit function
                 return
@@ -2226,31 +2234,30 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Create the conversational agent instance
     conversation = ConversationOrchestrator(message.text, memberID, messageData, message.message_id)
-    try:
     # Shows the bot as "typing"
+    try:
         await context.bot.send_chat_action(
             chat_id=chat.id, 
             action=constants.ChatAction.TYPING,
             message_thread_id=topicID
         )
     except Exception as err:
-        logger.error("Exception while sending a telegram message", stack_info=False, exc_info=err)
-        #logger.warning(f"The following error occurred while sending chat action to telegram:  {err}.")
+        logger.error(f"Exception while sending a chat action for typing:\n{err}")
+        # Non critical to the remaining functionality, continue
 
     response = await conversation.runAgents()
 
+    # Send the conversational agent response
     try:
-        # Send the conversational agent response
         responseMessage = await context.bot.send_message(
             chat_id=chat.id,
             message_thread_id=topicID,
             text=f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
         )
     except Exception as err:
-        logger.error("Exception while sending a telegram message", stack_info=False, exc_info=err)
-        #logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while sending a telegram message:\n{err}")
+        # Critical to the remaining functionality, exit
         return
-
 
     # Score the message if the message is greater than 20 words
     if len(message.text.split(" ")) > 20:
@@ -2268,7 +2275,7 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await sendStats(stats=conversation.stats, chatID=chat.id, context=context, threadID=topicID)
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"Exception while calling sendStats:\n{err}")
 
 
 
@@ -2301,23 +2308,25 @@ async def botStatusChanged(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             # User does not have permission to add the bot to the chat
             # Check if user exist
             if member is None:
-                logger.info(f"A non-registered user {fromUser.name} ({fromUser.id}) attempted to add the chatbot to the {chat.title} group chat.")
+                logger.warning(f"A non-registered user {fromUser.name} ({fromUser.id}) attempted to add the chatbot to the {chat.title} group chat.")
                 responseText="Non registered user's are not authorized to add the chatbot to group chats. To register, start a private conversation with the chatbot."
             else:
-                logger.info(f"A non-authorized user {fromUser.name} ({fromUser.id}) attempted to add the chatbot to the {chat.title} group chat.")
+                logger.warning(f"A non-authorized user {fromUser.name} ({fromUser.id}) attempted to add the chatbot to the {chat.title} group chat.")
                 responseText = "You are not authorized to add the chatbot to group chats."
                 
-            # TODO Wrap this is try except block
-            # Send response
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=responseText
-            )
-            # Exit the group chat
-            await context.bot.leave_chat(chat.id)
-
-            # Exit the function
-            return
+            try:
+                # Send response
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=responseText
+                )
+                # Exit the group chat
+                await context.bot.leave_chat(chat.id)
+            except Exception as err:
+                logger.error(f"Exception while removing chatbot from an unauthorized group:\n{err}")
+            finally:
+                # Exit the function
+                return
 
         # Chat isn't registered and user is authorized
         logger.info(f"User {fromUser.name} ({fromUser.id}) is authorized to add chatbot to group chats.")
@@ -2335,13 +2344,16 @@ async def botStatusChanged(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Add new individual account via accounts manager
         communities.addCommunityFromTelegram(newCommunityData)
-
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text=f"Hello, I am the {config.botName} chatbot. Use the /help command for more information."
-        )
-        # Exit the function
-        return
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=f"Hello, I am the {config.botName} chatbot. Use the /help command for more information."
+            )
+        except Exception as err:
+            logger.error(f"Exception while sending a telegram message:\n{err}")
+        finally:
+            # Exit the function
+            return
         
     elif newStatus.status != constants.ChatMemberStatus.MEMBER:
         logger.info(f"The chatbot's status change is:  {newStatus.status}.")
@@ -2352,17 +2364,16 @@ async def botStatusChanged(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     else:
         return
-#good
+
 
 async def newChatUser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("Chat member status update, check for new user in group.")
     newUserData = update.chat_member.new_chat_member
 
-    # test
+    # TODO Update this logic to check for "status" key in the return value of difference, then check for second element of tuple for MEMBER
     print(update.chat_member.difference())
 
     if newUserData.status == constants.ChatMemberStatus.MEMBER:
-        print(newUserData.user)
         # Store a timestamp for when the telegram user joined the group
         context.chat_data[newUserData.user.id] = datetime.now()
 
@@ -2376,42 +2387,45 @@ async def linkHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     member = members.getMemberByTelegramID(user.id)
     if member is None:
-        logger.info(f"Unregistered user {user.name} (user_id: {user.id}) sent a link in a {chat.type} chat.")
+        logger.warning(f"Unregistered user {user.name} (user_id: {user.id}) sent a link in a {chat.type} chat.")
         try:
             await message.delete()
             # Ban user if they sent image within 60 seconds of joining the group chat
             userJoined = context.chat_data.get(user.id)
             if userJoined is not None:
-                # compare the timestamps
                 if userJoined > (datetime.now() - timedelta(seconds=60)):
-                    print("ban user for spam")
+                    logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
                     await chat.ban_member(user.id)
                     return
 
+            # User not banned, send a requirement message
             await context.bot.send_message(
                 chat_id=chat.id,
                 message_thread_id=topicID,
                 text=f"Start a private chat with the @{config.botName} to send links in this chat."
             )
-        
+        except Exception as err:
+            logger.error(f"Exception while handling potential spam (message containing a link):\n{err}")
+        finally:
             # Exit the function
             return
-        except Exception as err:
-            logger.error("The following error occured:  %s", err, exc_info=True)
-            return
         
-    memberID = member.get("member_id")
+    #memberID = member.get("member_id")
     minimumCommunityScore = 20
     # Set the allowed roles
     allowedRoles = ["tester", "marketing", "admin", "owner"]
 
     community = communities.getCommunityByTelegramID(chat.id)
     if community is None:
-        # This should technically not be able to happen
-        logger.info(f"User {user.name} (user_id: {user.id}) attempted to send an link in an unregistered group chat.")
-        await message.delete()
-        # Exit the function
-        return
+        # This should technically not be able to happen, but can due to DB error, etc
+        logger.warning(f"User {user.name} (user_id: {user.id}) attempted to send an link in an unregistered group chat.")
+        try:
+            await message.delete()
+        except Exception as err:
+            logger.error(f"Exception while deleting a potential spam message (containing a link):\n{err}")
+        finally:
+            # Exit the function
+            return
     
     # Combine the user and group roles into rolesAvailable
     rolesAvailable = set(member["roles"] + community["roles"])
@@ -2423,14 +2437,12 @@ async def linkHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await context.bot.send_message(
                 chat_id=chat.id,
                 message_thread_id=topicID,
-                text=f"You need a minimum community score of {minimumCommunityScore} to send images in a {chat.type} chat."
+                text=f"You need a minimum community score of {minimumCommunityScore} to send links in the {community.get("community_name")} chat."
             )
         except Exception as err:
-            logger.error("The following error occured:  %s", err, exc_info=True)
+            logger.error(f"Exception while handling potential spam message (containing a link):\n{err}")
         finally:
             return
-    
-    return
 
 
 ####################
@@ -2439,10 +2451,10 @@ async def linkHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def setPassword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"User is requesting an new access key.")
-    chat = update.effective_chat
+    #chat = update.effective_chat
     message = update.effective_message
     user = update.effective_user
-    topicID = message.message_thread_id if message.is_topic_message else None
+    #topicID = message.message_thread_id if message.is_topic_message else None
 
     member = members.getMemberByTelegramID(user.id)
     if member is not None:
@@ -2469,10 +2481,8 @@ async def setPassword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             await message.reply_text(text=response)
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"Exception while replying to a telegram message:\n{err}")
 
-        # TODO Set up auto delete of message response
-#good
 
 async def statisticsManager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # For now this function will just toggle on or off the sending of statistics
@@ -2487,12 +2497,15 @@ async def statisticsManager(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         userDefaults = context.user_data["defaults"] = {} if "defaults" not in context.user_data else context.user_data["defaults"]
         userDefaults["send_stats"] = True if "send_stats" not in userDefaults else not userDefaults["send_stats"]
 
-        await context.bot.send_message(
-            chat_id=chat.id,
-            message_thread_id=message.message_thread_id if message.is_topic_message else None,
-            text=f"Show statistics:  {userDefaults['send_stats']}"
-        )
-#good
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                message_thread_id=message.message_thread_id if message.is_topic_message else None,
+                text=f"Show statistics:  {userDefaults['send_stats']}"
+            )
+        except Exception as err:
+            logger.error(f"Exception while sending a telegram message:\n{err}")
+
 
 async def sendStats(chatID: int, context: ContextTypes.DEFAULT_TYPE, stats: dict, threadID=None) -> None:
     logger.info(f"Send stats for previously generated message.")
@@ -2508,13 +2521,16 @@ async def sendStats(chatID: int, context: ContextTypes.DEFAULT_TYPE, stats: dict
 *Total tokens per second:*  {((stats['prompt_eval_count'] + stats['eval_count']) / ((stats['prompt_eval_duration'] + stats['eval_duration']) / 1000000000)):.2f} 
 *Total duration:*  {(stats['total_duration'] / 1000000000):.2f} seconds """
     
-    await context.bot.send_message(
-        chat_id=chatID,
-        message_thread_id=threadID,
-        parse_mode=constants.ParseMode.MARKDOWN,
-        text=messageText
-    )
-#good
+    try:
+        await context.bot.send_message(
+            chat_id=chatID,
+            message_thread_id=threadID,
+            parse_mode=constants.ParseMode.MARKDOWN,
+            text=messageText
+        )
+    except Exception as err:
+        logger.error(f"Exception while sending a telegram message:\n{err}")
+
 
 async def reactionsHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"Handling message reactions.")
@@ -2539,7 +2555,7 @@ async def reactionsHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         originalMessage = chatHistory.getMessageByMessageID(communityID, "community", "telegram", update.message_reaction.message_id)
         if originalMessage:
             communityScore.scoreMessageFromReaction(memberID, originalMessage.get("history_id"))
-#good
+
 
 async def handleForwardedMessage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """This function is for spam prevention. 
@@ -2555,32 +2571,65 @@ async def handleForwardedMessage(update: Update, context: ContextTypes.DEFAULT_T
 
     if member is None:
         # Delete the message and give the user information to message the chatbot
-        logger.info(f"An unregistered user {user.name} (user_id: {user.id}) attempted to forward a message into the group chat.")
+        logger.warning(f"An unregistered user {user.name} (user_id: {user.id}) attempted to forward a message into the group chat.")
 
-        await message.delete()
-        # Ban user if they sent image within 60 seconds of joining the group chat
-        userJoined = context.chat_data.get(user.id)
-        if userJoined is not None:
-            # compare the timestamps
-            if userJoined > (datetime.now() - timedelta(seconds=60)):
-                print("ban user for spam")
-                await chat.ban_member(user.id)
-                return
-        
-        await context.bot.send_message(
-            chat_id=chat.id,
-            message_thread_id=topicID,
-            text=f"Start a private chat with the @{config.botName} to forward messages to this chat."
-        )
-
-        return
+        try:
+            await message.delete()
+            # Ban user if they sent image within 60 seconds of joining the group chat
+            userJoined = context.chat_data.get(user.id)
+            if userJoined is not None:
+                # compare the timestamps
+                if userJoined > (datetime.now() - timedelta(seconds=60)):
+                    logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
+                    await chat.ban_member(user.id)
+                    return
+            
+            await context.bot.send_message(
+                chat_id=chat.id,
+                message_thread_id=topicID,
+                text=f"Start a private chat with the @{config.botName} to forward messages to this chat."
+            )
+        except Exception as err:
+            logger.error(f"Exception while handling potential spam message (forwarded message):\n{err}")
+        finally:
+            return
     
-    logger.info(f"Registered user {user.name} (user_id: {user.id}) forwarded a message.")
-#good
+    minimumCommunityScore = 20
+    # Set the allowed roles
+    allowedRoles = ["tester", "marketing", "admin", "owner"]
+
+    community = communities.getCommunityByTelegramID(chat.id)
+    if community is None:
+        # This should technically not be able to happen, but can due to DB error, etc
+        logger.warning(f"User {user.name} (user_id: {user.id}) attempted to forward a message in an unregistered group chat.")
+        try:
+            await message.delete()
+        except Exception as err:
+            logger.error(f"Exception while deleting a potential spam message (forwarded message):\n{err}")
+        finally:
+            # Exit the function
+            return
+    
+    # Combine the user and group roles into rolesAvailable
+    rolesAvailable = set(member["roles"] + community["roles"])
+
+    if (not any(role in rolesAvailable for role in allowedRoles)) and member["community_score"] < minimumCommunityScore:
+        logger.info(f"User {user.name} (user_id: {user.id}) does not meet the minimum community score to forward messages in a {chat.type} chat.")
+        try:
+            await message.delete()
+            await context.bot.send_message(
+                chat_id=chat.id,
+                message_thread_id=topicID,
+                text=f"You need a minimum community score of {minimumCommunityScore} to forward messages in the {community.get("community_name")} chat."
+            )
+        except Exception as err:
+            logger.error(f"Exception while handling potential spam message (forwarded message):\n{err}")
+        finally:
+            return
+
 
 async def errorHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Add "exc_info=context.error" for traceback info
-    logger.error(msg=f"Exception while handling an update:\n{context.error}")
+    logger.error(f"Exception while handling an update:\n{context.error}")
 
 
 
