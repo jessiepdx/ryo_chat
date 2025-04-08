@@ -135,21 +135,22 @@ async def startBot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Check if the user is already registered
     member = members.getMemberByTelegramID(user.id)
 
-    if member is None:
-        logger.info(f"New user {user.name} (user_id: {user.id}) being registered with the chatbot.")
-        # There is no account for this user, begin registration process
-        newAccount = {
-            "username": user.username,
-            "user_id": user.id,
-            "first_name": user.first_name,
-            "last_name": user.last_name,
-            "email": None,
-            "roles": ["user"],
-            "register_date": datetime.now()
-        }
-        members.addMemberFromTelegram(newAccount)
+    try:
+        if member is None:
+            logger.info(f"New user {user.name} (user_id: {user.id}) being registered with the chatbot.")
+            # There is no account for this user, begin registration process
+            newAccount = {
+                "username": user.username,
+                "user_id": user.id,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "email": None,
+                "roles": ["user"],
+                "register_date": datetime.now()
+            }
+            members.addMemberFromTelegram(newAccount)
 
-        try:
+        
             # TODO get official community chat links from config and insert into the welcome message
             welcomeMessage = f"""Welcome {user.name}, I am the {config.botName} chatbot. 
 You will need to have a minimum community score of 50 to chat with me in private. 
@@ -160,17 +161,14 @@ Use the /help command for more information."""
             await message.reply_text(
                 text=welcomeMessage
             )
-        except Exception as err:
-            logger.error("Exception while sending a telegram message", exc_info=err)
-            #logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
-
-    else:
-        # A user with this id is already registered
-        logger.info(f"User {user.name} (user_id: {user.id}) is already registered.")
-        try:
+        
+        else:
+            # A user with this id is already registered
+            logger.info(f"User {user.name} (user_id: {user.id}) is already registered.")
             await message.reply_text(f"Welcome back {user.name}, you are already registered with the {config.botName} chatbot.")
-        except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        
+    except Exception as err:
+        logger.error(f"Exception while replying to a telegram message:\n{err}")
 
 
 # Launch the Miniapp Dashboard.
@@ -237,7 +235,7 @@ Tag @{config.botName} in your message to get a response from the chatbot. The ch
     try:
         await message.reply_text(text=helpMsg)
     except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while replying to a telegram message:\n{err}")
 
 
 # Display user and chat group data
@@ -274,7 +272,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Leave the group chat
                 await context.bot.leave_chat(chat.id)
             except Exception as err:
-                logger.warning(f"The following error occurred while leaving the group chat:  {err}.")
+                logger.error(f"Exception while leaving the group chat:\n{err}")
             finally:
                 # Exit the function
                 return
@@ -292,8 +290,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=infoMsg
         )
     except Exception as err:
-            logger.error(msg="Exception while replying to a telegram message", exc_info=err, stack_info=False)
-            #logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"Exception while replying to a telegram message\n{err}")
 
 
 
@@ -315,7 +312,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             reply_markup=ReplyKeyboardRemove()
         )
     except Exception as err:
-        logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.warning(f"Exception while replying to a telegram message:\n{err}")
     finally:
         return ConversationHandler.END
 
@@ -343,7 +340,7 @@ async def beginGenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=f"Only members are able to use the /generate command. To register your telegram account with the {config.botName} chatbot, open a private chat with @{config.botName} and send the /start command."
             )
         except Exception as err:
-            logger.warning(f"The following error occurred:  {err}.")
+            logger.error(f"Exception while replying to a telegram message:\n{err}")
         finally:
             return ConversationHandler.END
     else:
@@ -359,7 +356,7 @@ async def beginGenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             return SET_SYSTEM_PROMPT
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"Exception while replying to a telegram message:\n{err}")
             context.chat_data["generate_data"] = None
 
             return ConversationHandler.END
@@ -382,7 +379,7 @@ async def setSystemPrompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         return SET_PROMPT
     except Exception as err:
-        logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while replying to a telegram message:\n{err}.")
         # Clear the generate data from telegram storage
         gd = None
 
@@ -406,7 +403,7 @@ async def skip_systemPrompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         return SET_PROMPT
     except Exception as err:
-        logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while replying to a telegram message:\n{err}.")
         gd = None
 
         return ConversationHandler.END
@@ -422,17 +419,21 @@ async def setPrompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     systemPromptText = config.defaults["system_prompt"] + gd["system_prompt"]
     
     generateClient = AsyncClient(host=config.inference["generate"]["url"])
-    # TODO Wrap in try except block
-    output = await generateClient.generate(
-        model=config.inference["generate"]["model"], 
-        stream=False, 
-        system=systemPromptText, 
-        prompt=message.text
-    )
-    responseText = output["response"]
-
-    # Delete the generate data from telegram bot storage
-    context.chat_data["generate_data"] = None
+    
+    try:
+        output = await generateClient.generate(
+            model=config.inference["generate"]["model"], 
+            stream=False, 
+            system=systemPromptText, 
+            prompt=message.text
+        )
+        responseText = output["response"]
+    except Exception as err:
+        logger.error(f"Exception while generating a response from Ollama:\n{err}")
+        return ConversationHandler.END
+    finally:
+        # Delete the generate data from telegram bot storage
+        context.chat_data["generate_data"] = None
     
     try:
         await context.bot.send_message(
@@ -442,9 +443,9 @@ async def setPrompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=responseText
         )
     except Exception as err:
-        logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
-        gd = None
+        logger.error(f"Exception while sending a telegram message:\n{err}")
     finally:
+        gd = None
         return ConversationHandler.END
 
 
@@ -493,29 +494,29 @@ async def knowledgeManger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             return HANDLE_KNOWLEDGE_TYPE
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"Exception while replying to a telegram message:\n{err}")
             context.chat_data["new_knowledge"] = None
 
             return ConversationHandler.END
         
     # The follwoing code only runs if the user is not authorized above
-    logger.info(f"User {user.name} (user_id: {user.id}) is not authorized to use knowledge command.")
+    logger.warning(f"User {user.name} (user_id: {user.id}) is not authorized to use knowledge command.")
     try:
         await message.reply_text(text="Only admins are authorized to use the knowledge command.")
     except Exception as err:
-        logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while sending a telegram message:\n{err}")
     finally:
         return ConversationHandler.END
 
 
 async def setKnowledgeType(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Knowledge visibity received. Get knowledge text.")
+    logger.info("Knowledge visibity received. Get knowledge text.")
 
     query = update.callback_query
     try:
         await query.answer()
     except Exception as err:
-        logger.warning(f"The following error occurred while receiving a telegram query response:  {err}.")
+        logger.error(f"Exception while receiving a telegram query response:\n{err}")
         return
     
     nk = context.chat_data.get("new_knowledge")
@@ -528,7 +529,7 @@ async def setKnowledgeType(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return HANDLE_KNOWLEDGE_TEXT
     except Exception as err:
-        logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while sending a telegram message:\n{err}")
         nk = None
 
         return ConversationHandler.END
@@ -548,7 +549,7 @@ async def setKnowledgeText(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return HANDLE_KNOWLEDGE_SOURCE
     except Exception as err:
-        logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while replying to a telegram message:\n{err}.")
         nk = None
 
         return ConversationHandler.END
@@ -568,7 +569,7 @@ async def setKnowledgeSource(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         return HANDLE_KNOWLEDGE_CATEGORY
     except Exception as err:
-        logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while replying to a telegram message:\n{err}")
         nk = None
 
         return ConversationHandler.END
@@ -589,14 +590,14 @@ async def skip_knowledgeSource(update: Update, context: ContextTypes.DEFAULT_TYP
 
         return HANDLE_KNOWLEDGE_CATEGORY
     except Exception as err:
-        logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while replying to a telegram message:\n{err}")
         nk = None
 
         return ConversationHandler.END
 
 
 async def setKnowledgeCategories(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Knowledge category tag received. Call final method to save.")
+    logger.info("Knowledge category tag received. Call final method to save.")
     message = update.effective_message
 
     nk = context.chat_data.get("new_knowledge")
@@ -629,7 +630,7 @@ Do you wish to save?
 
         return STORE_KNOWLEDGE
     except Exception as err:
-        logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while replying to a telegram message:\n{err}.")
         nk = None
         
         return ConversationHandler.END
@@ -671,7 +672,7 @@ Do you wish to save?
 
         return STORE_KNOWLEDGE
     except Exception as err:
-        logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while replying to a telegram message:\n{err}.")
         nk = None
 
         return ConversationHandler.END
@@ -686,7 +687,7 @@ async def finalizeKnowledge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.answer()
     except Exception as err:
-        logger.warning(f"The following error occurred:  {err}.")
+        logger.error(f"Exception while receiving a telegram query response:\n{err}")
         return
     
     nk = context.chat_data.get("new_knowledge")
@@ -697,7 +698,7 @@ async def finalizeKnowledge(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # If somehow an unregistered user made it to this point
         if member is None:
-            logger.info(f"An unregistered user {user.name} (user_id: {user.id}) attempted to save data to the knowledge database.")
+            logger.warning(f"An unregistered user {user.name} (user_id: {user.id}) attempted to save data to the knowledge database.")
             return ConversationHandler.END
         
         allowedRoles = ["admin", "owner"]
@@ -723,7 +724,7 @@ async def finalizeKnowledge(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=f"Document stored. Record ID:  {record_id}"
                 )
             except Exception as err:
-                logger.warning(f"The following error occurred while editing a telegram message:  {err}.")
+                logger.error(f"Exception while editing a telegram message:\n{err}")
             finally:
                 # Delete the newKnowledge property in chat_data
                 nk = None
@@ -731,13 +732,13 @@ async def finalizeKnowledge(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return ConversationHandler.END
         
         # The follwoing code only runs if the user is not authorized in the above for loop
-        logger.info(f"User {user.name} (user_id: {user.id}) is not authorized to use knowledge command.")
+        logger.warning(f"User {user.name} (user_id: {user.id}) is not authorized to use knowledge command.")
         try:
             await message.reply_text(
                 text="Only admins are authorized to use the knowledge command."
             )
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"Exception while replying to a telegram message:\n{err}")
         finally:
             return ConversationHandler.END
 
@@ -749,7 +750,7 @@ async def finalizeKnowledge(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="You've selected to not save the knowledge data. Process ended."
             )
         except Exception as err:
-            logger.warning(f"The following error occurred while editing a telegram message:  {err}.")
+            logger.error(f"Exception while editing a telegram message:\n{err}")
         finally:
             return ConversationHandler.END
 
@@ -772,7 +773,7 @@ async def promoteAccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     member = members.getMemberByTelegramID(user.id)
 
     if member is None:
-        logger.info(f"A non-registered user {user.name} (user_id: {user.id}) attempted to use the promote command.")
+        logger.warning(f"A non-registered user {user.name} (user_id: {user.id}) attempted to use the promote command.")
         return
 
     # First check if user has valid roles. 
@@ -806,7 +807,7 @@ async def promoteAccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=reply_markup
                     )
                 except Exception as err:
-                    logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+                    logger.error(f"Exception while replying to a telegram message:\n{err}")
                 finally:
                     return VERIFY_PROMOTE
                 
@@ -817,7 +818,7 @@ async def promoteAccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text=f"User {userToPromote.name} is not a registered user.", 
                     )
                 except Exception as err:
-                    logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+                    logger.error(f"Exception while sending a telegram message:\n{err}")
                 finally:
                     return ConversationHandler.END
                 
@@ -844,7 +845,7 @@ async def promoteAccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=reply_markup
                     )
                 except Exception as err:
-                    logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+                    logger.error(f"Exception while replying to a telegram message:\n{err}")
                 finally:
                     return VERIFY_PROMOTE
         else:
@@ -855,7 +856,7 @@ async def promoteAccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Member is registered but not authorized
     else:
-        logger.info(f"A non-authorized member {user.name} (user_id: {user.id}) attempted to use the promote command.")
+        logger.warning(f"A non-authorized member {user.name} (user_id: {user.id}) attempted to use the promote command.")
 
         return ConversationHandler.END
 
@@ -865,17 +866,25 @@ async def setNewRole(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat = update.effective_chat
     user = update.effective_user
-    await query.answer()
+    
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception as err:
+        logger.error(f"Exception while receiving a telegram query response:\n{err}")
+        return
+    
     memberToPromote = context.chat_data.get("member_to_promote")
 
     if memberToPromote:
         # Get the telegram user from member data
-        userToPromote = await context.bot.get_chat_member(chat_id=chat.id, user_id=memberToPromote["user_id"])
-        logger.info(f"User {user.name} (user_id: {user.id}) is promoting {userToPromote.user.name} ({userToPromote.user.id}) to the role of {query.data}.")
+        try:
+            userToPromote = await context.bot.get_chat_member(chat_id=chat.id, user_id=memberToPromote["user_id"])
+            logger.info(f"User {user.name} (user_id: {user.id}) is promoting {userToPromote.user.name} ({userToPromote.user.id}) to the role of {query.data}.")
+        except Exception as err:
+            logger.error(f"Exception while getting telegram user information:\n{err}")
 
-        #userToPromote = context.chat_data["user_to_promote"]
         memberToPromote["roles"].append(query.data)
-        #results = accounts.updateRoles(userToPromoteData["roles"], userToPromoteData["user_id"])
         results = members.updateMemberRoles(memberToPromote.get("member_id"), memberToPromote.get("roles"))
         if results:
             responseText = f"{userToPromote.user.name} has been promoted to {query.data} role."
@@ -907,7 +916,7 @@ async def setNewRole(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=responseText
         )
     except Exception as err:
-        logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while editing a telegram message:\n{err}")
     finally:
         return ConversationHandler.END
 
@@ -1248,7 +1257,7 @@ async def newsletterStart(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     member = members.getMemberByTelegramID(user.id)
 
     if member is None:
-        logger.info(f"An unregistered user {user.name} (user_id: {user.id}) attempted to use the newsletter command.")
+        logger.warning(f"An unregistered user {user.name} (user_id: {user.id}) attempted to use the newsletter command.")
         # Exit the function if there is no user account
         return ConversationHandler.END
 
@@ -1262,7 +1271,7 @@ async def newsletterStart(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         community = communities.getCommunityByTelegramID(chat.id)
 
         if community is None:
-            logger.info(f"User {user.name} (user_id: {user.id}) attempted to use the newsletter command in an unregistered group chat.")
+            logger.warning(f"User {user.name} (user_id: {user.id}) attempted to use the newsletter command in an unregistered group chat.")
             # Exit the function, there is no group account
             return ConversationHandler.END
         
@@ -1320,11 +1329,9 @@ async def newsletterStart(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 reply_markup=reply_markup
             )
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"Exception while replying to a telegram message:\n{err}")
         finally:
             return ROLE_SELECTION
-            
-
 
     else:
         logStr = f"User {user.name} (user_id: {user.id}) (roles:  {', '.join(member['roles'])}) is NOT authorized to use the newsletter command"
@@ -1346,7 +1353,7 @@ async def selectRole(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.answer()
     except Exception as err:
-        logger.warning(f"The following error occurred while receiving a telegram query response:  {err}.")
+        logger.error(f"Exception while receiving a telegram query response:\n{err}")
         return
 
     nd = context.chat_data["newsletter_data"]
@@ -1387,7 +1394,7 @@ async def selectRole(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ROLE_SELECTION
     
     except Exception as err:
-        logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+        logger.error(f"Exception while editing a telegram message:\n{err}")
         return
 
 
@@ -1397,7 +1404,7 @@ async def roleSelectionDone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.answer()
     except Exception as err:
-        logger.warning(f"The following error occurred while receiving a telegram query response:  {err}.")
+        logger.error(f"Exception while receiving a telegram query response:\n{err}")
         return
 
     nd = context.chat_data["newsletter_data"]
@@ -1421,7 +1428,7 @@ async def roleSelectionDone(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return PHOTO_OPTION
             except Exception as err:
-                logger.warning(f"The following error occurred while editing a telegram query message:  {err}.")
+                logger.error(f"Excpetion while editing a telegram query message:\n{err}")
                 return
 
         else:
@@ -1441,7 +1448,7 @@ async def roleSelectionDone(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return CONFIRM_NEWSLETTER
             except Exception as err:
-                logger.warning(f"The following error occurred while editing a telegram query message:  {err}.")
+                logger.error(f"Exception while editing a telegram query message:\n{err}")
                 return
     
     return ConversationHandler.END
@@ -1453,30 +1460,28 @@ async def photoOption(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.answer()
     except Exception as err:
-        logger.warning(f"The following error occurred while receiving a telegram query response:  {err}.")
+        logger.error(f"Execption while receiving a telegram query response:\n{err}")
         return
     
     nd = context.chat_data["newsletter_data"]
 
-    if query.data == "yes":
-        try:
+    try:
+        if query.data == "yes":
             await query.edit_message_text(
                 text="Send the image you wish to add to the newsletter"
             )
             return ADD_PHOTO
-        except Exception as err:
-            logger.warning(f"The following error occurred while editing a telegram query message:  {err}.")
-            return
-    else:
+
+        else:
         # Get newsletter body text
-        try:
             await query.edit_message_text(
                 text=f"Compose the text of the newsletter. Newsletter will be sent to the following roles: {', '.join(nd['roles'])}"
             )
             return COMPOSE_NEWLETTER
-        except Exception as err:
-            logger.warning(f"The following error occurred while editing a telegram query message:  {err}.")
-            return
+        
+    except Exception as err:
+        logger.error(f"Exception while editing a telegram query message:\n{err}")
+        return
 
 
 async def addNewsletterPhoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1496,7 +1501,7 @@ async def addNewsletterPhoto(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return COMPOSE_NEWLETTER
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"Exception while sending a telegram message:\n{err}")
             return
     else:
         logger.info("There was an issue getting the photo.")
@@ -1522,27 +1527,25 @@ async def addNewsletterText(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Check if a photo was added and reply with photo and caption if so
         newsletterPhoto = nd.get("photo")
-        if newsletterPhoto is not None:
-            logger.info("Newsletter has a photo.")
-            try:
+
+        try:
+            if newsletterPhoto is not None:
+                logger.info("Newsletter has a photo.")
                 await message.reply_photo(
                     photo=newsletterPhoto,
                     caption=f"Here's your newsletter:\n\n{nd['text']}\n\nSending to the following roles: {', '.join(nd['roles'])}",
                     reply_markup=reply_markup
                 )
-            except Exception as err:
-                logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
-                return
-        else:
-            logger.info("Newsletter has no photo.")
-            try:
+
+            else:
+                logger.info("Newsletter has no photo.")
                 await message.reply_text(
                     text=f"Here's your newsletter:\n\n{nd['text']}\n\nSending to the following roles: {', '.join(nd['roles'])}",
                     reply_markup=reply_markup
                 )
-            except Exception as err:
-                logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
-                return
+        except Exception as err:
+            logger.error(f"Exception while replying to a telegram message:\n{err}")
+            return
 
         return CONFIRM_NEWSLETTER
     else:
@@ -1556,7 +1559,7 @@ async def confirmNewsletter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.answer()
     except Exception as err:
-        logger.warning(f"The following error occurred while receiving a telegram query response:  {err}.")
+        logger.error(f"Exception while receiving a telegram query response:\n{err}")
         return
     
     nd = context.chat_data["newsletter_data"]
@@ -1572,7 +1575,7 @@ async def confirmNewsletter(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text="Sending..."
                 )
         except Exception as err:
-            logger.warning(f"The following error occurred while editing a telegram query message:  {err}.")
+            logger.error(f"Exception while editing a telegram query message:\n{err}")
             return
         
         membersInRoles = members.getMembersByRoles(nd["roles"])
@@ -1604,7 +1607,7 @@ async def confirmNewsletter(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=f"Sent:\n\n{nd['text']}\n\nto the following roles: {', '.join(nd['roles'])}"
                 )
         except Exception as err:
-            logger.warning(f"The following error occurred while editing a telegram query message:  {err}.")
+            logger.error(f"Exception while editing a telegram query message:\n{err}")
     else:
         try:
             if query.message.caption is not None:
@@ -1616,7 +1619,7 @@ async def confirmNewsletter(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=f"Newsletter not sent"
                 )
         except Exception as err:
-            logger.warning(f"The following error occurred while editing a telegram query message:  {err}.")
+            logger.error(f"Exception while editing a telegram query message:\n{err}")
             return
     
     return ConversationHandler.END
@@ -1768,17 +1771,6 @@ async def openProposal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def catchAllMessages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"A message was captured by the catch all function.")
 
-    # TEST
-    print(update.message.entities)
-    entities = update.message.parse_entities([MessageEntity.URL, MessageEntity.TEXT_LINK])
-    links = []
-    for entity in entities:
-            if entity == MessageEntity.TEXT_LINK:
-                links.append(entities[entity].url)
-            elif entities[entity].type == MessageEntity.URL:
-                links.append(entities[entity])
-
-    print(links)
 
 # TODO when incoming message, check if the model is loaded and if not preload the main chat model before doing embeddings and db lookup. This may increase response time.
 
@@ -1802,11 +1794,11 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     member = members.getMemberByTelegramID(user.id)
 
     if member is None:
-        logger.info(f"An unregistered user {user.name} (user_id: {user.id}) attempted to message the chatbot in {community['chat_title']} group chat.")
+        logger.warning(f"An unregistered user {user.name} (user_id: {user.id}) attempted to message the chatbot in {community['chat_title']} group chat.")
         try:
             await message.reply_text(text=f"To message {config.botName}, open a private message to the chatbot @{config.botName} and click start.")
         except Exception as err:
-            logger.warning(f"The following error occurred while sending a telegram message:  {err}.")
+            logger.error(f"The following error occurred while sending a telegram message:\n{err}")
         finally:
             # No member account, exit the function
             return  
@@ -2587,7 +2579,8 @@ async def handleForwardedMessage(update: Update, context: ContextTypes.DEFAULT_T
 #good
 
 async def errorHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Exception while handling an update:", exc_info=context.error)
+    # Add "exc_info=context.error" for traceback info
+    logger.error(msg=f"Exception while handling an update:\n{context.error}")
 
 
 
@@ -2748,7 +2741,8 @@ def main() -> None:
     application.add_error_handler(errorHandler)
 
     # Run the bot until the user presses Ctrl-C
-    application.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=5, bootstrap_retries=3, timeout=50)
+    # poll_interval=5, bootstrap_retries=3, timeout=50
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

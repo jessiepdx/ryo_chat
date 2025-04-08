@@ -68,6 +68,8 @@ logger = logging.getLogger(__name__)
 
 config = ConfigManager()
 
+# TODO Check if the twitter keys exist at all and throw critical if not
+
 client = tweepy.asynchronous.AsyncClient(
     consumer_key=config.twitter_keys["consumer_key"],
     consumer_secret=config.twitter_keys["consumer_secret"],
