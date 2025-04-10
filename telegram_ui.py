@@ -76,7 +76,7 @@ for handler in logging.root.handlers[:]:
 # Set the basic config to append logging data to a file
 logPath = "logs/"
 logFilename = "telegram_log_" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".txt"
-print(logPath + logFilename)
+#print(logPath + logFilename)
 logging.basicConfig(
     filename=logPath+logFilename,
     filemode="a",
@@ -94,6 +94,7 @@ logging.getLogger().addHandler(console)
 # set higher logging level for httpx to avoid all GET and POST requests being logged
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("hypermindlabs.utils").setLevel(logging.INFO)
 logging.getLogger("telegram").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
@@ -178,11 +179,11 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if config.webUIUrl is None:
         # TODO message the user / owner account that the config for the dashboard is missing
-        print("missing webUI URL from config")
+        #print("missing webUI URL from config")
         return
     
     logger.info(f"Dashboard command issued by {user.name} (user_id: {user.id}).")
-    print(config.webUIUrl + "miniapp/dashboard")
+    #print(config.webUIUrl + "miniapp/dashboard")
     
     keyboard = [
         [
@@ -710,13 +711,13 @@ async def finalizeKnowledge(update: Update, context: ContextTypes.DEFAULT_TYPE):
             document = nk.get("text")
             documentMetadata = dict()
             categories = [] if nk.get("categories") is None else nk.get("categories")
-            print(categories)
+            #print(categories)
             source = nk.get("source")
             if source:
                 documentMetadata["source"] = source
             
             record_id = knowledge.addDocument(document, categories=categories, documentMetadata=documentMetadata)
-            print(record_id)
+            #print(record_id)
 
             try:
                 # Edit telegram message
