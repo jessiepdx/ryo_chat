@@ -5,12 +5,6 @@
 {% block content %}
 <!-- Interface specific imports and input handling, as well as chat history intake api -->
 
-<!-- Marked.js for Markdown parsing -->
-<script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
-
-<!-- Highlight.js library: updated from cdnjs so that hljs is defined -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
-
 
 <style>
     
@@ -46,15 +40,21 @@
   }
   #input-section {
     display: flex;
+    width:100%;
   }
   #user-input {
     flex: 1;
     padding: 0.5em;
     margin-right: 0.5em;
+    background-color: var(--accent-ternery);
+
   }
   #send-btn {
     padding: 0.5em 1em;
     cursor: pointer;
+    display: flex;
+    flex-flow: column;
+    justify-content: center;
   }
 </style>
 
@@ -65,11 +65,24 @@
     <!-- Chat messages will appear here -->
 </div>
 
+
+
+{% endblock %}
+
+{% block footer %}
+<!-- Marked.js for Markdown parsing -->
+<script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
+
+<!-- Highlight.js library: updated from cdnjs so that hljs is defined -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+
+
 <div id="input-section">
-  <!-- Start with a single-line input; this may be replaced by a textarea -->
-  <input type="text" id="user-input" placeholder="Type a message...">
-  <button id="send-btn">Send</button>
-</div>
+    <!-- Start with a single-line input; this may be replaced by a textarea -->
+    <input type="text" id="user-input" placeholder="Type a message...">
+    <button id="send-btn">Send</button>
+  </div>
+
 
 <script>
     // Configure marked for code highlighting.
@@ -222,5 +235,4 @@
   \`\`\`
   `);
   </script>
-
-{% endblock %}
+  {% endblock %}
