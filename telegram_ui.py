@@ -58,7 +58,8 @@ from hypermindlabs.utils import (
     CustomFormatter,
     KnowledgeManager, 
     MemberManager, 
-    ProposalManager, 
+    ProposalManager,
+    SpamManager,
     UsageManager
 )
 from hypermindlabs.agents import ConversationOrchestrator, ConversationalAgent, ImageAgent, TweetAgent
@@ -115,6 +116,7 @@ config = ConfigManager()
 knowledge = KnowledgeManager()
 members = MemberManager()
 proposals = ProposalManager()
+spam = SpamManager()
 usage = UsageManager()
 
 
@@ -2128,8 +2130,47 @@ async def otherGroupChat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     community = communities.getCommunityByTelegramID(chat.id)
     member = members.getMemberByTelegramID(user.id)
+    score = 0 if member is None else member.get("community_score")
+    userJoined = context.chat_data.get(user.id)
+
+    minimumCommunityScore = 20
+    spamDistanceThreshold = 10
+    # Set the allowed roles
+    allowedRoles = ["tester", "marketing", "admin", "owner"]
+    rolesAvailable = list() if member is None else member.get("roles")
     
-    if community and member:
+    # Check message for spam content
+    if member is None or (score < minimumCommunityScore and not any(role in rolesAvailable for role in allowedRoles)):
+        logger.info("Check message for spam.")
+        results = spam.searchSpam(message.text)
+        if len(results) > 0:
+            distance = results[0].get("distance")
+            if distance < spamDistanceThreshold:
+                logger.warning("Spam message detected")
+                try:
+                    # Delete the message
+                    await message.delete()
+
+                    # Check how long the user has been in the chat
+                    if userJoined is not None:
+                        if userJoined > (datetime.now() - timedelta(seconds=60)):
+                            logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
+                            await chat.ban_member(user.id)
+                            return
+                    
+                    # User not banned, send a requirement message
+                    await context.bot.send_message(
+                        chat_id=chat.id,
+                        message_thread_id=topicID,
+                        text=f"Potential spam message deleted."
+                    )
+                
+                except Exception as error:
+                    logger.error(f"Exception while handling potential spam message:\n{error}")
+                finally:
+                    return
+    
+    if community is not None and member is not None:
         # Update the chat history database with the newest message
         messageHistoryID = chatHistory.addChatHistory(
             messageID=message.message_id, 

@@ -1694,6 +1694,137 @@ class ProposalManager:
                 logger.debug(f"PostgreSQL connection is closed.")
 
 
+class SpamManager:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(SpamManager, cls).__new__(cls)
+            # Intialize the new singleton
+
+            connection = None
+            try:
+                connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
+                cursor = connection.cursor()
+                logger.debug(f"PostgreSQL connection established.")
+                
+                # Create the knowledge table if it does not exist
+                createSpamSQL = """CREATE TABLE IF NOT EXISTS spam (
+                    spam_id SERIAL PRIMARY KEY,
+                    spam_text TEXT,
+                    embeddings vector(768),
+                    record_timestamp TIMESTAMP,
+                    added_by INT,
+                    CONSTRAINT member_link
+                        FOREIGN KEY(added_by)
+                        REFERENCES member_data(member_id)
+                        ON DELETE SET NULL
+                );"""
+                cursor.execute(createSpamSQL)
+                connection.commit()
+
+                # close the communication with the PostgreSQL
+                cursor.close()
+            except (Exception, psycopg.DatabaseError) as error:
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+            finally:
+                if connection is not None:
+                    connection.close()
+                    logger.debug(f"PostgreSQL connection is closed.")
+
+        return cls._instance
+
+    def addSpamText(self, spamText: str, addedBy: int) -> int:
+        logger.info(f"Adding a new spam message.")
+        embedding = getEmbeddings(spamText)
+        # TODO Validate member data
+        member = MemberManager().getMemberByID(addedBy)
+        if member is None:
+            return None
+        
+        connection = None
+        recordID = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+
+            insertSQL = """INSERT INTO spam (spam_text, embeddings, record_timestamp, added_by)
+            VALUES (%s, %s, %s, %s)
+            RETURNING spam_id;"""
+            cursor.execute(insertSQL, (spamText, embedding, datetime.now(), addedBy))
+            recordID = cursor.fetchone()[0]
+            connection.commit()
+            # close the communication with the PostgreSQL
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+
+            return recordID
+
+    def getSpam(self) -> list:
+        logger.info(f"Get spam messages.")
+
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+
+            querySQL = """SELECT spam_id, spam_text, record_timestamp, added_by
+            FROM spam
+            LIMIT 10"""
+            cursor.execute(querySQL)
+            results = cursor.fetchall()
+
+            response = results
+            # close the communication with the PostgreSQL
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            
+            return response
+
+    def searchSpam(self, text: str, limit: int=1) -> list:
+        logger.info(f"Searching spam messages.")
+        embedding = getEmbeddings(text)
+
+        connection = None
+        response = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+
+            querySQL = """SELECT spam_id, spam_text, embeddings <-> %s::vector AS distance, record_timestamp, added_by
+            FROM spam
+            ORDER BY distance
+            LIMIT %s"""
+            cursor.execute(querySQL, (embedding, limit))
+            results = cursor.fetchall()
+
+            response = results
+            # close the communication with the PostgreSQL
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            
+            return response
+
+
 class UsageManager:
     _instance = None
 
