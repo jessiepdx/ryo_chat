@@ -3,6 +3,240 @@
 {% block title %}{{ contentData.title }}{% endblock %}
 
 {% block content %}
-<h3>Agent Playground stuff</h3>
-<p>More preprossing and out put here</p>
+<!-- Interface specific imports and input handling, as well as chat history intake api -->
+
+
+<style>
+    
+  #chat-container {
+    flex: 1;
+    overflow-y: auto;
+    margin:calc(-1 * var(--mini-rem));
+    padding:var(--mini-rem);
+    display:flex;
+    flex-flow:column;
+    gap:var(--mini-rem);
+  }
+  .message {
+    max-width: 80%;
+    padding: 0.8em;
+    border-radius: 6px;
+    line-height: 1.4;
+    word-wrap: break-word;
+  }
+  .user {
+    background-color: var(--accent-dark);
+    border: 1px solid var(--accent-border);
+    align-self: flex-end;
+    margin-left: auto;
+  }
+  .assistant {
+    background-color: var(--accent-ternery);
+    border: 1px solid var(--accent-border);
+    align-self: flex-start;
+    margin-right: auto;
+  }
+  .system {
+    background-color: var(--accent-grey);
+    border: 1px solid var(--accent-border);
+    align-self: center;
+    font-style: italic;
+  }
+  #input-section {
+    display: flex;
+    width:100%;
+  }
+  #user-input {
+    flex: 1;
+    padding: 0.5em;
+    margin-right: 0.5em;
+    background-color: var(--accent-ternery);
+
+  }
+  #send-btn {
+    padding: 0.5em 1em;
+    cursor: pointer;
+    display: flex;
+    flex-flow: column;
+    justify-content: center;
+  }
+</style>
+
+<!-- Main Area Content -->
+
+
+<div id="chat-container">
+    <!-- Chat messages will appear here -->
+</div>
+
+
+
 {% endblock %}
+
+{% block footer %}
+<!-- Marked.js for Markdown parsing -->
+<script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
+
+<!-- Highlight.js library: updated from cdnjs so that hljs is defined -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+
+
+<div id="input-section">
+    <!-- Start with a single-line input; this may be replaced by a textarea -->
+    <input type="text" id="user-input" placeholder="Type a message...">
+    <button id="send-btn">Send</button>
+  </div>
+
+
+<script>
+    // Configure marked for code highlighting.
+    marked.setOptions({
+      highlight: function(code, lang) {
+        if (lang && hljs.getLanguage(lang)) {
+          return hljs.highlight(code, { language: lang }).value;
+        }
+        return hljs.highlightAuto(code).value;
+      }
+    });
+  
+    const chatContainer = document.getElementById('chat-container');
+    const inputSection = document.getElementById('input-section');
+    let userInput = document.getElementById('user-input'); // will be swapped with a textarea if needed
+    const sendBtn = document.getElementById('send-btn');
+  
+    // Append a message to the chat. 'role' should be "system", "assistant", or "user".
+    // 'content' is a markdown string (with code blocks via triple backticks).
+    function addMessage(role, content) {
+      const messageDiv = document.createElement('div');
+      messageDiv.classList.add('message', role);
+      const html = marked.parse(content);
+      messageDiv.innerHTML = html;
+      chatContainer.appendChild(messageDiv);
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+  
+    // Send the current message and then revert to an input if necessary.
+    function sendMessage() {
+      const text = userInput.value.trim();
+      if (!text) return;
+      addMessage('user', text);
+      userInput.value = '';
+      // After sending, if in textarea mode or text reduces to one line, revert to input.
+      maybeSwitchToInput();
+    }
+  
+    // Switch the current element from an <input> to a <textarea>.
+    function switchToTextarea() {
+      const oldValue = userInput.value;
+      const newEl = document.createElement('textarea');
+      newEl.id = 'user-input';
+      newEl.placeholder = 'Type a message...';
+      newEl.style.flex = '1';
+      newEl.style.padding = '0.5em';
+      newEl.style.marginRight = '0.5em';
+      // Append a newline so the user starts on a new line.
+      newEl.value = oldValue + '\n';
+      attachListeners(newEl);
+      inputSection.replaceChild(newEl, userInput);
+      userInput = newEl;
+      userInput.focus();
+      userInput.setSelectionRange(userInput.value.length, userInput.value.length);
+    }
+  
+    // Switch the current element from a <textarea> back to an <input>.
+    function switchToInput() {
+      const oldValue = userInput.value;
+      const newEl = document.createElement('input');
+      newEl.type = 'text';
+      newEl.id = 'user-input';
+      newEl.placeholder = 'Type a message...';
+      newEl.style.flex = '1';
+      newEl.style.padding = '0.5em';
+      newEl.style.marginRight = '0.5em';
+      // Remove any newline characters so we get a single-line string.
+      newEl.value = oldValue.replace(/\n/g, '');
+      attachListeners(newEl);
+      inputSection.replaceChild(newEl, userInput);
+      userInput = newEl;
+      userInput.focus();
+      userInput.setSelectionRange(userInput.value.length, userInput.value.length);
+    }
+  
+    // Returns true if the given text contains no newline characters.
+    function isSingleLine(text) {
+      return !text.includes('\n');
+    }
+  
+    // Check the content; if it's only a single line, switch back to the input box.
+    function maybeSwitchToInput() {
+      if (userInput.tagName.toLowerCase() === 'textarea' && isSingleLine(userInput.value)) {
+        switchToInput();
+      }
+    }
+  
+    // Attach event listeners to the element (input or textarea)
+    function attachListeners(el) {
+      el.addEventListener('keydown', (e) => {
+        // Branch according to whether we're dealing with an input or textarea.
+        if (el.tagName.toLowerCase() === 'input') {
+          // In input mode, use:
+          // Shift+Enter: switch to textarea.
+          // Enter (no modifiers): send message.
+          if (e.key === 'Enter') {
+            if (e.shiftKey) {
+              e.preventDefault();
+              switchToTextarea();
+            } else {
+              e.preventDefault();
+              sendMessage();
+            }
+          }
+        } else if (el.tagName.toLowerCase() === 'textarea') {
+          // In textarea mode:
+          // Ctrl+Enter sends the message.
+          // Plain Enter (or with Shift) produces a newline.
+          if (e.key === 'Enter' && e.ctrlKey) {
+            e.preventDefault();
+            sendMessage();
+          }
+          // Otherwise, let Enter insert newline.
+        }
+      });
+  
+      // Use input event to monitor for changes; if the content has no newlines, revert back.
+      el.addEventListener('input', () => {
+        maybeSwitchToInput();
+      });
+    }
+  
+    // Attach the listeners to the initial input.
+    attachListeners(userInput);
+  
+    // Click handler for the Send button (works in both input and textarea mode).
+    sendBtn.addEventListener('click', () => {
+      sendMessage();
+    });
+  
+    // ---------------------------------------------------
+    // DEMO: Pre-populate the chat with sample messages.
+    // ---------------------------------------------------
+    addMessage('system', '*System:* Hello! This is a demonstration of a chat interface with **Markdown** and syntax highlighting. Feel free to experiment.');
+    addMessage('assistant', `Sure! Here's a sample code block in Python:
+  
+  \`\`\`python
+  def hello_world():
+      print("Hello, world!")
+  \`\`\`
+  `);
+    addMessage('user', 'That looks cool. Can you show me a JavaScript snippet as well?');
+    addMessage('assistant', `Absolutely! Here's a JavaScript snippet:
+  
+  \`\`\`javascript
+  function add(a, b) {
+    return a + b;
+  }
+  console.log(add(2, 3));
+  \`\`\`
+  `);
+  </script>
+  {% endblock %}

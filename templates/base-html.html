@@ -2,7 +2,7 @@
 <html>
 <head>
     <title>Test page</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
     <link rel="stylesheet" href="{{ url_for('static', filename='base-style.css') }}" />
     <link rel="shortcut icon" href="{{ url_for('static', filename='favicon.ico') }}" type="image/x-icon" />
     
@@ -175,7 +175,14 @@
     <div id="container">
         <header>
             <div onclick="location.href = '/';" id="logo">
-                <img src="/static/favicon.ico" style="height:100%;" alt="">
+                <div class="icon">
+                <svg class="" width="100%" height="100%" viewBox="0 0 524 524" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <rect x="-4" y="107.637" width="77.2733" height="283.279" rx="20" transform="rotate(-30 -4 107.637)" fill="var(--accent-primary)"/>
+                    <rect x="154.898" y="382.855" width="77.2733" height="77.0793" rx="20" transform="rotate(-30 154.898 382.855)" fill="var(--accent-primary)"/>
+                    <rect x="528" y="416.363" width="77.2733" height="283.279" rx="20" transform="rotate(150 528 416.363)" fill="var(--accent-primary)"/>
+                    <rect x="369.103" y="141.145" width="77.2733" height="77.0793" rx="20" transform="rotate(150 369.103 141.145)" fill="var(--accent-primary)"/>
+                    <rect x="358.617" y="354.347" width="77.2733" height="256.159" rx="20" transform="rotate(150 358.617 354.347)" fill="var(--accent-primary)"/>
+                    </svg></div>
             </div>
             <div id="icons">
                 <nav id="account-btn" onclick="menuMan.buttonCallback(event);">
@@ -203,7 +210,14 @@
         <div id="panel-sections">
             {% block leftPanel %}
             <div id="left-panel" class="panel-section-left panel-no-footer">
-                <div class="panel-header" onclick="panelMan.togglePanel('left');">
+                <div class="panel-header">
+                    <nav onclick="panelMan.togglePanel('left');">
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><script xmlns=""/>
+                            <g id="Edit / Add_Minus_Square">
+                            <path id="Vector" d="M8 12H16M4 16.8002V7.2002C4 6.08009 4 5.51962 4.21799 5.0918C4.40973 4.71547 4.71547 4.40973 5.0918 4.21799C5.51962 4 6.08009 4 7.2002 4H16.8002C17.9203 4 18.4801 4 18.9079 4.21799C19.2842 4.40973 19.5905 4.71547 19.7822 5.0918C20.0002 5.51962 20.0002 6.07967 20.0002 7.19978V16.7998C20.0002 17.9199 20.0002 18.48 19.7822 18.9078C19.5905 19.2841 19.2842 19.5905 18.9079 19.7822C18.4805 20 17.9215 20 16.8036 20H7.19691C6.07899 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2842 4.21799 18.9079C4 18.4801 4 17.9203 4 16.8002Z" stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            </g>
+                        </svg>
+                    </nav>
                 </div>
                 <div class="panel-content">
                     <p>Default</p>
@@ -216,38 +230,42 @@
             {% endblock %}
 
             <div id="center-panel" class="panel-section-center">
+                
                 {% if contentData %}
                 <div id="section-header" class="panel-header header-detached" onclick="toggle('center');">
-                    {% if contentData.sections %}
-                    <nav id="prevBtn">
+                    <nav onclick="panelMan.togglePanel('left');">
                         <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                            <script xmlns="" />
-                            <g id="Arrow / Chevron_Left">
-                                <path id="Vector" d="M15 19L8 12L15 5" stroke="var(--accent-primary)" stroke-width="2"
-                                    stroke-linecap="round" stroke-linejoin="round" />
+                            <script xmlns=""></script>
+                            <g id="System / Bar_Top">
+                                <path id="Vector" d="M9 20V4M9 20H16.8031C17.921 20 18.48 20 18.9074 19.7822C19.2837 19.5905 19.5905 19.2837 19.7822 18.9074C20 18.48 20 17.921 20 16.8031V7.19691C20 6.07899 20 5.5192 19.7822 5.0918C19.5905 4.71547 19.2837 4.40973 18.9074 4.21799C18.4796 4 17.9203 4 16.8002 4H9M9 20H7.19692C6.07901 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2837 4.21799 18.9074C4 18.4796 4 17.9203 4 16.8002V7.2002C4 6.08009 4 5.51962 4.21799 5.0918C4.40973 4.71547 4.71547 4.40973 5.0918 4.21799C5.51962 4 6.08009 4 7.2002 4H9" stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
                             </g>
                         </svg>
                     </nav>
+
+                    {% if contentData.sections %}
                     <div id="section-title">
-                        <span>{{ contentData.title }} :: </span> <select>
+                        <h3>{{ contentData.title }} </h3> 
+                        <!--<select>
                             {% for section in contentData.sections %}
                             <option>{{ section }}</option>
                             {% endfor %}
-                        </select>
+                        </select>-->
                     </div>
-                    <nav id="nextBtn">
-                        <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                            <script xmlns="" />
-                            <g id="Arrow / Chevron_Right">
-                                <path id="Vector" d="M9 5L16 12L9 19" stroke="var(--accent-primary)" stroke-width="2"
-                                    stroke-linecap="round" stroke-linejoin="round" />
-                            </g>
-                        </svg>
-                    </nav>                    {% else %}
+                    {% else %}
                     <div id="section-title">
                         <h3>{{ contentData.title }}</h3>
                     </div>
                     {% endif %}
+
+
+                    <nav onclick="panelMan.togglePanel('right');">
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <script xmlns=""></script>
+                            <g id="System / Bar_Top">
+                                <path id="Vector" d="M15 4L15 20M15 4H7.2002C6.08009 4 5.51962 4 5.0918 4.21799C4.71547 4.40973 4.40973 4.71547 4.21799 5.0918C4 5.51962 4 6.08009 4 7.2002V16.8002C4 17.9203 4 18.4796 4.21799 18.9074C4.40973 19.2837 4.71547 19.5905 5.0918 19.7822C5.51921 20 6.07901 20 7.19694 20L15 20M15 4H16.8002C17.9203 4 18.4796 4 18.9074 4.21799C19.2837 4.40973 19.5905 4.71547 19.7822 5.0918C20 5.5192 20 6.079 20 7.19691L20 16.8031C20 17.921 20 18.48 19.7822 18.9074C19.5905 19.2837 19.2837 19.5905 18.9074 19.7822C18.48 20 17.921 20 16.8031 20H15" stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
+                            </g>
+                        </svg>
+                    </nav>
                 </div>
                 {% else %}
                 <div class="panel-header header-detached" onclick="toggle('center');"></div>
@@ -257,10 +275,6 @@
                 <div class="panel-content header-detached footer-detached">
                     {% block content %}
                     <h2>Center Panel Content</h2>
-                    <div class="row">
-                    <button type="button" onclick="panelMan.togglePanel('left');">left</button>
-                    <button type="button" onclick="panelMan.togglePanel('right');">right</button>
-                </div>
                     {% endblock %}
                 </div>
                 <div class="panel-footer footer-detached">
@@ -373,7 +387,9 @@
                         </div>
                     </div>
                     <div class="panel-footer button-bar">
+                        <div  class="button-text">
                         Member Details and Settings
+                        </div>
                     </div>
                 </div>
                 {% else %}
@@ -401,7 +417,9 @@
                     </div>
                     <div class="panel-footer button-bar" onclick="location.href = '/logout';">
                         {% if memberData %}
-                        Logout
+                        <div class="button-text">
+                            Logout
+                        </div>
                         {% endif %}
                     </div>
                 </div>
@@ -473,7 +491,14 @@
             <div id="right-panel" class="panel-section-right">
                 {% block rightTopPanel %}
                 <div id="right-top-panel">
-                    <div class="panel-header" onclick="panelMan.togglePanel('right');">
+                    <div class="panel-header" >
+                        <nav onclick="panelMan.togglePanel('right');">
+                            <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><script xmlns=""/>
+                                <g id="Edit / Add_Minus_Square">
+                                <path id="Vector" d="M8 12H16M4 16.8002V7.2002C4 6.08009 4 5.51962 4.21799 5.0918C4.40973 4.71547 4.71547 4.40973 5.0918 4.21799C5.51962 4 6.08009 4 7.2002 4H16.8002C17.9203 4 18.4801 4 18.9079 4.21799C19.2842 4.40973 19.5905 4.71547 19.7822 5.0918C20.0002 5.51962 20.0002 6.07967 20.0002 7.19978V16.7998C20.0002 17.9199 20.0002 18.48 19.7822 18.9078C19.5905 19.2841 19.2842 19.5905 18.9079 19.7822C18.4805 20 17.9215 20 16.8036 20H7.19691C6.07899 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2842 4.21799 18.9079C4 18.4801 4 17.9203 4 16.8002Z" stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                </g>
+                            </svg>
+                        </nav>
                     </div>
                     <div class="panel-content">
                         right top panel content<br />

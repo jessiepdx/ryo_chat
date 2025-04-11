@@ -313,7 +313,7 @@ class MenuPanel extends Panel {
       const panelWidth = this.containerDOM.offsetWidth;
       // get the parent container
       const nav = this.buttonDOM.parentNode;
-      nav.style.width = `calc(${panelWidth}px - 1em)`;
+      nav.style.width = `calc(${panelWidth}px)`;
       this.buttonDOM.style.flexGrow = 1;
     }
   
