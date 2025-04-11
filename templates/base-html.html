@@ -244,11 +244,12 @@
 
                     {% if contentData.sections %}
                     <div id="section-title">
-                        <h3>{{ contentData.title }} </h3> <select>
+                        <h3>{{ contentData.title }} </h3> 
+                        <!--<select>
                             {% for section in contentData.sections %}
                             <option>{{ section }}</option>
                             {% endfor %}
-                        </select>
+                        </select>-->
                     </div>
                     {% else %}
                     <div id="section-title">
@@ -386,7 +387,9 @@
                         </div>
                     </div>
                     <div class="panel-footer button-bar">
+                        <div  class="button-text">
                         Member Details and Settings
+                        </div>
                     </div>
                 </div>
                 {% else %}
@@ -414,7 +417,9 @@
                     </div>
                     <div class="panel-footer button-bar" onclick="location.href = '/logout';">
                         {% if memberData %}
-                        Logout
+                        <div class="button-text">
+                            Logout
+                        </div>
                         {% endif %}
                     </div>
                 </div>

@@ -42,8 +42,8 @@
             </svg>
         </nav>
         {% if contentData.sections %}
-        <div id="section-title">
-            <select>
+        <div class="section-auxiliary">
+           <select>
                 {% for section in contentData.sections %}
                 <option>{{ section }}</option>
                 {% endfor %}
@@ -94,8 +94,8 @@
 {% block rightTopPanel %}
 <div id="right-top-panel">
     <div class="panel-header" onclick="panelMan.togglePanel('right');">
-        <nav>
-        <h3>Knowledge Editor Panel</h3></nav></div>
+        <div class="section-auxiliary">
+        <h3>Knowledge Editor Panel</h3></div></div>
     <div class="panel-content">
 
 
