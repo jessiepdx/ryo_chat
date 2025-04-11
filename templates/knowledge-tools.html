@@ -39,7 +39,6 @@
 {% block leftPanel %}
 <div id="left-panel" class="panel-section-left panel-no-footer">
     <div class="panel-header">
-
         <nav onclick="panelMan.togglePanel('left');">
             <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
                 <script xmlns=""/>
@@ -50,7 +49,7 @@
         </nav>
         {% if contentData.sections %}
         <div class="section-auxiliary">
-           <select>
+            <select>
                 {% for section in contentData.sections %}
                 <option>{{ section }}</option>
                 {% endfor %}
@@ -61,7 +60,6 @@
             <h3>{{ contentData.title }}</h3>
         </div>
         {% endif %}
-
     </div>
     <div class="panel-content">
         <p>Knowledge</p>
@@ -115,9 +113,17 @@
 
         <div class="domain-selection">
             <label for="domain">Domain Dropdown</label>
-            <select name="domain" id="">
+            {% if contentData.sections %}
+            <select name="domain" id="rightDomainDropdown">
+                {% for section in contentData.sections %}
+                <option value="{{ section }}">{{ section }}</option>
+                {% endfor %}
+            </select>
+            {% else %}
+            <select name="domain" id="rightDomainDropdown">
                 <option value=""></option>
             </select>
+            {% endif %}
         </div>
 
         <div class="primary-editor">
@@ -127,10 +133,7 @@
             <!-- Updated input field with assigned ID -->
             <input type="text" name="knowledgeTag" id="knowledgeTagInput">
             <div id="knowledgeTags">
-                <div class="knowledgeTagBlock">
-                    <span>Tag1</span>
-                    <span>X</span>
-                </div>
+               
             </div>
         </div>
 
