@@ -1041,6 +1041,20 @@ select {
         border-radius: var(--nano-rem);
     }
 
+
+.panel-header .section-auxiliary {
+    height: 100%;
+    display: flex;
+    flex-flow: column;
+    justify-content: center;
+    padding: var(--mini-rem);
+}
+
+.panel-header .section-auxiliary h3 {
+    font-weight: bold;
+}
+
+
     #section-title>h3::before {
         content: '';
         position: absolute;
@@ -1105,7 +1119,7 @@ select {
     }
 
     #icons nav .icon {
-        margin: var(--micro-rem);
+        margin: var(--mini-rem);
     }
 
     /* Class selectors */
