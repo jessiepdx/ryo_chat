@@ -81,6 +81,7 @@ ConsoleColors = {
 
 }
 
+knowledge = KnowledgeManager()
 members = MemberManager()
 
 availableMenu = [
@@ -368,6 +369,43 @@ def login():
             
         return redirect(url_for("index"))
 
+@app.post("/knowledge/<action>")
+def knowledgeEndpoint(action: str = None):
+    # first validate the member has the authorization for endpoint
+    if g.memberData is None:
+        return
+    
+    memberID = g.memberData["member_id"]
+    allowedRoles = ["admin", "owner"]
+    rolesAvailable = g.memberData["roles"]
+
+    if (any(role in rolesAvailable for role in allowedRoles)):
+        match action:
+            case "add":
+                logger.info("Adding new knowledge data")
+                # Verify all required arguments
+                knowledgeDocument = request.form.get("knowledge_document")
+                if knowledgeDocument is None:
+                    return
+                
+                domains = config.knowledgeDomains if request.form.get("domains") is None else [domain for domain in request.form.get("domains") if domain in config.knowledgeDomains]
+                print(domains)
+                roles = config.rolesList if request.form.get("roles") is None else [role for role in request.form.get("roles") if role in config.rolesList]
+                print(roles)
+                # TODO further validation on categories and document metadata
+                categories = list() if request.form.get("categories") is None else request.form.get("categories")
+                print(categories)
+                documentMetadata = dict() if request.form.get("document_metadata") is None else request.form.get("document_metadata")
+
+                knowledgeID = knowledge.addDocument(knowledgeDocument, memberID, domains, roles, categories, documentMetadata)
+                print(knowledge)
+                return {"success": True, "knowledge_id": knowledgeID}
+
+
+            case "edit":
+                logger.info("Editing knowledge data")
+            case "delete":
+                logger.info("Deleting knowledge data")
 
 @app.post("/miniapp-login")
 def miniappLogin():

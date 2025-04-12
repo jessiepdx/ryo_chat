@@ -1437,7 +1437,8 @@ class KnowledgeManager:
                     document_metadata JSON,
                     embeddings vector(768),
                     record_timestamp TIMESTAMP,
-                    record_metadata JSON
+                    record_metadata JSON,
+                    recall_count INT
                 );"""
                 cursor.execute(createKnowledgeSQL)
 
@@ -1478,8 +1479,13 @@ class KnowledgeManager:
         
         return cls._instance
 
-    def addDocument(self, document: str, domains: list = [], roles: list = [], categories: list = [], documentMetadata: dict = {}, addedBy: dict = {}):
+    def addDocument(self, document: str, addedBy: int, domains: list = [], roles: list = [], categories: list = [], documentMetadata: dict = {}) -> int:
         logger.info(f"Adding a new knowledge document.")
+        # TODO change addedby to int value and create record metadata for insert
+        recordMetadata = {
+            "addedBy": addedBy
+        }
+        # TODO validate data
         embedding = getEmbeddings(document)
         connection = None
         recordID = None
@@ -1488,10 +1494,10 @@ class KnowledgeManager:
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
 
-            insertSQL = """INSERT INTO knowledge (domains, roles, categories, knowledge_document, document_metadata, embeddings, record_timestamp, record_metadata)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            insertSQL = """INSERT INTO knowledge (domains, roles, categories, knowledge_document, document_metadata, embeddings, record_timestamp, record_metadata, recall_count)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0)
             RETURNING knowledge_id;"""
-            cursor.execute(insertSQL, (domains, roles, categories, document, json.dumps(documentMetadata), embedding, datetime.now(), json.dumps(addedBy)))
+            cursor.execute(insertSQL, (domains, roles, categories, document, json.dumps(documentMetadata), embedding, datetime.now(), json.dumps(recordMetadata)))
             recordID = cursor.fetchone()[0]
             connection.commit()
             # close the communication with the PostgreSQL
@@ -1542,7 +1548,7 @@ class KnowledgeManager:
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
 
-            querySQL = """SELECT knowledge_id, domains, roles, categories, knowledge_document, document_metadata, record_timestamp, record_metadata
+            querySQL = """SELECT knowledge_id, domains, roles, categories, knowledge_document, document_metadata, record_timestamp, record_metadata, recall_count
             FROM knowledge
             LIMIT 10"""
             cursor.execute(querySQL)
