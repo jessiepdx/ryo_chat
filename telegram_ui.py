@@ -58,7 +58,8 @@ from hypermindlabs.utils import (
     CustomFormatter,
     KnowledgeManager, 
     MemberManager, 
-    ProposalManager, 
+    ProposalManager,
+    SpamManager,
     UsageManager
 )
 from hypermindlabs.agents import ConversationOrchestrator, ConversationalAgent, ImageAgent, TweetAgent
@@ -115,6 +116,7 @@ config = ConfigManager()
 knowledge = KnowledgeManager()
 members = MemberManager()
 proposals = ProposalManager()
+spam = SpamManager()
 usage = UsageManager()
 
 
@@ -791,16 +793,29 @@ async def promoteAccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if memberToPromote is not None:
                 logger.info(f"User {user.name} (user_id: {user.id}) is authorized to promote user {userToPromote.name} (user_id: {userToPromote.id}).")
                 context.chat_data["member_to_promote"] = memberToPromote
-                keyboard = [
-                    [
-                        InlineKeyboardButton("Administrator", callback_data="admin"),
-                        InlineKeyboardButton("Marketing", callback_data="marketing")
-                    ],
-                    [
-                        InlineKeyboardButton("Tester", callback_data="tester")
-                    ]
-                ]
+                
+                # TODO build the roles available for promotion from roles list in config
+                prettyTitles = {
+                    "user": "Users",
+                    "tester": "Testers",
+                    "marketing": "Marketing",
+                    "admin": "Administrators",
+                    "owner": "Owner"
+                }
+
+                availableRolesForPromotion = [role for role in config.rolesList if role not in memberToPromote.get("roles")]
+                print(availableRolesForPromotion)
+
+                # TODO build inline keyboard button pairs from the available roles for promotion
+                buttonList = []
+                for role in availableRolesForPromotion:
+                    buttonText = role if role not in prettyTitles else prettyTitles[role]
+                    buttonList.append(InlineKeyboardButton(buttonText, callback_data=role))
+                
+                # Display role selection
+                keyboard = list(pairs(buttonList))
                 reply_markup = InlineKeyboardMarkup(keyboard)
+
                 # Send message with text and appended InlineKeyboard
                 try:
                     await message.reply_text(
@@ -877,15 +892,19 @@ async def setNewRole(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     memberToPromote = context.chat_data.get("member_to_promote")
 
-    if memberToPromote:
+    if memberToPromote is not None:
         # Get the telegram user from member data
+        # TODO The following isn't really necessary, used just for logging
         try:
             userToPromote = await context.bot.get_chat_member(chat_id=chat.id, user_id=memberToPromote["user_id"])
             logger.info(f"User {user.name} (user_id: {user.id}) is promoting {userToPromote.user.name} ({userToPromote.user.id}) to the role of {query.data}.")
         except Exception as err:
             logger.error(f"Exception while getting telegram user information:\n{err}")
 
-        memberToPromote["roles"].append(query.data)
+        # TODO Verify the role is in the roles list from the config
+        if query.data in config.rolesList:
+            memberToPromote["roles"].append(query.data)
+        
         results = members.updateMemberRoles(memberToPromote.get("member_id"), memberToPromote.get("roles"))
         if results:
             responseText = f"{userToPromote.user.name} has been promoted to {query.data} role."
@@ -1309,6 +1328,7 @@ async def newsletterStart(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             nd["text"] = message.reply_to_message.text if nd["text"] is None else nd["text"] + "\n\n" + message.reply_to_message.text
 
         # Display role selection
+        # TODO Build this inline button list based on roles list in config
         keyboard = [
             [
                 InlineKeyboardButton("Users", callback_data="user"),
@@ -1367,11 +1387,11 @@ async def selectRole(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "owner": "Owner"
     }
 
-    if query.data in members.rolesList:
+    if query.data in config.rolesList:
         nd["roles"].append(query.data)
 
     buttonList = []
-    remainingRoles = [role for role in members.rolesList if role not in nd["roles"]]
+    remainingRoles = [role for role in config.rolesList if role not in nd["roles"]]
 
     for role in remainingRoles:
         buttonText = role if role not in prettyTitles else prettyTitles[role]
@@ -1380,10 +1400,6 @@ async def selectRole(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttonList.append(InlineKeyboardButton("Done", callback_data="done"))
     
     # Display role selection
-    def pairs(l):
-        for i in range(0, len(l), 2):
-            yield l[i:i + 2]
-
     keyboard = list(pairs(buttonList))
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -2128,8 +2144,47 @@ async def otherGroupChat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     community = communities.getCommunityByTelegramID(chat.id)
     member = members.getMemberByTelegramID(user.id)
+    score = 0 if member is None else member.get("community_score")
+    userJoined = context.chat_data.get(user.id)
+
+    minimumCommunityScore = 20
+    spamDistanceThreshold = 10
+    # Set the allowed roles
+    allowedRoles = ["tester", "marketing", "admin", "owner"]
+    rolesAvailable = list() if member is None else member.get("roles")
     
-    if community and member:
+    # Check message for spam content
+    if member is None or (score < minimumCommunityScore and not any(role in rolesAvailable for role in allowedRoles)):
+        logger.info("Check message for spam.")
+        results = spam.searchSpam(message.text)
+        if len(results) > 0:
+            distance = results[0].get("distance")
+            if distance < spamDistanceThreshold:
+                logger.warning("Spam message detected")
+                try:
+                    # Delete the message
+                    await message.delete()
+
+                    # Check how long the user has been in the chat
+                    if userJoined is not None:
+                        if userJoined > (datetime.now() - timedelta(seconds=60)):
+                            logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
+                            await chat.ban_member(user.id)
+                            return
+                    
+                    # User not banned, send a requirement message
+                    await context.bot.send_message(
+                        chat_id=chat.id,
+                        message_thread_id=topicID,
+                        text=f"Potential spam message deleted."
+                    )
+                
+                except Exception as error:
+                    logger.error(f"Exception while handling potential spam message:\n{error}")
+                finally:
+                    return
+    
+    if community is not None and member is not None:
         # Update the chat history database with the newest message
         messageHistoryID = chatHistory.addChatHistory(
             messageID=message.message_id, 
@@ -2449,6 +2504,10 @@ async def linkHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 ####################
 # Helper Functions #
 ####################
+
+def pairs(l):
+    for i in range(0, len(l), 2):
+        yield l[i:i + 2]
 
 async def setPassword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"User is requesting an new access key.")

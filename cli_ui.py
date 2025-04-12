@@ -23,7 +23,7 @@ import logging
 import requests
 import uuid
 from datetime import datetime, timedelta, timezone
-from hypermindlabs.utils import ChatHistoryManager, ConfigManager, ConsoleColors, MemberManager
+from hypermindlabs.utils import ChatHistoryManager, ConfigManager, ConsoleColors, MemberManager, SpamManager
 from hypermindlabs.agents import ConversationOrchestrator, MessageAnalysisAgent, DevTestAgent, ToolCallingAgent, braveSearch
 from ollama import Client, ChatResponse, ListResponse, Message, ProgressResponse
 
@@ -53,7 +53,7 @@ config = ConfigManager()
 memberData = None
 members = MemberManager()
 messageHistory = list()
-
+spam = SpamManager()
 toolInference = config._instance.inference.get("tool")
 ollamaClient = Client(host=toolInference.get("url"))
 
@@ -121,11 +121,7 @@ async def main():
         if (userInput[:1] == "/"):
             command = userInput.split(" ")[0]
             match command:
-                case "/search":
-                    query = input("Search query:  ")
-                    braveWebResults = braveSearch(queryString=query)
-                    print(braveWebResults.get("results"))
-                    continue
+                
                 case "/bye":
                     break
                 case "/clear":
@@ -167,6 +163,27 @@ async def main():
                             print(model.model)
 
                     continue
+                case "/search":
+                    query = input("Search query:  ")
+                    braveWebResults = braveSearch(queryString=query)
+                    print(braveWebResults.get("results"))
+                    continue
+                case "/spam":
+                    # Check the arguments
+                    argument = userInput.split(" ")[1]
+                    match argument:
+                        case "add":
+                            logger.info("Adding new spam text.")
+                            query = input("Spam text to add:  ")
+                            newRecord = spam.addSpamText(query, memberID)
+                            print(newRecord)
+                            continue
+                        case "search":
+                            logger.info("Searching the spam table.")
+                            query = input("Text to search spam:  ")
+                            result = spam.searchSpam(query)
+                            print(result)
+                            continue
                 case "/stats":
                     toggleStats()
                     continue
@@ -174,9 +191,6 @@ async def main():
                     print("unknown command")
                     continue
 
-        # All of this should move from the UI elements to an Orchestrator
-        # How does a UI element separate from the Agent calling handle streaming outputs though...
-        # Perhaps by assigning it to a property in the orchestrator that can be accessed by the UI
         cliContext = {
             "platform": "cli"
         }
