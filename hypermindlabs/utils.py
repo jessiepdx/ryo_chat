@@ -1538,6 +1538,28 @@ class KnowledgeManager:
 
             return recordID
 
+    def deleteDocument(self, knowledgeID: int):
+        logger.info("Delete knowledge document.")
+
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+
+            deleteSQL = """DELETE FROM knowledge
+            WHERE knowledge_id = %s;"""
+            cursor.execute(deleteSQL, (knowledgeID, ))
+            connection.commit()
+            # close the communication with the PostgreSQL
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+
     def getKnowledge(self) -> list:
         logger.info(f"Get knowledge documents.")
 

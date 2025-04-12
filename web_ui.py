@@ -388,18 +388,15 @@ def knowledgeEndpoint(action: str = None):
                 if knowledgeDocument is None:
                     return
                 
-                print(request.form.get("domains"))
-                print(type(request.form.get("domains")))
-                print(request.form.get("roles"))
-                print(type(request.form.get("roles")))
-
-
-                domains = config.knowledgeDomains if request.form.get("domains") is None else [domain for domain in request.form.get("domains") if domain in config.knowledgeDomains]
+                _domains = list() if request.form.get("domains") is None else ",".split(request.form.get("domains"))
+                domains = config.knowledgeDomains if len(_domains) == 0 else [domain for domain in _domains if domain in config.knowledgeDomains]
                 print(domains)
-                roles = config.rolesList if request.form.get("roles") is None else [role for role in request.form.get("roles") if role in config.rolesList]
+
+                _roles = list() if request.form.get("roles") is None else ",".split(request.form.get("roles"))
+                roles = config.rolesList if len(_roles) == 0 else [role for role in _roles if role in config.rolesList]
                 print(roles)
                 # TODO further validation on categories and document metadata
-                categories = list() if request.form.get("categories") is None else request.form.get("categories")
+                categories = list() if request.form.get("categories") is None else ",".split(request.form.get("categories"))
                 print(categories)
                 documentMetadata = dict() if request.form.get("document_metadata") is None else request.form.get("document_metadata")
 
@@ -407,11 +404,17 @@ def knowledgeEndpoint(action: str = None):
                 print(knowledge)
                 return {"success": True, "knowledge_id": knowledgeID}
 
-
             case "edit":
                 logger.info("Editing knowledge data")
+
             case "delete":
                 logger.info("Deleting knowledge data")
+
+                knowledgeID = request.form.get("knowledge_id")
+                if knowledgeID is None:
+                    return
+                
+                knowledge.deleteDocument(knowledgeID)
 
 @app.post("/miniapp-login")
 def miniappLogin():
