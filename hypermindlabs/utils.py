@@ -1382,6 +1382,7 @@ class ConfigManager:
             cls._instance.owner_info = config_json.get("owner_info")
             cls._instance.database = database
             cls._instance.knowledge_domains = None if config_json.get("knowledge") is None else config_json.get("knowledge").get("domains")
+            cls._instance.roles_list = config_json.get("roles_list")
             cls._instance.db_conninfo = connectionString
             cls._instance.defaults = config_json.get("defaults")
             cls._instance.inference = config_json.get("inference")
@@ -1395,17 +1396,20 @@ class ConfigManager:
         # Save new config changes to JSON file
     
     # Define getters
-
     @property
-    def botName(self):
+    def rolesList(self) -> list:
+        return self._instance.roles_list
+    
+    @property
+    def botName(self) -> str:
         return self._instance.bot_name
     
     @property
-    def knowledgeDomains(self):
+    def knowledgeDomains(self) -> list:
         return self._instance.knowledge_domains
     
     @property
-    def webUIUrl(self):
+    def webUIUrl(self) -> str:
         return self._instance.web_ui_url
 
 
