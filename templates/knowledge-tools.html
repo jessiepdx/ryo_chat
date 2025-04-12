@@ -7,6 +7,45 @@
     // Variable to store the last clicked knowledge item
     var lastClickedKnowledgeItem = null;
 
+    // Helper function to convert JSON into FormData
+    function jsonToFormData(json) {
+        var formData = new FormData();
+        for (var key in json) {
+            if (json.hasOwnProperty(key)) {
+                if (Array.isArray(json[key])) {
+                    // For arrays, store them as JSON strings.
+                    formData.append(key, JSON.stringify(json[key]));
+                } else {
+                    formData.append(key, json[key]);
+                }
+            }
+        }
+        return formData;
+    }
+
+    // Function to update the tags section with toggle-able buttons
+    function updateTagsButtons(tagsString) {
+        const tagsContainer = document.getElementById('knowledgeTags');
+        // Clear any existing tag buttons
+        tagsContainer.innerHTML = '';
+        if (tagsString) {
+            // Split the tags by comma, trim whitespace and filter out empty entries
+            var tagsArray = tagsString.split(',').map(tag => tag.trim()).filter(tag => tag.length > 0);
+            tagsArray.forEach(tag => {
+                var btn = document.createElement('button');
+                btn.type = 'button';
+                btn.textContent = tag;
+                // By default, mark each tag button as active
+                btn.classList.add('tag-btn', 'active');
+                // Toggle active/inactive state when clicked
+                btn.addEventListener('click', function () {
+                    btn.classList.toggle('active');
+                });
+                tagsContainer.appendChild(btn);
+            });
+        }
+    }
+
     function knowledgeItemClicked(item) {
         // Get the trimmed knowledge document content
         var knowledgeContent = item.querySelector('.list-item-body').textContent.trim();
@@ -22,8 +61,9 @@
         } else {
             // Update the textarea with the new content
             document.getElementById('knowledgeDataEditor').value = knowledgeContent;
-            // Populate the tags input with the retrieved tags
-            document.getElementById('knowledgeTagInput').value = knowledgeTags;
+            // Instead of populating a text input, update the tags container
+            updateTagsButtons(knowledgeTags);
+            // (Leave any other fields untouched for editing)
             // Update the last clicked item reference
             lastClickedKnowledgeItem = item;
             // Open the right panel if it's not already open
@@ -32,18 +72,222 @@
             }
         }
     }
-</script>
 
+    // Function to initiate "Add Entry" mode.
+    function addKnowledgeItem() {
+        // Clear all input fields
+        document.getElementById('knowledgeDataEditor').value = '';
+        document.getElementById('knowledgeTagInput').value = '';
+        document.getElementById('knowledgeTitleInput').value = '';
+        document.getElementById('knowledgeDescriptionInput').value = '';
+        document.getElementById('knowledgeAuthorInput').value = '';
+        document.getElementById('knowledgeSourceInput').value = '';
+        document.getElementById('knowledgeLinkInput').value = '';
+        // Clear the toggle-able tags container
+        document.getElementById('knowledgeTags').innerHTML = '';
+        // Also clear any selected domains and roles
+        document.getElementById('selectedDomains').innerHTML = '';
+        document.getElementById('selectedRoles').innerHTML = '';
+
+        // Set the mode to "Add Entry" by updating the footer button text and re-binding its event.
+        var footerButton = document.querySelector('#right-top-panel .button-text');
+        if (footerButton) {
+            footerButton.textContent = 'Add Entry';
+            // Rebind the click event for "Add Entry" mode.
+            footerButton.onclick = function () {
+                // Assemble JSON packet from fields.
+                var knowledgeContent = document.getElementById('knowledgeDataEditor').value.trim();
+                if (!knowledgeContent) {
+                    alert("Knowledge Entry content is required!");
+                    return;
+                }
+                var packet = {
+                    knowledge_document: knowledgeContent
+                };
+                // Optional fields
+                var tagInput = document.getElementById('knowledgeTagInput').value.trim();
+                if (tagInput) packet.knowledge_tags = tagInput;
+                var titleInput = document.getElementById('knowledgeTitleInput').value.trim();
+                if (titleInput) packet.title = titleInput;
+                var descriptionInput = document.getElementById('knowledgeDescriptionInput').value.trim();
+                if (descriptionInput) packet.description = descriptionInput;
+                var authorInput = document.getElementById('knowledgeAuthorInput').value.trim();
+                if (authorInput) packet.author = authorInput;
+                var sourceInput = document.getElementById('knowledgeSourceInput').value.trim();
+                if (sourceInput) packet.source = sourceInput;
+                var linkInput = document.getElementById('knowledgeLinkInput').value.trim();
+                if (linkInput) packet.link = linkInput;
+
+                // Gather selected domains (if any)
+                var selectedDomains = Array.from(document.getElementById('selectedDomains').children)
+                    .map(btn => btn.textContent);
+                if (selectedDomains.length > 0) {
+                    packet.domains = selectedDomains;
+                }
+                // Gather selected roles (if any)
+                var selectedRoles = Array.from(document.getElementById('selectedRoles').children)
+                    .map(btn => btn.textContent);
+                if (selectedRoles.length > 0) {
+                    packet.roles = selectedRoles;
+                }
+                // Also gather active tags from the toggle-able tag buttons (if any)
+                var activeTagButtons = Array.from(document.querySelectorAll('#knowledgeTags .tag-btn.active'))
+                    .map(btn => btn.textContent);
+                if (activeTagButtons.length > 0) {
+                    packet.tags = activeTagButtons;
+                }
+                // Show a confirm dialog with the assembled packet. The built-in confirm() shows OK/Cancel buttons.
+                if (confirm("Assembled JSON packet:\n" + JSON.stringify(packet, null, 2) + "\n\nClick OK to send, or Cancel to abort.")) {
+                    // Convert packet to FormData.
+                    var formData = jsonToFormData(packet);
+                    // Send the form data via POST to /knowledge/add
+                    fetch('/knowledge/add', {
+                        method: 'POST',
+                        body: formData
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        alert("Success:\n" + JSON.stringify(data, null, 2));
+                    })
+                    .catch(error => {
+                        alert("Error:\n" + error);
+                    });
+                }
+            };
+        }
+        // Reset the last clicked item (since we’re creating a new entry)
+        lastClickedKnowledgeItem = null;
+        // Open the right panel if it's not open already
+        if (!panelMan.panelStates['right']) {
+            panelMan.showPanel('right');
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', function () {
+        // Fetch available domains from /knowledge/domains-list endpoint
+        fetch('/knowledge/domains-list')
+            .then(response => response.json())
+            .then(data => {
+                const domainDropdown = document.getElementById('domainDropdown');
+                if (domainDropdown) {
+                    data.forEach(domain => {
+                        const option = document.createElement('option');
+                        option.value = domain;
+                        option.textContent = domain;
+                        domainDropdown.appendChild(option);
+                    });
+                }
+            });
+
+        // Fetch available roles from /knowledge/roles-list endpoint
+        fetch('/knowledge/roles-list')
+            .then(response => response.json())
+            .then(data => {
+                const roleDropdown = document.getElementById('roleDropdown');
+                if (roleDropdown) {
+                    data.forEach(role => {
+                        const option = document.createElement('option');
+                        option.value = role;
+                        option.textContent = role;
+                        roleDropdown.appendChild(option);
+                    });
+                }
+            });
+
+        // Event listener for the domain + button to add the domain selected from the dropdown
+        document.getElementById('addDomainBtn').addEventListener('click', function () {
+            const domainDropdown = document.getElementById('domainDropdown');
+            const selectedValue = domainDropdown.value;
+            if (selectedValue) {
+                const selectedDomainsContainer = document.getElementById('selectedDomains');
+                let exists = Array.from(selectedDomainsContainer.children)
+                    .some(child => child.textContent === selectedValue);
+                if (!exists) {
+                    const newBtn = document.createElement('button');
+                    newBtn.type = 'button';
+                    newBtn.textContent = selectedValue;
+                    newBtn.classList.add('selected-domain-btn');
+                    // Remove the domain from the selected list on click
+                    newBtn.addEventListener('click', () => {
+                        selectedDomainsContainer.removeChild(newBtn);
+                    });
+                    selectedDomainsContainer.appendChild(newBtn);
+                }
+            }
+        });
+
+        // Event listener for the role + button to add selected roles
+        document.getElementById('addRoleBtn').addEventListener('click', function () {
+            const roleDropdown = document.getElementById('roleDropdown');
+            const selectedValue = roleDropdown.value;
+            const selectedRolesContainer = document.getElementById('selectedRoles');
+            if (selectedValue) {
+                let exists = Array.from(selectedRolesContainer.children)
+                    .some(child => child.textContent === selectedValue);
+                if (!exists) {
+                    const newBtn = document.createElement('button');
+                    newBtn.type = 'button';
+                    newBtn.textContent = selectedValue;
+                    newBtn.classList.add('selected-role-btn');
+                    // Remove the role from the selected list on click
+                    newBtn.addEventListener('click', () => {
+                        selectedRolesContainer.removeChild(newBtn);
+                    });
+                    selectedRolesContainer.appendChild(newBtn);
+                }
+            }
+        });
+    });
+</script>
 {% endblock %}
 
 {% block leftPanel %}
+
+<style>
+    .bottom-panel-auto {
+        height: auto !important;
+    }
+
+    .top-panel-fill {
+        height: 100% !important;
+    }
+
+.detatched-button-bar {
+    text-align: center;
+    vertical-align: middle;
+    line-height: var(--panel-bar-height);
+    left: 0px;
+    top: 0px;
+    font-weight: bold;
+    cursor: pointer;
+    position: relative;
+    box-sizing: border-box;
+    position: absolute;
+    height: 100%;
+    width: 100%;
+    line-height: calc(var(--panel-bar-height) - (2 * var(--micro-rem)));
+}
+
+.detatched-button-bar:hover {
+    background-color: var(--accent-primary);
+    color: var(--accent-dark);
+}
+
+.detatched-button-bar:hover .button-text {
+    color: var(--accent-dark);
+}
+</style>
+
 <div id="left-panel" class="panel-section-left panel-no-footer">
     <div class="panel-header">
         <nav onclick="panelMan.togglePanel('left');">
             <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <script xmlns=""/>
+                <script xmlns="" />
                 <g id="Edit / Add_Minus_Square">
-                    <path id="Vector" d="M8 12H16M4 16.8002V7.2002C4 6.08009 4 5.51962 4.21799 5.0918C4.40973 4.71547 4.71547 4.40973 5.0918 4.21799C5.51962 4 6.08009 4 7.2002 4H16.8002C17.9203 4 18.4801 4 18.9079 4.21799C19.2842 4.40973 19.5905 4.71547 19.7822 5.0918C20.0002 5.51962 20.0002 6.07967 20.0002 7.19978V16.7998C20.0002 17.9199 20.0002 18.48 19.7822 18.9078C19.5905 19.2841 19.2842 19.5905 18.9079 19.7822C18.4805 20 17.9215 20 16.8036 20H7.19691C6.07899 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2842 4.21799 18.9079C4 18.4801 4 17.9203 4 16.8002Z" stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path id="Vector"
+                        d="M8 12H16M4 16.8002V7.2002C4 6.08009 4 5.51962 4.21799 5.0918C4.40973 4.71547 4.71547 4.40973 5.0918 4.21799C5.51962 4 6.08009 4 7.2002 4H16.8002C17.9203 4 18.4801 4 18.9079 4.21799C19.2842 4.40973 19.5905 4.71547 19.7822 5.0918C20.0002 5.51962 20.0002 6.07967 20.0002 7.19978V16.7998C20.0002 17.9199 20.0002 18.48 19.7822 18.9078C19.5905 19.2841 19.2842 19.5905 18.9079 19.7822C18.4805 20 17.9215 20 16.8036 20H7.19691C6.07899 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2842 4.21799 18.9079C4 18.4801 4 17.9203 4 16.8002Z"
+                        stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round"
+                        stroke-linejoin="round" />
                 </g>
             </svg>
         </nav>
@@ -88,20 +332,21 @@
     </div>
 </div>
 {% endfor %}
-<div class="list-item-container" onclick="addKnowledgeItem();">
-    <h3>ADD KNOWLEDGE ENTRY</h3>
-</div>
 
 {% endblock %}
 
 {% block rightTopPanel %}
-<div id="right-top-panel">
+<div id="right-top-panel" class="panel-top-fill">
     <div class="panel-header">
         <nav onclick="panelMan.togglePanel('right');">
             <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
                 <script xmlns=""></script>
                 <g id="Edit / Add_Minus_Square">
-                    <path id="Vector" d="M8 12H16M4 16.8002V7.2002C4 6.08009 4 5.51962 4.21799 5.0918C4.40973 4.71547 4.71547 4.40973 5.0918 4.21799C5.51962 4 6.08009 4 7.2002 4H16.8002C17.9203 4 18.4801 4 18.9079 4.21799C19.2842 4.40973 19.5905 4.71547 19.7822 5.0918C20.0002 5.51962 20.0002 6.07967 20.0002 7.19978V16.7998C20.0002 17.9199 20.0002 18.48 19.7822 18.9078C19.5905 19.2841 19.2842 19.5905 18.9079 19.7822C18.4805 20 17.9215 20 16.8036 20H7.19691C6.07899 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2842 4.21799 18.9079C4 18.4801 4 17.9203 4 16.8002Z" stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
+                    <path id="Vector"
+                        d="M8 12H16M4 16.8002V7.2002C4 6.08009 4 5.51962 4.21799 5.0918C4.40973 4.71547 4.71547 4.40973 5.0918 4.21799C5.51962 4 6.08009 4 7.2002 4H16.8002C17.9203 4 18.4801 4 18.9079 4.21799C19.2842 4.40973 19.5905 4.71547 19.7822 5.0918C20.0002 5.51962 20.0002 6.07967 20.0002 7.19978V16.7998C20.0002 17.9199 20.0002 18.48 19.7822 18.9078C19.5905 19.2841 19.2842 19.5905 18.9079 19.7822C18.4805 20 17.9215 20 16.8036 20H7.19691C6.07899 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2842 4.21799 18.9079C4 18.4801 4 17.9203 4 16.8002Z"
+                        stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round"
+                        stroke-linejoin="round">
+                    </path>
                 </g>
             </svg>
         </nav>
@@ -110,32 +355,36 @@
         </div>
     </div>
     <div class="panel-content">
-
-        <div class="domain-selection">
-            <label for="domain">Domain Dropdown</label>
-            {% if contentData.sections %}
-            <select name="domain" id="rightDomainDropdown">
-                {% for section in contentData.sections %}
-                <option value="{{ section }}">{{ section }}</option>
-                {% endfor %}
+        <!-- Domain Selection Section -->
+        <div class="domain-section">
+            <label for="domainDropdown">Domains:</label>
+            <select id="domainDropdown">
+                <option value="">Select Domain</option>
             </select>
-            {% else %}
-            <select name="domain" id="rightDomainDropdown">
-                <option value=""></option>
-            </select>
-            {% endif %}
+            <button type="button" id="addDomainBtn">+ Add Domain</button>
+            <div id="selectedDomains" style="display: flex; gap: 10px;"></div>
         </div>
 
+        <!-- Roles Selection Section -->
+        <div class="role-section">
+            <label for="roleDropdown">Roles:</label>
+            <select id="roleDropdown">
+                <option value="">Select Role</option>
+            </select>
+            <button type="button" id="addRoleBtn">+ Add Role</button>
+            <div id="selectedRoles" style="display: flex; gap: 10px;"></div>
+        </div>
+
+        <!-- Primary Editor and Additional Fields -->
         <div class="primary-editor">
             <label for="knowledgeData">Knowledge Entry Editor</label>
             <textarea name="knowledgeData" id="knowledgeDataEditor"></textarea>
             <label for="knowledgeTag">Knowledge Tags</label>
-            <!-- Updated input field with assigned ID -->
             <input type="text" name="knowledgeTag" id="knowledgeTagInput">
             <div id="knowledgeTags">
-               
+                <!-- Toggle-able tag buttons will be rendered here -->
             </div>
-            <!-- Additional input fields added below Knowledge Tags -->
+            <!-- Additional input fields -->
             <label for="knowledgeTitle">Title</label>
             <input type="text" name="knowledgeTitle" id="knowledgeTitleInput">
             <label for="knowledgeDescription">Description</label>
@@ -147,7 +396,6 @@
             <label for="knowledgeLink">Link</label>
             <input type="text" name="knowledgeLink" id="knowledgeLinkInput">
         </div>
-
     </div>
     <div class="panel-footer button-bar">
         <div class="button-text">
@@ -158,7 +406,7 @@
 {% endblock %}
 
 {% block rightBottomPanel %}
-<div id="right-bottom-panel">
+<div id="right-bottom-panel" class="zpanel-bottom-fill">
     <div class="panel-header">
     </div>
     <div class="panel-content">
@@ -170,5 +418,7 @@
 {% endblock %}
 
 {% block footer %}
-Knowledge footer here
+<div class="detatched-button-bar" onclick="addKnowledgeItem();">
+    <div class="button-text">ADD KNOWLEDGE ENTRY</div>
+</div>
 {% endblock %}

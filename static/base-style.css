@@ -129,6 +129,7 @@ select {
 input:focus,
 textarea:focus {
     outline: none;
+    background:var(--accent-ternery);
 }
 
 input[type='submit'] {
@@ -268,6 +269,12 @@ select {
 #knowledgeDataEditor {
     height: 300px;
     max-height: calc(100% - 2rem);
+}
+
+#knowledgeTags {
+    display: flex;
+    flex-flow: row;
+    gap: var(--micro-rem);
 }
 
 #left-panel {
@@ -425,6 +432,16 @@ select {
     cursor: pointer;
 }
 
+#selectedDomains, #selectedRoles{
+    flex-flow: wrap;
+    margin-top:unset;
+}
+
+#selectedDomains, #selectedRoles button{
+    min-width:max-content;
+
+}
+
 #userpass {
     display: none;
     border-top-right-radius: unset !important;
@@ -529,12 +546,6 @@ select {
 
 .icons-bar nav {
     margin: var(--micro-rem);
-}
-
-.knowledgeTags {
-    display: flex;
-    flex-flow: row;
-    gap: var(--micro-rem);
 }
 
 
@@ -697,6 +708,16 @@ select {
     border-top-right-radius: var(--border-radius);
     margin-top: var(--micro-rem);
     border: 1px solid var(--accent-border);
+}
+
+.footer-detached {
+    box-sizing: border-box;
+    border-top-left-radius: var(--border-radius);
+    border-top-right-radius: var(--border-radius);
+    margin-top: var(--micro-rem);
+    border: 1px solid var(--accent-border);
+    overflow:clip;
+
 }
 
 .panel-header {
@@ -914,6 +935,10 @@ select {
     gap: var(--micro-rem);
 }
 
+.role-section, .domain-section{
+    display:flex;flex-flow:column;
+    gap:var(--micro-rem)
+}
 /* ====================================================
    MEDIA QUERIES
    (Inner rules are sorted into tag, then ID, then class groups)
