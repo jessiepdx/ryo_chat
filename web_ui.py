@@ -388,9 +388,25 @@ def knowledgeEndpoint(action: str = None):
                 if knowledgeDocument is None:
                     return
                 
-                domains = config.knowledgeDomains if request.form.get("domains") is None else [domain for domain in request.form.get("domains") if domain in config.knowledgeDomains]
+                _domains = request.form.get("domains")
+                print(config.knowledgeDomains)
+                print(_domains)
+                print(type(_domains))
+                #domains = config.knowledgeDomains if _domains is None else [domain for domain in _domains if domain in config.knowledgeDomains]
+                if _domains is None:
+                    domains = config.knowledgeDomains
+                else:
+                    domains = list()
+                    for domain in _domains:
+                        if domain in config.knowledgeDomains:
+                            domains.append(domain)
                 print(domains)
-                roles = config.rolesList if request.form.get("roles") is None else [role for role in request.form.get("roles") if role in config.rolesList]
+
+                _roles = request.form.get("roles")
+                print(config.rolesList)
+                print(_roles)
+                print(type(_roles))
+                roles = config.rolesList if _roles is None else [role for role in _roles if role in config.rolesList]
                 print(roles)
                 # TODO further validation on categories and document metadata
                 categories = list() if request.form.get("categories") is None else request.form.get("categories")
