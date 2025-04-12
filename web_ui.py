@@ -388,6 +388,12 @@ def knowledgeEndpoint(action: str = None):
                 if knowledgeDocument is None:
                     return
                 
+                print(request.form.get("domains"))
+                print(type(request.form.get("domains")))
+                print(request.form.get("roles"))
+                print(type(request.form.get("roles")))
+
+
                 domains = config.knowledgeDomains if request.form.get("domains") is None else [domain for domain in request.form.get("domains") if domain in config.knowledgeDomains]
                 print(domains)
                 roles = config.rolesList if request.form.get("roles") is None else [role for role in request.form.get("roles") if role in config.rolesList]

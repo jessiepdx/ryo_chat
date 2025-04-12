@@ -174,7 +174,7 @@ nav:hover .icon {
 
 option {
     width: max-content;
-    color: var(--accent-dark)
+    color: var(--accent-primary)
 }
 
 p {
@@ -642,6 +642,7 @@ select {
     background-color: var(--accent-dark);
     border: 1px solid var(--accent-border);
     display: flex;
+    margin-top:unset!important;
     flex-direction: column;
     gap: var(--mini-rem);
     height: calc(100% - 14vh - 1rem);
@@ -706,7 +707,6 @@ select {
 .panel-footer.footer-detached {
     border-top-left-radius: var(--border-radius);
     border-top-right-radius: var(--border-radius);
-    margin-top: var(--micro-rem);
     border: 1px solid var(--accent-border);
 }
 
