@@ -22,7 +22,7 @@ import logging
 import secrets
 from datetime import datetime
 from flask import Flask, request, abort, url_for, redirect, session, render_template, g, jsonify
-from hypermindlabs.utils import CustomFormatter, MemberManager, KnowledgeManager
+from hypermindlabs.utils import ConfigManager, CustomFormatter, MemberManager, KnowledgeManager
 from urllib.parse import parse_qs
 
 
@@ -66,6 +66,7 @@ logger = logging.getLogger(__name__)
 # GLOBALS #
 ###########
 
+config = ConfigManager()
 # Create a dictionary containing color codes for console output
 ConsoleColors = {
     "default": "\x1b[0m",
@@ -329,6 +330,20 @@ def miniAppDashboard():
     print("Mini App Dashboard")
 
     return redirect(url_for("static", filename="miniapp/index.html"))
+
+
+
+#####################
+## GET ONLY ROUTES ##
+#-------------------#
+
+@app.get("/knowledge/roles-list")
+def getRolesList():
+    return jsonify(config.rolesList)
+
+@app.get("/knowledge/domains-list")
+def getDomainsList():
+    return jsonify(config.knowledgeDomains)
 
 
 
