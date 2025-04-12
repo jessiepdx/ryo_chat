@@ -66,7 +66,7 @@ class CustomFormatter(logging.Formatter):
 # Enable logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)", 
-    level=logging.DEBUG
+    level=logging.WARNING
 )
 
 logger = logging.getLogger(__name__)
@@ -108,11 +108,11 @@ class MemberManager:
             # Initialize the singleton instance.
 
             connection = None
-            # Create the accounts database if it doesn't exist yet
+            # Create the members table if it doesn't exist yet
             try:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
                 cursor = connection.cursor()
-                logger.info(f"PostgreSQL connection established.")
+                logger.debug(f"PostgreSQL connection established.")
 
                 # Create the member data table
                 memberData_sql = """CREATE TABLE IF NOT EXISTS member_data (
@@ -160,7 +160,7 @@ class MemberManager:
                 cursor.execute("SELECT COUNT(*) AS total_members FROM member_data;")
                 rowCount = cursor.fetchone()
                 if rowCount.get("total_members") == 0:
-                    print("No registered users. Creating default owner account from config data")
+                    logger.info("No registered users. Creating default owner account from config data")
 
                     # Add the data from record to our new member_data table
                     ownerData = {
@@ -192,19 +192,19 @@ class MemberManager:
                     cursor.execute(insertOwnerTelegram_sql, ownerTelegramData)
 
                     connection.commit()
-                    print("Owner account added")
+                    logger.info("Owner account added.")
                 else:
-                    print(f"There are {rowCount.get("total_members")} registered users")
+                    logger.info(f"There are {rowCount.get("total_members")} registered users.")
                 
                 connection.commit()
                 # Close the cursor
                 cursor.close()
             except psycopg.Error as error:
-                logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
             finally:
                 if (connection):
                     connection.close()
-                    logger.info(f"PostgreSQL connection is closed.")
+                    logger.debug(f"PostgreSQL connection is closed.")
         
         return cls._instance
 
@@ -216,7 +216,7 @@ class MemberManager:
         try:
             connection = connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
             
             getMemberQuery_sql = """SELECT mem.member_id, mem.first_name, mem.last_name, mem.email, mem.roles, mem.register_date, mem.community_score, tg.username, tg.user_id
             FROM member_data AS mem
@@ -234,11 +234,11 @@ class MemberManager:
             response = result
             
         except psycopg.Error as error:
-                logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
         
         return response
 
@@ -250,7 +250,7 @@ class MemberManager:
         try:
             connection = connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
             
             getMemberQuery_sql = """SELECT mem.member_id, mem.first_name, mem.last_name, mem.email, mem.roles, mem.register_date, mem.community_score, tg.username, tg.user_id
             FROM member_data AS mem
@@ -268,18 +268,18 @@ class MemberManager:
             response = result
             
         except psycopg.Error as error:
-                logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                logger.error(f"Exception while working with pyscopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
         
         return response
 
     def getMembersByRoles(self, roles: list) -> list:
-        logger.info("Get accounts by role")
+        logger.info("Get members by roles.")
         if len(roles) == 0:
-            logger.info("Roles list is empty")
+            logger.error("Roles list is empty.")
             return []
         
         connection = None
@@ -287,7 +287,7 @@ class MemberManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
 
             query_sql = """SELECT mem.member_id, mem.first_name, mem.last_name, mem.email, mem.roles, mem.register_date, mem.community_score, tg.username, tg.user_id
             FROM member_data AS mem
@@ -303,11 +303,11 @@ class MemberManager:
             response = results
 
         except psycopg.Error as error:
-                logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
             
             return response
 
@@ -317,7 +317,7 @@ class MemberManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
 
             # Add the data from record to our new member_data table
             insertMember_sql = """INSERT INTO member_data (first_name, last_name, email, roles, register_date) 
@@ -344,11 +344,11 @@ class MemberManager:
             cursor.close()
             
         except psycopg.Error as error:
-            logger.error(f"Error while working with PostgreSQL.\n{error}.")
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
     def loginMember(self, username: str, password: str) -> dict:
         logger.info(f"Login member with username and password.")
@@ -358,7 +358,7 @@ class MemberManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
 
             getSaltQuery_sql = """SELECT mem.member_id, mem.register_date
             FROM member_data AS mem
@@ -389,16 +389,16 @@ class MemberManager:
 
             cursor.close()
         except psycopg.Error as error:
-            logger.error(f"Error while working with PostgreSQL.\n{error}.")
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
             return loginResults
 
     def setPassword(self, memberID: int, password: str = None) -> str:
-        logger.info(f"Set a member password.")
+        logger.info("Set a member password.")
 
         member = self.getMemberByID(memberID)
         if member is None:
@@ -406,7 +406,6 @@ class MemberManager:
         
         # Create a random password if none was sent
         if password is None:
-            # Generate a random password
             alphabet = string.ascii_letters + string.digits
             while True:
                 password = ''.join(secrets.choice(alphabet) for i in range(12))
@@ -419,7 +418,8 @@ class MemberManager:
             pattern = re.compile(r"(?=.*\d)(?=.*[a-z])(?=.*[A-Z])(?=.*[-+_!@#$%^&*.,?]).{12,}")
             validPassword = pattern.search(password)
             if validPassword is None:
-                print("invalid password")
+                logger.error("Invalid password.")
+                # Critical error effects remaining functionality, exit
                 return None
         
         # Create a hash string
@@ -435,7 +435,7 @@ class MemberManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
 
             insert_sql = """INSERT INTO member_secure (member_id, secure_hash) 
             VALUES (%s, %s)
@@ -447,36 +447,35 @@ class MemberManager:
             cursor.close()
             
         except psycopg.Error as error:
-            logger.error(f"Error while working with PostgreSQL.\n{error}.")
+            logger.error(f"Error while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
             # Return password to UI
             return results
 
     def updateMemberEmail(self, memberID: int, email: str):
-        logger.info("Update email")
-        print(memberID)
-        print(email)
+        logger.info("Update member email.")
 
         # Run Reg Expression to validate
-        # Return None if the password does not meet minimum requirements
+        # Return None if the email does not meet minimum requirements
         pattern = re.compile(r"^[\w\-\.]+@([\w-]+\.)+[\w-]{2,72}$")
         validEmail = pattern.search(email)
         if validEmail is None:
-            print("invalid")
+            logger.error("Invalid email.")
+            # Critical error effects remaining functionality, exit
             return None
         
-        print("valid")
+        logger.debug("Valid Email")
 
         # Add email to database
         connection = None
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
             
             updateEmail_sql = "UPDATE member_data SET email = %s WHERE member_id = %s;"
             valueTuple = (email, memberID)
@@ -485,15 +484,14 @@ class MemberManager:
             cursor.close()
             
         except psycopg.Error as error:
-                logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
     def updateMemberRoles(self, memberID: int, roles: list):
-        logger.info("Update roles")
-        # TODO Update code for community instead of group logic
+        logger.info("Update member roles.")
 
         member = self.getMemberByID(memberID)
         if member is not None:
@@ -504,7 +502,7 @@ class MemberManager:
             try:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                 cursor = connection.cursor()
-                logger.info(f"PostgreSQL connection established.")
+                logger.debug(f"PostgreSQL connection established.")
                 
                 updateRoles_sql = "UPDATE member_data SET roles = %s WHERE member_id = %s;"
                 valueTuple = (roles, memberID)
@@ -514,11 +512,11 @@ class MemberManager:
                 response = True
                 
             except psycopg.Error as error:
-                    logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                    logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
             finally:
                 if (connection):
                     connection.close()
-                    logger.info(f"PostgreSQL connection is closed.")
+                    logger.debug(f"PostgreSQL connection is closed.")
             
             return response
     
@@ -529,7 +527,7 @@ class MemberManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
 
             update_sql = "UPDATE member_data SET community_score = %s WHERE member_id = %s;"
             cursor.execute(update_sql, (newScore, memberID))
@@ -537,11 +535,11 @@ class MemberManager:
             cursor.close()
             
         except psycopg.Error as error:
-                logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
     def validateMiniappData(self, telegramInitData: str):
         logger.info(f"Validating the data sent via telegram miniapp.")
@@ -554,29 +552,14 @@ class MemberManager:
 
         # Create a data check string from the query string
         # Data Check String must have the hash propoerty removed
-        """
-        kvList = list()
-        for k, v in queryDict.items():
-            kvList.append(f"{k}={v}")
-
-        kvList.sort()
-        dataCheckString = "\n".join(kvList)
-        """
-
         initData = sorted([chunk.split("=") for chunk in unquote(telegramInitData).split("&") if chunk[:len("hash=")] != "hash="], key=lambda x: x[0])
         initData = "\n".join([f"{rec[0]}={rec[1]}" for rec in initData])
 
         # Create the Secret Key
-        # From the API:  secret_key = HMAC_SHA256(<bot_token>, "WebAppData")
         key = "WebAppData".encode()
         token = ConfigManager().bot_token.encode()
         secretKey = hmac.new(key, token, hashlib.sha256)
-        print("secret key")
-        print(secretKey.hexdigest())
-        print("\n")
         digest = hmac.new(secretKey.digest(), initData.encode(), hashlib.sha256)
-        print("computed hash")
-        print(digest.hexdigest())
 
         if hmac.compare_digest(knownHash, digest.hexdigest()):
             print("data validated!")
@@ -588,29 +571,26 @@ class MemberManager:
 
 
     # Define getters
-
+    # TODO move to config and config manager
     @property
     def rolesList(self):
         return self.__rolesList
-#good
+
 
 class ChatHistoryManager:
     _instance = None
 
     def __new__(cls):
         if cls._instance is None:
+            # Intialize the new singleton
             cls._instance = super(ChatHistoryManager, cls).__new__(cls)
 
             connection = None
-            # Intialize the new singleton
+            
             try:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                 cursor = connection.cursor()
-
-                #dropEmbed_sql = "DROP TABLE chat_history_embeddings;"
-                #cursor.execute(dropEmbed_sql)
-                #dropHistory_sql = "DROP TABLE chat_history;"
-                #cursor.execute(dropHistory_sql)
+                logger.debug(f"PostgreSQL connection established.")
                 
                 # Create the chat history table if it does not exist
                 memberHistory_sql = """CREATE TABLE IF NOT EXISTS chat_history (
@@ -642,11 +622,11 @@ class ChatHistoryManager:
                 # close the communication with the PostgreSQL
                 cursor.close()
             except (Exception, psycopg.DatabaseError) as error:
-                print(error)
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
             finally:
                 if connection is not None:
                     connection.close()
-                    logger.info(f"PostgreSQL connection is closed.")
+                    logger.debug(f"PostgreSQL connection is closed.")
 
         
         return cls._instance
@@ -657,7 +637,7 @@ class ChatHistoryManager:
         if not chatHostID:
             return
         
-        chatType = "community" if communityID else "member"
+        chatType = "community" if communityID is not None else "member"
         
         embedding = getEmbeddings(messageText)
 
@@ -666,6 +646,7 @@ class ChatHistoryManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
 
             insertHistory_sql = """INSERT INTO chat_history (member_id, community_id, chat_host_id, topic_id, chat_type, platform, message_id, message_text, message_timestamp)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -684,11 +665,11 @@ class ChatHistoryManager:
             # close the communication with the PostgreSQL
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
-            print(error)
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if connection is not None:
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
             return response
 
@@ -701,6 +682,7 @@ class ChatHistoryManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
 
             if platform is None:
                 querySQL = """SELECT history_id, message_id, message_text, message_timestamp
@@ -725,11 +707,11 @@ class ChatHistoryManager:
             # close the communication with the PostgreSQL
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
-            print(error)
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if connection is not None:
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
             
             return response
 
@@ -742,6 +724,7 @@ class ChatHistoryManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
 
             beginQuery_sql = """SELECT history_id, message_id, message_text, message_timestamp
                 FROM chat_history
@@ -772,11 +755,11 @@ class ChatHistoryManager:
             # close the communication with the PostgreSQL
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
-            print(error)
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if connection is not None:
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
             
             return response
 
@@ -789,6 +772,7 @@ class ChatHistoryManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
             
             beginQuery_sql = """SELECT history_id, member_id, message_id, message_text, message_timestamp
                 FROM chat_history
@@ -815,11 +799,11 @@ class ChatHistoryManager:
             # close the communication with the PostgreSQL
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
-            print(error)
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if connection is not None:
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
             
             return results
 
@@ -832,6 +816,7 @@ class ChatHistoryManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
             
             beginQuery_sql = """SELECT ch.history_id, ch.message_id, ch.message_text, ch.message_timestamp, mem.member_id, mem.first_name, mem.last_name
                 FROM chat_history AS ch
@@ -860,11 +845,11 @@ class ChatHistoryManager:
             # close the communication with the PostgreSQL
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
-            print(error)
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if connection is not None:
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
             
             return results
 
@@ -876,6 +861,7 @@ class ChatHistoryManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
 
             querySQL = """SELECT *
             FROM chat_history
@@ -889,11 +875,11 @@ class ChatHistoryManager:
 
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
-            print(error)
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if connection is not None:
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
             
             return response
     
@@ -905,6 +891,7 @@ class ChatHistoryManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
 
             querySQL = """SELECT *
             FROM chat_history
@@ -921,11 +908,11 @@ class ChatHistoryManager:
             
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
-            print(error)
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if connection is not None:
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
             
             return response
 
@@ -938,6 +925,7 @@ class ChatHistoryManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
             
             querySQL = """SELECT ch.history_id, ch.message_id, ch.message_text, ch.message_timestamp, che.embeddings <-> %s::vector AS distance
             FROM chat_history AS ch
@@ -951,19 +939,20 @@ class ChatHistoryManager:
             # close the communication with the PostgreSQL
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
-            print(error)
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if connection is not None:
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
             
             return response
-#good
+
 
 class CommunityManager:
     _instance = None
     
     # Private attributes
+    # TODO place this in config
     #__rolesList = ["user","tester","marketing","admin","owner"]
 
     def __new__(cls):
@@ -972,11 +961,11 @@ class CommunityManager:
             # Initialize the singleton instance.
 
             connection = None
-            # Create the accounts database if it doesn't exist yet
+            # Create the community database tables if they don't exist yet
             try:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                 cursor = connection.cursor()
-                logger.info(f"PostgreSQL connection established.")
+                logger.debug(f"PostgreSQL connection established.")
 
                 # Create the new community data table
                 communityData_sql = """CREATE TABLE IF NOT EXISTS community_data (
@@ -1010,11 +999,11 @@ class CommunityManager:
                 # Close the cursor
                 cursor.close()
             except psycopg.Error as error:
-                logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
             finally:
                 if (connection):
                     connection.close()
-                    logger.info(f"PostgreSQL connection is closed.")
+                    logger.debug(f"PostgreSQL connection is closed.")
         
         return cls._instance
 
@@ -1026,7 +1015,7 @@ class CommunityManager:
         try:
             connection = connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
 
             getCommunityQuery_sql = """SELECT cd.community_id, cd.community_name, cd.community_link, cd.roles, cd.created_by, cd.register_date, tg.chat_id, tg.chat_title, tg.has_topics
             FROM community_data AS cd
@@ -1043,11 +1032,11 @@ class CommunityManager:
             response = result
             
         except psycopg.Error as error:
-                logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
             
             return response
 
@@ -1059,7 +1048,7 @@ class CommunityManager:
         try:
             connection = connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
 
             getCommunityQuery_sql = """SELECT cd.community_id, cd.community_name, cd.community_link, cd.roles, cd.created_by, cd.register_date, tg.chat_id, tg.chat_title, tg.has_topics
             FROM community_data AS cd
@@ -1076,11 +1065,11 @@ class CommunityManager:
             response = result
             
         except psycopg.Error as error:
-                logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
             
             return response
 
@@ -1091,7 +1080,7 @@ class CommunityManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
 
             insertMember_sql = """INSERT INTO community_data (community_name, community_link, roles, created_by, register_date) 
             VALUES (%(community_name)s, %(community_link)s, %(roles)s, %(created_by)s, %(register_date)s)
@@ -1116,14 +1105,14 @@ class CommunityManager:
             
             cursor.close()
         except psycopg.Error as error:
-                logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
     def updateCommunityRoles(self, communityID: int, roles: list):
-            logger.info("Update roles")
+            logger.info("Update community roles")
             
             community = self.getCommunityByID(communityID)
             if community is not None:
@@ -1133,7 +1122,7 @@ class CommunityManager:
                 try:
                     connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                     cursor = connection.cursor()
-                    logger.info(f"PostgreSQL connection established.")
+                    logger.debug(f"PostgreSQL connection established.")
 
                     updateRoles_sql = "UPDATE community_data SET roles = %s WHERE community_id = %s;"
                     valueTuple = (roles, communityID)
@@ -1143,11 +1132,11 @@ class CommunityManager:
                     cursor.close()
                     
                 except psycopg.Error as error:
-                        logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                        logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
                 finally:
                     if (connection):
                         connection.close()
-                        logger.info(f"PostgreSQL connection is closed.")
+                        logger.debug(f"PostgreSQL connection is closed.")
                         return True
 
 
@@ -1221,16 +1210,12 @@ class CommunityScoreManager:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(CommunityScoreManager, cls).__new__(cls)
-            database = ConfigManager().database
-            cls._instance.communityScore_db = database
 
+            connection = None
             try:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                 cursor = connection.cursor()
-                logger.info(f"PostgreSQL connection established.")
-
-                #drop_sql = "DROP TABLE community_score;"
-                #cursor.execute(drop_sql)
+                logger.debug(f"PostgreSQL connection established.")
                 
                 # Create the individual accounts table if it doesn't exist
                 communityScoreTable_sql = """CREATE TABLE IF NOT EXISTS community_score (
@@ -1252,11 +1237,11 @@ class CommunityScoreManager:
                 # Close the cursor
                 cursor.close()
             except psycopg.Error as error:
-                logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
             finally:
                 if (connection):
                     connection.close()
-                    logger.info(f"PostgreSQL connection is closed.")
+                    logger.debug(f"PostgreSQL connection is closed.")
 
         return cls._instance
     
@@ -1267,7 +1252,7 @@ class CommunityScoreManager:
         historyMessage = ChatHistoryManager().getMessageByHistoryID(historyID)
         # Get member data from the history message member ID
         memberData = MemberManager().getMemberByID(historyMessage.get("member_id"))
-        if not memberData:
+        if memberData is None:
             return
         
         messageText = historyMessage.get("message_text")
@@ -1294,7 +1279,7 @@ class CommunityScoreManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
             
             insert_sql = "INSERT INTO community_score (history_id, event, read_score, points_awarded, awarded_from_id, multiplier) VALUES (%s, 'message', %s, %s, %s, %s);"
             cursor.execute(insert_sql, (historyID, baselineScore, finalPoints, memberData["member_id"], finalRatio))
@@ -1302,11 +1287,11 @@ class CommunityScoreManager:
             cursor.close()
             
         except psycopg.Error as error:
-            logger.error(f"Error while working with PostgreSQL.\n{error}.")
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
         # Call accounts manager method to calculate user's new community score
         # TODO add up each record vs just the new score and old score
@@ -1337,7 +1322,7 @@ class CommunityScoreManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
 
             insert_sql = "INSERT INTO community_score (history_id, event, points_awarded, awarded_from_id, multiplier) VALUES (%s, 'reaction', %s, %s, %s);"
             cursor.execute(insert_sql, (historyID, finalPoints, memberID, finalRatio))
@@ -1345,11 +1330,11 @@ class CommunityScoreManager:
             cursor.close()
             
         except psycopg.Error as error:
-            logger.error(f"Error while working with PostgreSQL.\n{error}.")
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
         # Call accounts manager method to calculate user's new community score
         # TODO add up each record vs just the new score and old score
@@ -1373,7 +1358,7 @@ class CommunityScoreManager:
                 break
         
         return rateLimits
-#good
+
 
 class ConfigManager:
     _instance = None
@@ -1422,7 +1407,7 @@ class ConfigManager:
     @property
     def webUIUrl(self):
         return self._instance.web_ui_url
-#good
+
 
 class KnowledgeManager:
     _instance = None
@@ -1430,13 +1415,13 @@ class KnowledgeManager:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(KnowledgeManager, cls).__new__(cls)
-
             # Intialize the new singleton
-            database = ConfigManager().database
-            cls._instance.knowledge_db = database
+
+            connection = None
             try:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                 cursor = connection.cursor()
+                logger.debug(f"PostgreSQL connection established.")
                 
                 # Create the knowledge table if it does not exist
                 createKnowledgeSQL = """CREATE TABLE IF NOT EXISTS knowledge (
@@ -1480,11 +1465,11 @@ class KnowledgeManager:
                 # close the communication with the PostgreSQL
                 cursor.close()
             except (Exception, psycopg.DatabaseError) as error:
-                print(error)
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
             finally:
                 if connection is not None:
                     connection.close()
-                    logger.info(f"PostgreSQL connection is closed.")
+                    logger.debug(f"PostgreSQL connection is closed.")
 
         
         return cls._instance
@@ -1497,6 +1482,8 @@ class KnowledgeManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
             cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+
             insertSQL = """INSERT INTO knowledge (domains, roles, categories, knowledge_document, document_metadata, embeddings, record_timestamp, record_metadata)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING knowledge_id;"""
@@ -1506,11 +1493,11 @@ class KnowledgeManager:
             # close the communication with the PostgreSQL
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
-            print(error)
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if connection is not None:
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
             return recordID
 
@@ -1522,6 +1509,8 @@ class KnowledgeManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
             cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+
             insertSQL = """INSERT INTO knowledge_retrievals (prompt_id, response_id, knowledge_id, distance, retrieval_timestamp)
             VALUES (%s, %s, %s, %s, %s)
             RETURNING retrieval_id;"""
@@ -1531,11 +1520,11 @@ class KnowledgeManager:
             # close the communication with the PostgreSQL
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
-            print(error)
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if connection is not None:
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
             return recordID
 
@@ -1547,6 +1536,8 @@ class KnowledgeManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+
             querySQL = """SELECT knowledge_id, domains, roles, categories, knowledge_document, document_metadata, record_timestamp, record_metadata
             FROM knowledge
             LIMIT 10"""
@@ -1557,11 +1548,11 @@ class KnowledgeManager:
             # close the communication with the PostgreSQL
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
-            print(error)
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if connection is not None:
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
             
             return response
 
@@ -1574,6 +1565,8 @@ class KnowledgeManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+
             querySQL = """SELECT knowledge_id, domains, roles, categories, knowledge_document, document_metadata, embeddings <-> %s::vector AS distance, record_timestamp, record_metadata
             FROM knowledge
             ORDER BY distance
@@ -1585,14 +1578,14 @@ class KnowledgeManager:
             # close the communication with the PostgreSQL
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
-            print(error)
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if connection is not None:
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
             
             return response
-#good
+
 
 class ProposalManager:
     _instance = None
@@ -1600,16 +1593,14 @@ class ProposalManager:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(ProposalManager, cls).__new__(cls)
-
             # Intialize the new singleton
-            database = ConfigManager().database
-            cls._instance.proposals_db = database
 
-            # Create the accounts database if it doesn't exist yet
+            # Create the proposal tables if they don't exist yet
+            connection = None
             try:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                 cursor = connection.cursor()
-                logger.info(f"PostgreSQL connection established.")
+                logger.debug(f"PostgreSQL connection established.")
 
                 # Create the proposals table if it doesn't exist
                 proposalsTable_sql = """CREATE TABLE IF NOT EXISTS proposals (
@@ -1635,11 +1626,11 @@ class ProposalManager:
                 # Close the cursor
                 cursor.close()
             except psycopg.Error as error:
-                logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
             finally:
                 if (connection):
                     connection.close()
-                    logger.info(f"PostgreSQL connection is closed.")
+                    logger.debug(f"PostgreSQL connection is closed.")
         
         return cls._instance
 
@@ -1649,8 +1640,7 @@ class ProposalManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
-
+            logger.debug(f"PostgreSQL connection established.")
             
             usageQuery_sql = "SELECT rowid, * FROM proposals;"
             cursor.execute(usageQuery_sql)
@@ -1674,13 +1664,12 @@ class ProposalManager:
             return proposalList
 
         except psycopg.Error as error:
-            logger.error(f"Error while working with PostgreSQL.\n{error}.")
-
-            return []
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+            return list()
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
     def addDisclosureAgreement(self, userID: int, proposalID: int):
         logger.info(f"Adding a new discolure agreement for a proposal.")
@@ -1688,7 +1677,7 @@ class ProposalManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
             
             addAgreement_sql = "INSERT INTO proposal_disclosure (user_id, proposal_id, agreement_date) VALUES (%s, %s, %s);"
             cursor.execute(addAgreement_sql, (userID, proposalID, datetime.now()))
@@ -1698,11 +1687,11 @@ class ProposalManager:
             cursor.close()
 
         except psycopg.Error as error:
-            logger.error(f"Error while working with PostgreSQL.\n{error}.")
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
 
 class UsageManager:
@@ -1711,16 +1700,14 @@ class UsageManager:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(UsageManager, cls).__new__(cls)
-
             # Intialize the new singleton
-            database = ConfigManager().database
-            cls._instance.usage_db = database
 
-            # Create the accounts database if it doesn't exist yet
+            # Create the usage table if it doesn't exist yet
+            connection = None
             try:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                 cursor = connection.cursor()
-                logger.info(f"PostgreSQL connection established.")
+                logger.debug(f"PostgreSQL connection established.")
                 
                 # Create the individual accounts table if it doesn't exist
                 usageTable_sql = """CREATE TABLE IF NOT EXISTS inference_usage (
@@ -1748,11 +1735,11 @@ class UsageManager:
                 # Close the cursor
                 cursor.close()
             except psycopg.Error as error:
-                logger.error(f"Error while working with PostgreSQL.\n{error}.")
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
             finally:
                 if (connection):
                     connection.close()
-                    logger.info(f"PostgreSQL connection is closed.")
+                    logger.debug(f"PostgreSQL connection is closed.")
         
         return cls._instance
 
@@ -1762,7 +1749,7 @@ class UsageManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
             
             addUsage_sql = """INSERT INTO inference_usage (prompt_history_id, response_history_id, load_duration, prompt_eval_count, prompt_eval_duration, eval_count, eval_duration, total_duration) 
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s);"""
@@ -1773,11 +1760,11 @@ class UsageManager:
             cursor.close()
 
         except psycopg.Error as error:
-            logger.error(f"Error while working with PostgreSQL.\n{error}.")
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
 
     def getUsageForMember(self, MemberID: int, timeInHours: int = 1) -> list:
         logger.info(f"Get a list of usage data for user.")
@@ -1787,7 +1774,7 @@ class UsageManager:
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
-            logger.info(f"PostgreSQL connection established.")
+            logger.debug(f"PostgreSQL connection established.")
 
             beginSearch_dt = datetime.now() - timedelta(hours=timeInHours)
             
@@ -1803,14 +1790,14 @@ class UsageManager:
             # Close the cursor
             cursor.close()
         except psycopg.Error as error:
-            logger.error(f"Error while working with PostgreSQL.\n{error}.")
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
         finally:
             if (connection):
                 connection.close()
-                logger.info(f"PostgreSQL connection is closed.")
+                logger.debug(f"PostgreSQL connection is closed.")
             
             return response
-#good
+
 
 
 ####################
@@ -1818,15 +1805,14 @@ class UsageManager:
 ####################
 
 def getEmbeddings(text: str) -> list:
-    logger.info(f"Getting embeddings.")
+    logger.info("Getting embeddings.")
     try:
         results = Client(host=ConfigManager().inference["embedding"]["url"]).embeddings(
             model=ConfigManager().inference["embedding"]["model"],
             prompt=text
         )
-        #print(results.embedding)
         return results.embedding
-    except Exception as err:
-        print(err)
+    except Exception as error:
+        logger.error(f"Exception while getting embeddings from Ollama:\n{error}")
         return None
 

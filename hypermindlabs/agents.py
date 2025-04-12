@@ -149,7 +149,7 @@ class ConversationOrchestrator:
 
         analysisResponseMessage = ""
         
-        print(f"{ConsoleColors["purple"]}Analysis Agent > ", end="")
+        #print(f"{ConsoleColors["purple"]}Analysis Agent > ", end="")
         chunk: ChatResponse
         async for chunk in self._analysisResponse:
             # Call the streaming response method. This is intended to be over written by the UI for cutom handling
@@ -165,7 +165,7 @@ class ConversationOrchestrator:
                     "eval_duration": chunk.eval_duration,
                 }
 
-        print(ConsoleColors["default"])
+        #print(ConsoleColors["default"])
         
         # TODO Just send the last USER message to the tools followed by the thoughts from analysis agent
         self._toolsAgent = ToolCallingAgent(self._messages)
@@ -188,7 +188,7 @@ class ConversationOrchestrator:
 
         responseMessage = ""
         
-        print(f"{ConsoleColors["blue"]}Assistant > ", end="")
+        #print(f"{ConsoleColors["blue"]}Assistant > ", end="")
         chunk: ChatResponse
         async for chunk in response:
             self.streamingResponse(streamingChunk=chunk.message.content)
@@ -204,7 +204,7 @@ class ConversationOrchestrator:
                 }
 
         self._chatResponseMessage = responseMessage
-        print(ConsoleColors["default"])
+        #print(ConsoleColors["default"])
 
         if hasattr(self, "_responseID"):
             print("autogen response ID, store message")
@@ -320,7 +320,7 @@ def chatHistorySearch(queryString: str, count: int = 2) -> list:
 
     # Need to limit this only search within the context of the current conversation
     results = chatHistory.searchChatHistory(text=queryString, limit=1)
-    print(results)
+    logger.debug(f"Chat history tool results:\n{results}")
     
     convertedResults = list()
     for result in results:
@@ -392,8 +392,6 @@ knowledgeTool = {
     }
 }
 
-print(knowledgeTool)
-
 # Manually creating a skip tools tool so that the agent can decide not to use tools
 # This is a work around to some tool calling models calling a tool always
 skipTool = {
@@ -454,6 +452,7 @@ class ToolCallingAgent():
     async def generateResponse(self):
         logger.info(f"Generate a response for the tool calling agent.")
 
+        # TODO Wrap this in a try except block
         self._response: ChatResponse = await self._ollamaClient.chat(
             model=self._model, 
             messages=self._messages,
@@ -467,8 +466,9 @@ class ToolCallingAgent():
                 # TODO replace below with the following: toolCaller(function_to_call, args_to_call) once that function is built
                 # Ensure the function is available, and then call it
                 if function_to_call := available_functions.get(tool.function.name):
-                    print('Calling function:', tool.function.name)
-                    print('Arguments:', tool.function.arguments)
+                    logger.debug(f"Tool calling agent calling the following functions:\nCalling function:  {tool.function.name}\nArguments:  {tool.function.arguments}")
+                    #print('Calling function:', tool.function.name)
+                    #print('Arguments:', tool.function.arguments)
                     toolArgs = tool.function.arguments if tool.function.arguments.get("properties") is None else tool.function.arguments.get("properties")
                     
                     output = function_to_call(**toolArgs)
@@ -478,7 +478,7 @@ class ToolCallingAgent():
                     }
                     toolResults.append(toolResult)
                 else:
-                    print('Function', tool.function.name, 'not found')
+                    logger.debug(f"Function {tool.function.name} not found")
         
         return toolResults
     
