@@ -716,8 +716,6 @@ select {
     border-top-right-radius: var(--border-radius);
     margin-top: var(--micro-rem);
     border: 1px solid var(--accent-border);
-    overflow:clip;
-
 }
 
 .panel-header {
