@@ -388,20 +388,36 @@ def knowledgeEndpoint(action: str = None):
                 if knowledgeDocument is None:
                     return
                 
-                _domains = list() if request.form.get("domains") is None else ",".split(request.form.get("domains"))
-                domains = config.knowledgeDomains if len(_domains) == 0 else [domain for domain in _domains if domain in config.knowledgeDomains]
+                _domains = request.form.get("domains")
+                print(_domains)
+                if _domains is None:
+                    domains = config.knowledgeDomains
+                else:
+                    domains = json.loads(_domains)
                 print(domains)
 
-                _roles = list() if request.form.get("roles") is None else ",".split(request.form.get("roles"))
-                roles = config.rolesList if len(_roles) == 0 else [role for role in _roles if role in config.rolesList]
+                _roles = request.form.get("roles")
+                if _roles is None:
+                    roles = config.rolesList
+                else:
+                    roles = json.loads(_roles)
                 print(roles)
                 # TODO further validation on categories and document metadata
-                categories = list() if request.form.get("categories") is None else ",".split(request.form.get("categories"))
+                _categories = request.form.get("categories")
+                if _categories is None:
+                    categories = list()
+                else:
+                    categories = json.loads(_categories)
                 print(categories)
-                documentMetadata = dict() if request.form.get("document_metadata") is None else request.form.get("document_metadata")
-
+                _documentMetadata = request.form.get("document_metadata")
+                if _documentMetadata is None:
+                    documentMetadata = dict()
+                else: 
+                    documentMetadata = json.loads(_documentMetadata)
+                print(documentMetadata)
+                
                 knowledgeID = knowledge.addDocument(knowledgeDocument, memberID, domains, roles, categories, documentMetadata)
-                print(knowledge)
+                print(knowledgeID)
                 return {"success": True, "knowledge_id": knowledgeID}
 
             case "edit":
@@ -415,6 +431,8 @@ def knowledgeEndpoint(action: str = None):
                     return
                 
                 knowledge.deleteDocument(knowledgeID)
+
+                return {"success": True}
 
 @app.post("/miniapp-login")
 def miniappLogin():

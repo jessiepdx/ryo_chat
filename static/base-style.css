@@ -589,6 +589,7 @@ select {
 .list-item-header {
     padding: var(--micro-rem);
     background-color: var(--accent-midway);
+    display:flex;flex-flow:row;justify-content: space-between;
 }
 
 .list-item-footer {

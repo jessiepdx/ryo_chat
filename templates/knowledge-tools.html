@@ -174,19 +174,44 @@
                 console.log("Editor: Active tag buttons (categories):", activeTagButtons);
             }
 
+            console.log("Editor: Final packet before FormData conversion:", packet);
+
+            const documentMetadata = {
+                "source": packet.source || "",
+                "title": packet.title || "",
+                "author": packet.author || "",
+                "link": packet.link || "",
+                "description": packet.description || "",
+            };
+
             // Prepare FormData packet.
-            // (Retaining original functionality: appending a hardcoded string for 'knowledge_document')
             const fd = new FormData();
-            fd.append('knowledge_document', "test test test");
-            if (packet.domains) fd.append('domains', packet.domains);
-            if (packet.roles) fd.append('roles', packet.roles);
-            if (packet.categories) fd.append('categories', packet.categories);
-            console.log("Editor: FormData prepared for submission.", fd);
+            fd.append('knowledge_document', knowledgeContent);
+            // Append additional fields from the main window.
+            if (packet.domains) {
+                fd.append('domains', JSON.stringify(packet.domains));
+                console.log("Editor: Appended domains:", packet.domains);
+            }
+            if (packet.roles) {
+                fd.append('roles', JSON.stringify(packet.roles));
+                console.log("Editor: Appended roles:", packet.roles);
+            }
+            if (packet.categories) {
+                fd.append('categories', JSON.stringify(packet.categories));
+                console.log("Editor: Appended categories:", packet.categories);
+            }
+            fd.append("document_metadata", JSON.stringify(documentMetadata));
+
+            console.log("Editor: Final FormData entries:");
+            fd.forEach((value, key) => {
+                console.log(`Editor: FormData key: ${key}, value: ${value}`);
+            });
 
             const req = new Request("/knowledge/add", {
                 method: 'POST',
                 body: fd
             });
+            console.log("Editor: Sending POST request to '/knowledge/add' with FormData");
             fetch(req)
                 .then(response => response.json())
                 .then(data => {
@@ -335,6 +360,42 @@
     };
 
     // ========================
+    // Global Delete Function
+    // ========================
+    // This function sends a POST to the new /knowledge/delete endpoint with the knowledge_id.
+    window.deleteKnowledge = function(knowledgeId) {
+        if (!confirm("Are you sure you want to delete the knowledge entry with ID: " + knowledgeId + "?")) {
+            return;
+        }
+        const fd = new FormData();
+        fd.append("knowledge_id", knowledgeId);
+        console.log("deleteKnowledge: Sending deletion request for knowledge ID:", knowledgeId);
+
+        fetch("/knowledge/delete", {
+            method: "POST",
+            body: fd
+        })
+        .then(response => response.json())
+        .then(data => {
+            console.log("deleteKnowledge: Server responded with:", data);
+            if (data.success) {
+                // Remove the deleted entry from the DOM.
+                const entry = document.querySelector(`[data-knowledge-id="${knowledgeId}"]`);
+                if (entry) {
+                    entry.remove();
+                    console.log("deleteKnowledge: Removed entry for knowledge ID:", knowledgeId);
+                }
+            } else {
+                alert("Failed to delete entry: " + data.error);
+            }
+        })
+        .catch(error => {
+            console.error("deleteKnowledge: Error during deletion:", error);
+            alert("Error deleting entry: " + error);
+        });
+    };
+
+    // ========================
     // Initialization on DOMContentLoaded
     // ========================
     document.addEventListener('DOMContentLoaded', function () {
@@ -356,8 +417,8 @@
 
 {% block leftPanel %}
 <style>
-    .panel-auto { height: auto !important; }
-    .panel-fill { height: 100% !important; }
+    .panel-auto { height: calc(15% - var(--micro-rem)) !important; }
+    .panel-fill { height: 85% !important; }
     .detatched-button-bar {
         text-align: center;
         vertical-align: middle;
@@ -371,6 +432,13 @@
         height: 100%;
         width: 100%;
         line-height: calc(var(--panel-bar-height) - (2 * var(--micro-rem)));
+    }
+    .primary-editor{
+        display:flex;
+        flex-flow:column;
+    }
+    .primary-editor label{
+        margin-top: var(--mini-rem);
     }
     .detatched-button-bar:hover {
         background-color: var(--accent-primary);
@@ -416,7 +484,11 @@
 {% for knowledge in knowledgeData %}
 <div class="list-item-container" data-knowledge-id="{{ knowledge['knowledge_id'] }}" onclick="knowledgeItemClicked(this);">
     <div class="list-item-header">
-        {{ knowledge["knowledge_id"] }}
+        <h3>{{ knowledge["knowledge_id"] }}</h3>
+        <!-- Delete button added next to the ID -->
+        <button type="button" class="delete-btn"  onclick="deleteKnowledge(knowledgeId={{ knowledge['knowledge_id'] }});">
+            Delete
+        </button>
     </div>
     <div class="list-item-body">
         {{ knowledge["knowledge_document"] }}
