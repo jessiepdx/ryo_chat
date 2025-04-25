@@ -14,6 +14,7 @@ const uiPrefs = new DATA.UIPrefs();
 // Define Callback handlers
 function contentLoaded() {
     // The DOM content has loaded.
+    console.log("test");
 
     // Set up the panels
     const accountPanel = new UI.AccountPanel("account-panel", "account-btn", "Accounts");

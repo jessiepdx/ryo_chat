@@ -3,7 +3,23 @@
 {% block title %}{{ contentData.title }}{% endblock %}
 
 {% block javascript %}
+<script type="module">
+    import { KnowledgeManager } from "{{ url_for('static', filename='data-managers.js') }}"
+
+    window.knowledge = new KnowledgeManager();
+    
+    
+</script>
+
 <script>
+function setKnowledgeManager() {
+    knowledgeForm = document.getElementById("new-knowledge-form");
+    console.log(knowledgeForm);
+    knowledge.knowledgeForm = knowledgeForm
+}
+
+document.addEventListener("DOMContentLoaded", setKnowledgeManager);
+
 (function() {
     // ========================
     // Utility Module
@@ -518,32 +534,35 @@
     </div>
     <div class="panel-content">
         <!-- Domain Selection Section -->
+        <form id="new-knowledge-form" action="/knowledge/add" method="post" onsubmit="knowledge.submitKnowledgeForm();">
+
+        
         <div class="domain-section">
             <label for="domainDropdown">Domains:</label>
-            <select id="domainDropdown">
+            <select id="domainDropdown" name="domain_select">
                 <option value="">Select Domain</option>
             </select>
-            <button type="button" id="addDomainBtn">+ Add Domain</button>
+            <button type="button" id="addDomainBtn" name="domain_add">+ Add Domain</button>
             <div id="selectedDomains" style="display: flex; gap: 0.5rem;"></div>
         </div>
         <!-- Roles Selection Section -->
         <div class="role-section">
             <label for="roleDropdown">Roles:</label>
-            <select id="roleDropdown">
+            <select id="roleDropdown" name="role_select">
                 <option value="">Select Role</option>
             </select>
-            <button type="button" id="addRoleBtn">+ Add Role</button>
+            <button type="button" id="addRoleBtn" name="role_add">+ Add Role</button>
             <div id="selectedRoles" style="display: flex; gap: 0.5rem;"></div>
         </div>
         <!-- Primary Editor and Additional Fields -->
         <div class="primary-editor">
-            <label for="knowledgeData">Knowledge Entry Editor</label>
-            <textarea name="knowledgeData" id="knowledgeDataEditor"></textarea>
-            <label for="knowledgeTag">Knowledge Tags</label>
-            <input type="text" name="knowledgeTag" id="knowledgeTagInput">
+            <label for="knowledgeDataEditor">Knowledge Entry Editor</label>
+            <textarea name="knowledge_document" id="knowledgeDataEditor"></textarea>
+            <label for="knowledgeTagInput">Knowledge Categories</label>
+            <input type="text" name="category_input" id="knowledgeTagInput">
             <div id="knowledgeTags"></div>
             <label for="knowledgeTitle">Title</label>
-            <input type="text" name="knowledgeTitle" id="knowledgeTitleInput">
+            <input type="text" name="document_title" id="knowledgeTitleInput" />
             <label for="knowledgeDescription">Description</label>
             <input type="text" name="knowledgeDescription" id="knowledgeDescriptionInput">
             <label for="knowledgeAuthor">Author</label>
@@ -553,6 +572,8 @@
             <label for="knowledgeLink">Link</label>
             <input type="text" name="knowledgeLink" id="knowledgeLinkInput">
         </div>
+
+        </form>
     </div>
     <div class="panel-footer button-bar">
         <div class="button-text">Save Edit</div>
