@@ -1,52 +1,59 @@
 {
-  "bot_name": "Telegram bot username",
+  "bot_name": "telegram_bot_username",
   "bot_id": 12345,
-  "bot_token": "Telegram bot token",
+  "bot_token": "telegram_bot_token",
   "web_ui_url": "https://web.ui.url/",
   "owner_info": {
-    "first_name": "First name",
-    "last_name": "Last name",
+    "first_name": "First",
+    "last_name": "Last",
     "user_id": 12345,
-    "username": "Telegram username"
+    "username": "telegram_username"
   },
   "database": {
-      "db_name": "Database name",
-      "user": "Database user", 
-      "password": "Database password", 
-      "host": "Postgres URL",
-      "port": "Postgres port"
+    "db_name": "ryo_chat",
+    "user": "postgres_user",
+    "password": "postgres_password",
+    "host": "127.0.0.1",
+    "port": "5432"
   },
   "knowledge": {
-    "domains": ["Short List", "Of Main", "Knowledge Domains"]
+    "domains": ["General", "Project", "Operations"]
   },
+  "roles_list": ["user", "tester", "marketing", "admin", "owner"],
   "defaults": {
-    "system_prompt": "You are a helpful Telegram Chatbot having conversations with users in the Telegram Messager App. Do your best to respond truthfully and factually. If you  don't know the answer, let the user know. You may need to ask the user questions to gather more information. ",
-    "generate_sys_prompt": "To keep the conversation flow going smoothly, it may make sense to keep responses short and concise while other times you should give a thorough response. ",
-    "chat_sys_prompt": "Using the message history of our conversations and you vast collection of training knowledge, respond to user prompts as best as you are able. If recalling information from previous parts of the conversation, make sure to summarize a response and don't be verbatum."
+    "system_prompt": "You are a helpful chatbot. Respond truthfully and factually. If you do not know the answer, say so and ask for clarification when needed.",
+    "generate_sys_prompt": "Adjust response length to the user request: concise for quick asks, detailed for deeper asks.",
+    "chat_sys_prompt": "Use conversation history and retrieved context when relevant, while keeping answers on-topic."
   },
   "inference": {
     "embedding": {
-      "url": "Ollama location",
-      "model": "Embedding model"
+      "url": "http://127.0.0.1:11434",
+      "model": "nomic-embed-text:latest"
     },
     "generate": {
-      "url": "Ollama location",
-      "model": "Generate model"
+      "url": "http://127.0.0.1:11434",
+      "model": "llama3.2:latest"
     },
     "chat": {
-      "url": "Ollama location",
-      "model": "Chat model"
+      "url": "http://127.0.0.1:11434",
+      "model": "llama3.2:latest"
     },
     "tool": {
-      "url": "Ollama location",
-      "model": "Tool model"
+      "url": "http://127.0.0.1:11434",
+      "model": "llama3.2:latest"
     },
     "multimodal": {
-      "url": "Ollama location",
-      "model": "Multimodal model"
+      "url": "http://127.0.0.1:11434",
+      "model": "llama3.2-vision:latest"
     }
   },
+  "twitter_keys": {
+    "consumer_key": "",
+    "consumer_secret": "",
+    "access_token": "",
+    "access_token_secret": ""
+  },
   "api_keys": {
-    "brave_search": "Brave search for AI keys"
+    "brave_search": ""
   }
 }
