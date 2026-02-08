@@ -53,6 +53,9 @@ python3 scripts/setup_wizard.py --no-curses
 
 # non-interactive usage
 python3 scripts/setup_wizard.py --non-interactive --strict --ollama-host http://127.0.0.1:11434
+
+# telegram key ingress/rotation only (preserves inference/database settings)
+python3 scripts/setup_wizard.py --telegram-only
 ```
 
 Resume behavior:
@@ -139,6 +142,11 @@ python3 scripts/setup_wizard.py --non-interactive \
   --fallback-enabled --fallback-mode local --fallback-db-host 127.0.0.1 --fallback-db-port 5433
 ```
 
+To rotate Telegram credentials without changing `OLLAMA_HOST` or model routes:
+```bash
+python3 scripts/setup_wizard.py --telegram-only --write-env
+```
+
 ## Policies
 Agent policies and system prompts live in:
 - `policies/agent/*.json`
@@ -149,6 +157,13 @@ Current behavior:
 - Missing/invalid policy data degrades to safe defaults with warnings.
 - Missing/unreadable prompt files degrade to a fallback system prompt with warnings.
 - `policies/agent/tool_calling_policy.json` supports optional `tool_runtime` timeout/retry settings per tool.
+- Tool calls use a canonical registry and structured runtime envelope:
+  - `tool_name`
+  - `status` (`success` or `error`)
+  - `tool_results`
+  - `error` (when present)
+- Unknown tool names and malformed argument payloads degrade gracefully with structured errors.
+- Set `tool_runtime.reject_unknown_args=true` to strictly reject unknown argument keys.
 
 Policy walkthrough and validation:
 ```bash

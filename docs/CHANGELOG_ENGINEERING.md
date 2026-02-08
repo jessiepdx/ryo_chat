@@ -86,3 +86,34 @@ Implemented:
 6. Integrated runtime policy loading in `hypermindlabs/agents.py` through `PolicyManager`, including graceful defaults on invalid policy artifacts.
 7. Added tests in `tests/test_policy_manager.py`.
 8. Added operator-facing policy documentation in `docs/policy-guide.md` and updated README policy instructions.
+
+### WO-007: Tool-Calling Stack Review and Improvements
+Status: Implemented
+
+Implemented:
+1. Added canonical tool metadata/registration layer in `hypermindlabs/tool_registry.py`.
+2. Updated `ToolCallingAgent` in `hypermindlabs/agents.py` to use the canonical registry for both model tool schemas and runtime registration.
+3. Hardened tool-call parsing in `hypermindlabs/tool_runtime.py`:
+   - supports nested/malformed argument payloads and JSON-string arguments
+   - supports argument coercion hooks
+   - supports strict unknown-argument rejection
+4. Added structured parsing/execution path for raw model tool calls via `ToolRuntime.execute_tool_call(...)`.
+5. Added policy behavior flags in `policies/agent/tool_calling_policy.json` (`reject_unknown_args`, `unknown_tool_behavior`).
+6. Updated `policies/agent/system_prompt/tool_calling_sp.txt` to align prompt constraints with runtime schema rules.
+7. Added stack-level tests in `tests/test_tool_calling_agent.py` for malformed args, nested args, unknown tools, and strict argument rejection.
+8. Updated operator notes in `readme.md` and status snapshot in `docs/master-engineering.md`.
+
+### WO-008: Automatic Ingress of Telegram Bot Keys
+Status: Implemented
+
+Implemented:
+1. Added Telegram-only setup/rotation mode in `scripts/setup_wizard.py` (`--telegram-only`) for guided credential ingress without rewriting inference/database sections.
+2. Added Telegram-specific config validation (`validate_required_telegram_config`) and merge path (`apply_telegram_state`) to support safe key rotation.
+3. Updated env-write behavior so Telegram-only setup updates Telegram env keys while preserving existing `OLLAMA_HOST` and PostgreSQL env values.
+4. Added runtime Telegram config validation helpers in `hypermindlabs/utils.py` (`ConfigManager.getTelegramConfigIssues`).
+5. Hardened Telegram miniapp validation in `MemberManager.validateMiniappData` to gracefully handle missing payload fields and missing bot token.
+6. Added startup guardrails:
+   - `telegram_ui.py` now blocks startup with actionable error messaging when Telegram config is incomplete.
+   - `web_ui.py` now reports configuration errors for miniapp login with explicit 4xx/5xx responses instead of unsafe failures.
+7. Added tests in `tests/test_telegram_config_ingress.py` for Telegram ingress merge behavior and env preservation.
+8. Updated operator documentation in `readme.md` and status snapshot in `docs/master-engineering.md`.

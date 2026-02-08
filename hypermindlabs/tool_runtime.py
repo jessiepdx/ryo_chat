@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
+import json
 from typing import Any, Callable
 
 
@@ -18,6 +19,8 @@ class ToolDefinition:
     function: Callable[..., Any]
     required_args: tuple[str, ...] = ()
     optional_args: dict[str, Any] = field(default_factory=dict)
+    arg_coercers: dict[str, Callable[[Any], Any]] = field(default_factory=dict)
+    reject_unknown_args: bool = False
     required_api_key: str | None = None
     timeout_seconds: float = 8.0
     max_retries: int = 1
@@ -45,6 +48,7 @@ class ToolRuntime:
             "tool_name": tool_name,
             "status": "error",
             "tool_results": None,
+            "attempts": attempts,
             "error": {
                 "code": code,
                 "message": message,
@@ -64,25 +68,92 @@ class ToolRuntime:
         }
 
     @staticmethod
-    def _normalize_args(raw_args: Any) -> dict[str, Any]:
+    def _normalize_args(raw_args: Any) -> Any:
+        if isinstance(raw_args, str):
+            stripped = raw_args.strip()
+            if not stripped:
+                return {}
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                return {}
+            return ToolRuntime._normalize_args(parsed)
+
         if isinstance(raw_args, dict):
-            properties = raw_args.get("properties")
-            if isinstance(properties, dict):
-                return properties
             return raw_args
+
         return {}
+
+    @staticmethod
+    def _candidate_arg_maps(raw_args: Any) -> list[dict[str, Any]]:
+        normalized = ToolRuntime._normalize_args(raw_args)
+        if not isinstance(normalized, dict):
+            return []
+
+        candidates: list[dict[str, Any]] = [normalized]
+        properties = normalized.get("properties")
+        if isinstance(properties, dict):
+            candidates.append(properties)
+
+        nested_arguments = normalized.get("arguments")
+        if nested_arguments is not None:
+            nested = ToolRuntime._normalize_args(nested_arguments)
+            if isinstance(nested, dict):
+                candidates.append(nested)
+
+        unique: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        for candidate in candidates:
+            if id(candidate) not in seen_ids:
+                unique.append(candidate)
+                seen_ids.add(id(candidate))
+        return unique
 
     def _validate_and_prepare_args(
         self,
         tool: ToolDefinition,
         raw_args: Any,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        args = self._normalize_args(raw_args)
+        candidate_maps = self._candidate_arg_maps(raw_args)
+        args = {}
         accepted_keys = set(tool.required_args) | set(tool.optional_args.keys())
+        best_overlap = -1
+        for candidate in candidate_maps:
+            overlap = len([key for key in candidate.keys() if key in accepted_keys])
+            if overlap > best_overlap:
+                best_overlap = overlap
+                args = candidate
+
+        accepted_keys = set(tool.required_args) | set(tool.optional_args.keys())
+        unknown_args = [key for key in args.keys() if key not in accepted_keys]
+        if tool.reject_unknown_args and unknown_args:
+            return None, {
+                "code": "invalid_arguments",
+                "message": f"Unexpected arguments provided: {', '.join(unknown_args)}",
+                "details": {"unknown_args": unknown_args},
+            }
+
         prepared = {key: value for key, value in args.items() if key in accepted_keys}
+        coercion_errors: dict[str, str] = {}
+        for arg_name, coercer in tool.arg_coercers.items():
+            if arg_name in prepared and prepared[arg_name] is not None:
+                try:
+                    prepared[arg_name] = coercer(prepared[arg_name])
+                except Exception as error:  # noqa: BLE001
+                    coercion_errors[arg_name] = str(error)
+
+        if coercion_errors:
+            return None, {
+                "code": "invalid_arguments",
+                "message": "Argument coercion failed.",
+                "details": {"coercion_errors": coercion_errors},
+            }
 
         missing_required = [
-            arg_name for arg_name in tool.required_args if prepared.get(arg_name) is None
+            arg_name
+            for arg_name in tool.required_args
+            if prepared.get(arg_name) is None
+            or (isinstance(prepared.get(arg_name), str) and prepared.get(arg_name).strip() == "")
         ]
         if missing_required:
             return None, {
@@ -94,8 +165,68 @@ class ToolRuntime:
         for opt_key, default_value in tool.optional_args.items():
             if prepared.get(opt_key) is None:
                 prepared[opt_key] = default_value
+            if opt_key in tool.arg_coercers and prepared.get(opt_key) is not None:
+                try:
+                    prepared[opt_key] = tool.arg_coercers[opt_key](prepared[opt_key])
+                except Exception as error:  # noqa: BLE001
+                    return None, {
+                        "code": "invalid_arguments",
+                        "message": f"Invalid value for optional argument '{opt_key}'.",
+                        "details": {"coercion_errors": {opt_key: str(error)}},
+                    }
 
         return prepared, None
+
+    @staticmethod
+    def _extract_tool_invocation(tool_call: Any) -> tuple[str | None, Any, dict[str, Any] | None]:
+        if tool_call is None:
+            return None, {}, {
+                "code": "invalid_tool_call",
+                "message": "Tool call is empty.",
+                "details": {},
+            }
+
+        tool_name = None
+        tool_args: Any = {}
+
+        if hasattr(tool_call, "function"):
+            function_data = getattr(tool_call, "function")
+            tool_name = getattr(function_data, "name", None)
+            tool_args = getattr(function_data, "arguments", {})
+        elif isinstance(tool_call, dict):
+            function_data = tool_call.get("function")
+            if isinstance(function_data, dict):
+                tool_name = function_data.get("name")
+                tool_args = function_data.get("arguments", {})
+            else:
+                tool_name = tool_call.get("name")
+                tool_args = tool_call.get("arguments", {})
+        else:
+            return None, {}, {
+                "code": "invalid_tool_call",
+                "message": "Tool call format is unsupported.",
+                "details": {"received_type": type(tool_call).__name__},
+            }
+
+        if not isinstance(tool_name, str) or tool_name.strip() == "":
+            return None, tool_args, {
+                "code": "invalid_tool_call",
+                "message": "Tool call is missing a valid function name.",
+                "details": {},
+            }
+
+        return tool_name.strip(), tool_args, None
+
+    def execute_tool_call(self, tool_call: Any) -> dict[str, Any]:
+        tool_name, tool_args, parse_error = self._extract_tool_invocation(tool_call)
+        if parse_error:
+            return self._error_result(
+                tool_name=tool_name or "unknown",
+                code=parse_error["code"],
+                message=parse_error["message"],
+                details=parse_error["details"],
+            )
+        return self.execute(tool_name=tool_name, raw_args=tool_args)
 
     def execute(self, tool_name: str, raw_args: Any) -> dict[str, Any]:
         tool = self._registry.get(tool_name)

@@ -99,6 +99,15 @@ def is_valid_http_url(value: str | None) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
+def is_valid_numeric_id(value: str | int | None) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, int):
+        return value > 0
+    text = str(value).strip()
+    return text.isdigit() and int(text) > 0
+
+
 def infer_existing_host(config_data: dict) -> str | None:
     inference = config_data.get("inference")
     if not isinstance(inference, dict):
@@ -317,6 +326,35 @@ def validate_required_config(config_data: dict) -> list[str]:
             missing.append(f"inference.{key}.url")
         if section.get("model") in (None, ""):
             missing.append(f"inference.{key}.model")
+
+    return missing
+
+
+def validate_required_telegram_config(config_data: dict) -> list[str]:
+    missing: list[str] = []
+
+    if not str(config_data.get("bot_name", "")).strip():
+        missing.append("bot_name")
+    if not is_valid_numeric_id(config_data.get("bot_id")):
+        missing.append("bot_id")
+    if not str(config_data.get("bot_token", "")).strip():
+        missing.append("bot_token")
+
+    web_ui_url = config_data.get("web_ui_url")
+    if not is_valid_http_url(str(web_ui_url) if web_ui_url is not None else None):
+        missing.append("web_ui_url")
+
+    owner = config_data.get("owner_info")
+    if not isinstance(owner, dict):
+        owner = {}
+    if not str(owner.get("first_name", "")).strip():
+        missing.append("owner_info.first_name")
+    if not str(owner.get("last_name", "")).strip():
+        missing.append("owner_info.last_name")
+    if not is_valid_numeric_id(owner.get("user_id")):
+        missing.append("owner_info.user_id")
+    if not str(owner.get("username", "")).strip():
+        missing.append("owner_info.username")
 
     return missing
 
@@ -552,19 +590,14 @@ class CursesUI:
 
 
 def apply_setup_state(config_data: dict, state: dict) -> dict:
+    config_data = apply_telegram_state(config_data, state)
     config_data = ensure_defaults(config_data)
-    config_data["bot_name"] = state["bot_name"]
-    config_data["bot_id"] = int(state["bot_id"])
-    config_data["bot_token"] = state["bot_token"]
-    config_data["web_ui_url"] = state["web_ui_url"]
-
-    owner = config_data.setdefault("owner_info", {})
-    owner["first_name"] = state["owner_first_name"]
-    owner["last_name"] = state["owner_last_name"]
-    owner["user_id"] = int(state["owner_user_id"])
-    owner["username"] = state["owner_username"]
-
     database = config_data.setdefault("database", {})
+    fallback = config_data.get("database_fallback")
+    if not isinstance(fallback, dict):
+        fallback = {}
+        config_data["database_fallback"] = fallback
+
     database["db_name"] = state["db_name"]
     database["user"] = state["db_user"]
     database["password"] = state["db_password"]
@@ -572,9 +605,6 @@ def apply_setup_state(config_data: dict, state: dict) -> dict:
     database["port"] = state["db_port"]
 
     fallback_enabled = state["fallback_enabled"]
-    fallback = config_data.get("database_fallback")
-    if not isinstance(fallback, dict):
-        fallback = {}
     fallback["enabled"] = fallback_enabled
     if fallback_enabled:
         fallback["mode"] = state["fallback_mode"]
@@ -599,7 +629,34 @@ def apply_setup_state(config_data: dict, state: dict) -> dict:
     return config_data
 
 
-def state_to_env_updates(state: dict) -> dict[str, str]:
+def apply_telegram_state(config_data: dict, state: dict) -> dict:
+    config_data["bot_name"] = state["bot_name"]
+    config_data["bot_id"] = int(state["bot_id"])
+    config_data["bot_token"] = state["bot_token"]
+    config_data["web_ui_url"] = state["web_ui_url"]
+
+    owner = config_data.setdefault("owner_info", {})
+    owner["first_name"] = state["owner_first_name"]
+    owner["last_name"] = state["owner_last_name"]
+    owner["user_id"] = int(state["owner_user_id"])
+    owner["username"] = state["owner_username"]
+    return config_data
+
+
+def state_to_env_updates(state: dict, telegram_only: bool = False) -> dict[str, str]:
+    telegram_updates = {
+        "TELEGRAM_BOT_NAME": state["bot_name"],
+        "TELEGRAM_BOT_ID": str(state["bot_id"]),
+        "TELEGRAM_BOT_TOKEN": state["bot_token"],
+        "TELEGRAM_OWNER_FIRST_NAME": state["owner_first_name"],
+        "TELEGRAM_OWNER_LAST_NAME": state["owner_last_name"],
+        "TELEGRAM_OWNER_USER_ID": str(state["owner_user_id"]),
+        "TELEGRAM_OWNER_USERNAME": state["owner_username"],
+        "WEB_UI_URL": state["web_ui_url"],
+    }
+    if telegram_only:
+        return telegram_updates
+
     updates = {
         "OLLAMA_HOST": state["ollama_host"],
         "OLLAMA_EMBED_MODEL": state["model_map"]["embedding"],
@@ -619,20 +676,13 @@ def state_to_env_updates(state: dict) -> dict[str, str]:
         "POSTGRES_FALLBACK_PASSWORD": state["fallback_db_password"] if state["fallback_enabled"] else "",
         "POSTGRES_FALLBACK_HOST": state["fallback_db_host"] if state["fallback_enabled"] else "",
         "POSTGRES_FALLBACK_PORT": state["fallback_db_port"] if state["fallback_enabled"] else "",
-        "TELEGRAM_BOT_NAME": state["bot_name"],
-        "TELEGRAM_BOT_ID": str(state["bot_id"]),
-        "TELEGRAM_BOT_TOKEN": state["bot_token"],
-        "TELEGRAM_OWNER_FIRST_NAME": state["owner_first_name"],
-        "TELEGRAM_OWNER_LAST_NAME": state["owner_last_name"],
-        "TELEGRAM_OWNER_USER_ID": str(state["owner_user_id"]),
-        "TELEGRAM_OWNER_USERNAME": state["owner_username"],
-        "WEB_UI_URL": state["web_ui_url"],
         "BRAVE_SEARCH_API_KEY": state.get("brave_search_key", ""),
         "TWITTER_CONSUMER_KEY": state.get("twitter_consumer_key", ""),
         "TWITTER_CONSUMER_SECRET": state.get("twitter_consumer_secret", ""),
         "TWITTER_ACCESS_TOKEN": state.get("twitter_access_token", ""),
         "TWITTER_ACCESS_TOKEN_SECRET": state.get("twitter_access_token_secret", ""),
     }
+    updates.update(telegram_updates)
     return updates
 
 
@@ -687,6 +737,22 @@ def build_state_non_interactive(args: argparse.Namespace, config_data: dict) -> 
         "twitter_access_token_secret": args.twitter_access_token_secret if args.twitter_access_token_secret is not None else twitter.get("access_token_secret", ""),
     }
     return state
+
+
+def build_state_non_interactive_telegram(args: argparse.Namespace, config_data: dict) -> dict:
+    owner = config_data.get("owner_info")
+    if not isinstance(owner, dict):
+        owner = {}
+    return {
+        "bot_name": args.bot_name or config_data.get("bot_name", ""),
+        "bot_id": args.bot_id or config_data.get("bot_id", 0),
+        "bot_token": args.bot_token or config_data.get("bot_token", ""),
+        "web_ui_url": args.web_ui_url or config_data.get("web_ui_url", ""),
+        "owner_first_name": args.owner_first_name or owner.get("first_name", ""),
+        "owner_last_name": args.owner_last_name or owner.get("last_name", ""),
+        "owner_user_id": args.owner_user_id or owner.get("user_id", 0),
+        "owner_username": args.owner_username or owner.get("username", ""),
+    }
 
 
 def build_state_plain_interactive(
@@ -854,6 +920,73 @@ def build_state_plain_interactive(
             "Twitter access token secret (optional)",
             default=_seeded_str(seed_state, "twitter_access_token_secret", str(twitter.get("access_token_secret", ""))),
             required=False,
+        )
+    except KeyboardInterrupt as error:
+        if state_path is not None:
+            save_partial_state(state_path, state)
+        raise SetupCancelledError("Setup interrupted by user.") from error
+
+    return state
+
+
+def build_state_plain_interactive_telegram(
+    args: argparse.Namespace,
+    config_data: dict,
+    seed_state: dict[str, Any] | None = None,
+    state_path: Path | None = None,
+) -> dict:
+    owner = config_data.get("owner_info")
+    if not isinstance(owner, dict):
+        owner = {}
+    state: dict[str, Any] = dict(seed_state or {})
+
+    try:
+        state["bot_name"] = _prompt_plain(
+            "Bot name",
+            default=_seeded_str(seed_state, "bot_name", str(config_data.get("bot_name", ""))),
+            required=True,
+        )
+        state["bot_id"] = _prompt_plain(
+            "Bot ID",
+            default=_seeded_str(seed_state, "bot_id", str(config_data.get("bot_id", ""))),
+            required=True,
+            validator=lambda v: v.isdigit(),
+        )
+        state["bot_token"] = _prompt_plain(
+            "Bot token",
+            default=_seeded_str(seed_state, "bot_token", str(config_data.get("bot_token", ""))),
+            required=True,
+        )
+        state["web_ui_url"] = _prompt_plain(
+            "Web UI URL",
+            default=_seeded_str(seed_state, "web_ui_url", str(config_data.get("web_ui_url", ""))),
+            required=True,
+            validator=is_valid_http_url,
+        )
+        state["owner_first_name"] = _prompt_plain(
+            "Owner first name",
+            default=_seeded_str(seed_state, "owner_first_name", str(owner.get("first_name", ""))),
+            required=True,
+        )
+        state["owner_last_name"] = _prompt_plain(
+            "Owner last name",
+            default=_seeded_str(seed_state, "owner_last_name", str(owner.get("last_name", ""))),
+            required=True,
+        )
+        state["owner_user_id"] = _prompt_plain(
+            "Owner Telegram user ID",
+            default=_seeded_str(seed_state, "owner_user_id", str(owner.get("user_id", ""))),
+            required=True,
+            validator=lambda v: v.isdigit(),
+        )
+        state["owner_username"] = _prompt_plain(
+            "Owner Telegram username",
+            default=_seeded_str(seed_state, "owner_username", str(owner.get("username", ""))),
+            required=True,
+        )
+        state["write_env"] = _bool_prompt_plain(
+            "Write/update .env with Telegram values?",
+            default=_seeded_bool(seed_state, "write_env", args.write_env),
         )
     except KeyboardInterrupt as error:
         if state_path is not None:
@@ -1108,6 +1241,120 @@ def build_state_curses(
     return state
 
 
+def build_state_curses_telegram(
+    args: argparse.Namespace,
+    config_data: dict,
+    state_path: Path,
+    seed_state: dict[str, Any] | None = None,
+) -> dict:
+    if curses is None:
+        raise RuntimeError("python curses module is unavailable in this environment")
+
+    owner = config_data.get("owner_info")
+    if not isinstance(owner, dict):
+        owner = {}
+    state: dict[str, Any] = dict(seed_state or {})
+
+    def _runner(stdscr):
+        ui = CursesUI(stdscr)
+        if args.config and Path(args.config).exists():
+            proceed = ui.prompt_yes_no(
+                title="Existing config detected",
+                label=f"Update existing file '{args.config}'?",
+                default=True,
+            )
+            if not proceed:
+                raise SetupCancelledError("Setup cancelled by user.")
+
+        ui.message(
+            "Telegram-only setup",
+            "This mode updates Telegram credentials/owner fields only and preserves model/database settings.",
+        )
+
+        state["bot_name"] = ui.prompt_text(
+            "Telegram bot",
+            "Bot name:",
+            default=_seeded_str(seed_state, "bot_name", str(config_data.get("bot_name", ""))),
+            required=True,
+        )
+        state["bot_id"] = ui.prompt_text(
+            "Telegram bot",
+            "Bot ID:",
+            default=_seeded_str(seed_state, "bot_id", str(config_data.get("bot_id", ""))),
+            required=True,
+            validator=lambda v: v.isdigit(),
+        )
+        state["bot_token"] = ui.prompt_text(
+            "Telegram bot",
+            "Bot token:",
+            default=_seeded_str(seed_state, "bot_token", str(config_data.get("bot_token", ""))),
+            required=True,
+        )
+        state["web_ui_url"] = ui.prompt_text(
+            "Web UI",
+            "Web UI URL:",
+            default=_seeded_str(seed_state, "web_ui_url", str(config_data.get("web_ui_url", ""))),
+            required=True,
+            validator=is_valid_http_url,
+        )
+
+        state["owner_first_name"] = ui.prompt_text(
+            "Owner info",
+            "Owner first name:",
+            default=_seeded_str(seed_state, "owner_first_name", str(owner.get("first_name", ""))),
+            required=True,
+        )
+        state["owner_last_name"] = ui.prompt_text(
+            "Owner info",
+            "Owner last name:",
+            default=_seeded_str(seed_state, "owner_last_name", str(owner.get("last_name", ""))),
+            required=True,
+        )
+        state["owner_user_id"] = ui.prompt_text(
+            "Owner info",
+            "Owner Telegram user ID:",
+            default=_seeded_str(seed_state, "owner_user_id", str(owner.get("user_id", ""))),
+            required=True,
+            validator=lambda v: v.isdigit(),
+        )
+        state["owner_username"] = ui.prompt_text(
+            "Owner info",
+            "Owner username:",
+            default=_seeded_str(seed_state, "owner_username", str(owner.get("username", ""))),
+            required=True,
+        )
+
+        state["write_env"] = ui.prompt_yes_no(
+            "Environment file",
+            "Write/update .env with Telegram values?",
+            default=_seeded_bool(seed_state, "write_env", args.write_env),
+        )
+
+        summary = (
+            f"Bot: {state['bot_name']}\n"
+            f"Bot ID: {state['bot_id']}\n"
+            f"Web UI URL: {state['web_ui_url']}\n"
+            "Save Telegram-only changes to config file?"
+        )
+        confirmed = ui.prompt_yes_no("Confirm", summary, default=True)
+        if not confirmed:
+            raise SetupCancelledError("Setup cancelled by user.")
+
+    try:
+        curses.wrapper(_runner)
+    except SetupCancelledError:
+        save_partial_state(state_path, state)
+        raise
+    except KeyboardInterrupt as error:
+        save_partial_state(state_path, state)
+        raise SetupCancelledError("Setup interrupted by user.") from error
+    except Exception:
+        save_partial_state(state_path, state)
+        raise
+
+    return state
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RYO setup wizard for endpoint, model, and key ingress configuration.")
     parser.add_argument("--config", default="config.json", help="Path to runtime config file.")
@@ -1116,6 +1363,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-path", default=".env", help="Path to .env file to update when writing env values.")
     parser.add_argument("--env-template", default=".env.example", help="Template used when creating .env.")
     parser.add_argument("--write-env", action="store_true", help="Write/update .env with wizard values.")
+    parser.add_argument(
+        "--telegram-only",
+        action="store_true",
+        help="Update Telegram credentials/owner fields only. Preserves inference/model/database sections.",
+    )
 
     parser.add_argument("--ollama-host", default=None, help="Explicit Ollama endpoint URL.")
     parser.add_argument("--default-host", default=DEFAULT_OLLAMA_HOST, help=f"Default local endpoint (default: {DEFAULT_OLLAMA_HOST}).")
@@ -1194,17 +1446,28 @@ def main() -> int:
             print(f"Loaded partial setup state from: {state_path}")
 
     if args.non_interactive:
-        state = build_state_non_interactive(args, config_data)
+        if args.telegram_only:
+            state = build_state_non_interactive_telegram(args, config_data)
+        else:
+            state = build_state_non_interactive(args, config_data)
     else:
         use_curses = (not args.no_curses) and sys.stdin.isatty() and sys.stdout.isatty()
         if use_curses:
             try:
-                state = build_state_curses(
-                    args,
-                    config_data,
-                    state_path=state_path,
-                    seed_state=seed_state,
-                )
+                if args.telegram_only:
+                    state = build_state_curses_telegram(
+                        args,
+                        config_data,
+                        state_path=state_path,
+                        seed_state=seed_state,
+                    )
+                else:
+                    state = build_state_curses(
+                        args,
+                        config_data,
+                        state_path=state_path,
+                        seed_state=seed_state,
+                    )
             except SetupCancelledError as error:
                 print(f"{error} Partial state saved to: {state_path}")
                 return 1
@@ -1212,29 +1475,49 @@ def main() -> int:
                 print(f"Curses wizard unavailable ({error}). Falling back to plain prompts.")
                 seed_state = load_partial_state(state_path)
                 try:
+                    if args.telegram_only:
+                        state = build_state_plain_interactive_telegram(
+                            args,
+                            config_data,
+                            seed_state=seed_state,
+                            state_path=state_path,
+                        )
+                    else:
+                        state = build_state_plain_interactive(
+                            args,
+                            config_data,
+                            seed_state=seed_state,
+                            state_path=state_path,
+                        )
+                except SetupCancelledError as inner_error:
+                    print(f"{inner_error} Partial state saved to: {state_path}")
+                    return 1
+        else:
+            try:
+                if args.telegram_only:
+                    state = build_state_plain_interactive_telegram(
+                        args,
+                        config_data,
+                        seed_state=seed_state,
+                        state_path=state_path,
+                    )
+                else:
                     state = build_state_plain_interactive(
                         args,
                         config_data,
                         seed_state=seed_state,
                         state_path=state_path,
                     )
-                except SetupCancelledError as inner_error:
-                    print(f"{inner_error} Partial state saved to: {state_path}")
-                    return 1
-        else:
-            try:
-                state = build_state_plain_interactive(
-                    args,
-                    config_data,
-                    seed_state=seed_state,
-                    state_path=state_path,
-                )
             except SetupCancelledError as error:
                 print(f"{error} Partial state saved to: {state_path}")
                 return 1
 
-    merged = apply_setup_state(config_data, state)
-    missing = validate_required_config(merged)
+    if args.telegram_only:
+        merged = apply_telegram_state(config_data, state)
+        missing = validate_required_telegram_config(merged)
+    else:
+        merged = apply_setup_state(config_data, state)
+        missing = validate_required_config(merged)
     strict_mode = args.strict or not args.non_interactive
     if strict_mode and missing:
         raise ValueError(f"Missing required config values after setup: {', '.join(missing)}")
@@ -1244,7 +1527,7 @@ def main() -> int:
 
     should_write_env = args.write_env or bool(state.get("write_env", False))
     if should_write_env:
-        updates = state_to_env_updates(state)
+        updates = state_to_env_updates(state, telegram_only=args.telegram_only)
         write_env_with_updates(env_path, env_template, updates)
         print(f"Wrote env values: {env_path}")
 
@@ -1252,8 +1535,12 @@ def main() -> int:
         print(f"Backed up existing config to: {backup}")
     clear_partial_state(state_path)
     print(f"Wrote config: {config_path}")
-    print("Setup precedence (host): explicit custom -> existing config -> default local")
-    print(f"Ollama endpoint in use: {state['ollama_host']}")
+    if args.telegram_only:
+        print("Setup mode: telegram-only")
+        print("Updated Telegram credentials/owner info; preserved inference and database settings.")
+    else:
+        print("Setup precedence (host): explicit custom -> existing config -> default local")
+        print(f"Ollama endpoint in use: {state['ollama_host']}")
     print("Startup hints:")
     print("  python3 telegram_ui.py")
     print("  python3 web_ui.py")

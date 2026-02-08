@@ -4,6 +4,8 @@
     "tool_runtime": {
         "default_timeout_seconds": 8,
         "default_max_retries": 1,
+        "reject_unknown_args": false,
+        "unknown_tool_behavior": "structured_error",
         "tools": {
             "braveSearch": {
                 "required_api_key": "brave_search",

@@ -2701,6 +2701,15 @@ async def errorHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def main() -> None:
     logger.info("RYO - begin telegram ui application.")
+    telegramConfigIssues = config.getTelegramConfigIssues()
+    if telegramConfigIssues:
+        logger.error(
+            "Telegram startup blocked: missing/invalid config values: %s",
+            ", ".join(telegramConfigIssues),
+        )
+        logger.error("Run setup wizard to fix Telegram config: python3 scripts/setup_wizard.py --telegram-only")
+        return
+
     # Run the bot
     # Create the Application and pass it your bot's token.
     # .get_updates_write_timeout(100)

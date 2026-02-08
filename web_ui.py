@@ -84,6 +84,12 @@ config = ConfigManager()
 members = MemberManager()
 
 logger.info(f"Database route status: {config.databaseRoute}")
+miniappConfigIssues = config.getTelegramConfigIssues(require_owner=False, require_web_ui_url=False)
+if miniappConfigIssues:
+    logger.warning(
+        "Telegram miniapp login is not fully configured. Missing/invalid values: %s",
+        ", ".join(miniappConfigIssues),
+    )
 
 availableMenu = [
     {
@@ -360,11 +366,27 @@ def login():
 @app.post("/miniapp-login")
 def miniappLogin():
     logger.info(f"{ConsoleColors['yellow']}Validate and login Telegram miniapp user.{ConsoleColors['default']}")
+    miniappConfigIssues = config.getTelegramConfigIssues(require_owner=False, require_web_ui_url=False)
+    if miniappConfigIssues:
+        logger.error(
+            "Miniapp login unavailable: missing/invalid Telegram config values: %s",
+            ", ".join(miniappConfigIssues),
+        )
+        return jsonify(
+            {
+                "status": "error",
+                "message": "Telegram miniapp login is not configured on this host.",
+                "missing": miniappConfigIssues,
+            }
+        ), 503
+
     queryString = request.form.get("query-string")
+    if not queryString:
+        logger.warning("Miniapp login rejected: missing query-string payload.")
+        return jsonify({"status": "error", "message": "Missing miniapp query-string payload."}), 400
 
     # Generate a hash with the data check string and secret key (from utils)
     memberID = members.validateMiniappData(queryString)
-    print(memberID)
 
     if memberID is not None:
         session["member_id"] = memberID

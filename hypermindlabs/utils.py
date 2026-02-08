@@ -34,7 +34,7 @@ from hypermindlabs.database_router import DatabaseRouter
 from math import ceil
 from ollama import Client
 from psycopg.rows import dict_row
-from urllib.parse import parse_qs, unquote
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 
@@ -545,26 +545,54 @@ class MemberManager:
 
     def validateMiniappData(self, telegramInitData: str):
         logger.info(f"Validating the data sent via telegram miniapp.")
+        if not telegramInitData:
+            logger.warning("Miniapp validation failed: missing init data payload.")
+            return None
+
         # Parse the telegram initData query string
         queryDict = parse_qs(telegramInitData)
-        knownHash = queryDict["hash"][0]
+        knownHashValues = queryDict.get("hash")
+        userValues = queryDict.get("user")
+        if not knownHashValues or not userValues:
+            logger.warning("Miniapp validation failed: required payload fields are missing.")
+            return None
 
-        telegramUserData = json.loads(queryDict["user"][0])
-        memberTelegramID = telegramUserData["id"]
+        knownHash = knownHashValues[0]
+
+        try:
+            telegramUserData = json.loads(userValues[0])
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Miniapp validation failed: malformed user payload.")
+            return None
+
+        memberTelegramID = telegramUserData.get("id")
+        if memberTelegramID is None:
+            logger.warning("Miniapp validation failed: user id not found in payload.")
+            return None
 
         # Create a data check string from the query string
         # Data Check String must have the hash propoerty removed
-        initData = sorted([chunk.split("=") for chunk in unquote(telegramInitData).split("&") if chunk[:len("hash=")] != "hash="], key=lambda x: x[0])
-        initData = "\n".join([f"{rec[0]}={rec[1]}" for rec in initData])
+        initDataChunks = []
+        for chunk in unquote(telegramInitData).split("&"):
+            if chunk[:len("hash=")] == "hash=" or "=" not in chunk:
+                continue
+            key, value = chunk.split("=", 1)
+            initDataChunks.append((key, value))
+        initDataChunks = sorted(initDataChunks, key=lambda x: x[0])
+        initData = "\n".join([f"{rec[0]}={rec[1]}" for rec in initDataChunks])
 
         # Create the Secret Key
         key = "WebAppData".encode()
-        token = ConfigManager().bot_token.encode()
-        secretKey = hmac.new(key, token, hashlib.sha256)
+        token = ConfigManager().bot_token
+        if token is None or str(token).strip() == "":
+            logger.warning("Miniapp validation unavailable: bot_token is missing from config.")
+            return None
+
+        secretKey = hmac.new(key, str(token).encode(), hashlib.sha256)
         digest = hmac.new(secretKey.digest(), initData.encode(), hashlib.sha256)
 
         if hmac.compare_digest(knownHash, digest.hexdigest()):
-            print("data validated!")
+            logger.info("Miniapp payload hash validated.")
             member = MemberManager().getMemberByTelegramID(memberTelegramID)
             if member is not None:
                 return member["member_id"]
@@ -1459,6 +1487,49 @@ class ConfigManager:
                 )
         
         return cls._instance
+
+    @staticmethod
+    def _is_valid_http_url(value: str | None) -> bool:
+        if value is None:
+            return False
+        parsed = urlparse(str(value).strip())
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    @staticmethod
+    def _is_numeric_id(value) -> bool:
+        if isinstance(value, int):
+            return value > 0
+        if value is None:
+            return False
+        text = str(value).strip()
+        return text.isdigit() and int(text) > 0
+
+    def getTelegramConfigIssues(self, require_owner: bool = True, require_web_ui_url: bool = True) -> list[str]:
+        issues: list[str] = []
+        if not str(self._instance.bot_name or "").strip():
+            issues.append("bot_name")
+        if not self._is_numeric_id(self._instance.bot_id):
+            issues.append("bot_id")
+        if not str(self._instance.bot_token or "").strip():
+            issues.append("bot_token")
+        if require_web_ui_url and not self._is_valid_http_url(self._instance.web_ui_url):
+            issues.append("web_ui_url")
+
+        if require_owner:
+            owner = self._instance.owner_info if isinstance(self._instance.owner_info, dict) else {}
+            if not str(owner.get("first_name", "")).strip():
+                issues.append("owner_info.first_name")
+            if not str(owner.get("last_name", "")).strip():
+                issues.append("owner_info.last_name")
+            if not self._is_numeric_id(owner.get("user_id")):
+                issues.append("owner_info.user_id")
+            if not str(owner.get("username", "")).strip():
+                issues.append("owner_info.username")
+
+        return issues
+
+    def isTelegramConfigValid(self, require_owner: bool = True, require_web_ui_url: bool = True) -> bool:
+        return len(self.getTelegramConfigIssues(require_owner=require_owner, require_web_ui_url=require_web_ui_url)) == 0
 
     def updateConfig(self, key, value):
         self.config[key] = value
