@@ -2384,24 +2384,43 @@ class UsageManager:
 
 def getEmbeddings(text: str) -> list:
     logger.info("Getting embeddings.")
-    try:
-        configManager = ConfigManager()
-        embeddingConfig = configManager.inference.get("embedding", {})
-        host = embeddingConfig.get("url") if embeddingConfig.get("url") else configManager.runtimeValue(
-            "inference.default_ollama_host", "http://127.0.0.1:11434"
-        )
-        model = embeddingConfig.get("model") or configManager.runtimeValue(
-            "inference.default_embedding_model", "nomic-embed-text:latest"
-        )
-        if not model:
-            logger.error("Embedding model is missing from config inference settings.")
-            return None
+    configManager = ConfigManager()
+    embeddingConfig = configManager.inference.get("embedding", {})
+    host = embeddingConfig.get("url") if embeddingConfig.get("url") else configManager.runtimeValue(
+        "inference.default_ollama_host", "http://127.0.0.1:11434"
+    )
+    host = host or "http://127.0.0.1:11434"
+    configuredModel = embeddingConfig.get("model")
+    fallbackModel = configManager.runtimeValue("inference.default_embedding_model", "nomic-embed-text:latest")
+    fallbackModel = fallbackModel or "nomic-embed-text:latest"
+    candidateModels = list()
+    for modelName in (configuredModel, fallbackModel, "nomic-embed-text:latest"):
+        if isinstance(modelName, str):
+            cleaned = modelName.strip()
+            if cleaned and cleaned not in candidateModels:
+                candidateModels.append(cleaned)
 
-        results = Client(host=host).embeddings(
-            model=model,
-            prompt=text
-        )
-        return results.embedding
-    except Exception as error:
-        logger.error(f"Exception while getting embeddings from Ollama:\n{error}")
+    if not candidateModels:
+        logger.error("Embedding model is missing from config inference settings.")
         return None
+
+    lastError = None
+    for index, model in enumerate(candidateModels):
+        try:
+            results = Client(host=host).embeddings(
+                model=model,
+                prompt=text
+            )
+            if index > 0:
+                logger.warning(f"Embedding model fallback succeeded with: {model}")
+            return results.embedding
+        except Exception as error:  # noqa: BLE001
+            lastError = error
+            if index < (len(candidateModels) - 1):
+                logger.warning(f"Embedding model '{model}' failed; trying fallback model.")
+                continue
+            logger.error(f"Exception while getting embeddings from Ollama:\n{error}")
+
+    if lastError is not None:
+        logger.debug(f"Last embedding model error: {lastError}")
+    return None

@@ -130,6 +130,10 @@ def _runtime_float(path: str, default: float) -> float:
     return config.runtimeFloat(path, default)
 
 
+def _runtime_bool(path: str, default: bool) -> bool:
+    return config.runtimeBool(path, default)
+
+
 def _message_word_threshold() -> int:
     return _runtime_int("conversation.community_score_message_word_threshold", 20)
 
@@ -153,6 +157,127 @@ def _database_unavailable_message() -> str:
         "connection/authentication failed. Run setup to fix PostgreSQL "
         "credentials, then send /start again."
     )
+
+
+_ORCHESTRATION_STAGE_LABELS = {
+    "orchestrator.start": "Accepted request",
+    "analysis.start": "Analyzing message",
+    "analysis.complete": "Analysis complete",
+    "tools.start": "Evaluating tools",
+    "tools.complete": "Tools complete",
+    "response.start": "Generating response",
+    "response.complete": "Response generated",
+    "orchestrator.complete": "Wrapping up",
+}
+
+
+class TelegramStageStatus:
+    def __init__(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        chat_id: int,
+        thread_id: int | None = None,
+        reply_message=None,
+        enabled: bool = True,
+        history_limit: int = 8,
+    ):
+        self._context = context
+        self._chat_id = chat_id
+        self._thread_id = thread_id
+        self._reply_message = reply_message
+        self._enabled = bool(enabled)
+        self._history_limit = max(3, int(history_limit))
+        self._message = None
+        self._lines: list[str] = []
+        self._last_text: str = ""
+
+    def _render(self) -> str:
+        if not self._lines:
+            return "Processing your request..."
+        visible = self._lines[-self._history_limit:]
+        return "Processing your request...\n\n" + "\n".join(visible)
+
+    async def _safe_edit(self, text: str) -> None:
+        if self._message is None:
+            return
+        if text == self._last_text:
+            return
+        try:
+            await self._message.edit_text(text=text)
+            self._last_text = text
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Failed to update stage status message: {error}")
+
+    async def start(self) -> None:
+        if not self._enabled:
+            return
+        initial_line = "• Accepted request"
+        self._lines = [initial_line]
+        text = self._render()
+        try:
+            if self._reply_message is not None:
+                self._message = await self._reply_message.reply_text(text=text)
+            else:
+                self._message = await self._context.bot.send_message(
+                    chat_id=self._chat_id,
+                    message_thread_id=self._thread_id,
+                    text=text,
+                )
+            self._last_text = text
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Unable to send stage status message: {error}")
+            self._message = None
+
+    async def emit(self, event: dict | None = None) -> None:
+        if not self._enabled or self._message is None:
+            return
+        payload = event if isinstance(event, dict) else {}
+        stage = str(payload.get("stage") or "").strip()
+        detail = str(payload.get("detail") or "").strip()
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+
+        label = _ORCHESTRATION_STAGE_LABELS.get(stage, stage if stage else "Processing")
+        line = f"• {label}"
+        if detail:
+            line = f"{line} — {detail}"
+        tool_calls = meta.get("tool_calls")
+        if isinstance(tool_calls, int):
+            line = f"{line} (tool calls: {tool_calls})"
+
+        if self._lines and self._lines[-1] == line:
+            return
+        self._lines.append(line)
+        await self._safe_edit(self._render())
+
+    async def finalize(self, final_text: str):
+        if self._message is not None:
+            await self._safe_edit(final_text)
+            return self._message
+
+        if self._reply_message is not None:
+            return await self._reply_message.reply_text(text=final_text)
+        return await self._context.bot.send_message(
+            chat_id=self._chat_id,
+            message_thread_id=self._thread_id,
+            text=final_text,
+        )
+
+    async def fail(self, error_text: str) -> None:
+        if self._message is not None:
+            await self._safe_edit(error_text)
+            return
+        try:
+            if self._reply_message is not None:
+                await self._reply_message.reply_text(text=error_text)
+            else:
+                await self._context.bot.send_message(
+                    chat_id=self._chat_id,
+                    message_thread_id=self._thread_id,
+                    text=error_text,
+                )
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Unable to send failure status message: {error}")
 
 
 
@@ -1950,8 +2075,23 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "message_timestamp": datetime.now()
     }
     
+    stageStatus = TelegramStageStatus(
+        context,
+        chat_id=chat.id,
+        thread_id=topicID,
+        reply_message=None,
+        enabled=_runtime_bool("telegram.show_stage_progress", True),
+    )
+    await stageStatus.start()
+
     # Create the conversational agent instance
-    conversation = ConversationOrchestrator(message.text, memberID, messageContext, message.message_id)
+    conversation = ConversationOrchestrator(
+        message.text,
+        memberID,
+        messageContext,
+        message.message_id,
+        options={"stage_callback": stageStatus.emit},
+    )
 
     try:
         # Shows the bot as "typing"
@@ -1964,14 +2104,17 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Exception while sending a chat action for typing:\n{err}")
         # Non critical to the overall function, continue
 
-    response = await conversation.runAgents()
+    try:
+        response = await conversation.runAgents()
+    except Exception as err:  # noqa: BLE001
+        logger.error(f"Conversation orchestration failed in group chat:\n{err}")
+        await stageStatus.fail("I hit an internal error while processing that request.")
+        return
     
     try:
         # Send the conversational agent response
-        responseMessage = await context.bot.send_message(
-            chat_id=chat.id,
-            message_thread_id=topicID,
-            text=f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
+        responseMessage = await stageStatus.finalize(
+            f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
         )
     except Exception as err:
         logger.error(f"Exception while sending a telegram message:\n{err}")
@@ -2074,7 +2217,22 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "message_timestamp": datetime.now()
     }
 
-    conversation = ConversationOrchestrator(message.text, memberID, messageData, message.message_id)
+    stageStatus = TelegramStageStatus(
+        context,
+        chat_id=chat.id,
+        thread_id=None,
+        reply_message=message,
+        enabled=_runtime_bool("telegram.show_stage_progress", True),
+    )
+    await stageStatus.start()
+
+    conversation = ConversationOrchestrator(
+        message.text,
+        memberID,
+        messageData,
+        message.message_id,
+        options={"stage_callback": stageStatus.emit},
+    )
 
     try:
         # Shows the bot as "typing"
@@ -2086,14 +2244,17 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Exception while sending a chat action for typing:\n{err}")
         # Non critical to the remaining functionality, continue
     
-    response = await conversation.runAgents()
+    try:
+        response = await conversation.runAgents()
+    except Exception as err:  # noqa: BLE001
+        logger.error(f"Conversation orchestration failed in private chat:\n{err}")
+        await stageStatus.fail("I hit an internal error while processing that request.")
+        return
     
     try:
-        responseMessage = await message.reply_text(
-            text=response
-        )
+        responseMessage = await stageStatus.finalize(response)
     except Exception as err:
-        logger.error("Exception while replying to a telegram message:\n{err}")
+        logger.error(f"Exception while replying to a telegram message:\n{err}")
         # Error is critical to the remaining functionality, exit
         return
     
@@ -2410,8 +2571,23 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "message_timestamp": datetime.now()
     }
     
+    stageStatus = TelegramStageStatus(
+        context,
+        chat_id=chat.id,
+        thread_id=topicID,
+        reply_message=None,
+        enabled=_runtime_bool("telegram.show_stage_progress", True),
+    )
+    await stageStatus.start()
+
     # Create the conversational agent instance
-    conversation = ConversationOrchestrator(message.text, memberID, messageData, message.message_id)
+    conversation = ConversationOrchestrator(
+        message.text,
+        memberID,
+        messageData,
+        message.message_id,
+        options={"stage_callback": stageStatus.emit},
+    )
     # Shows the bot as "typing"
     try:
         await context.bot.send_chat_action(
@@ -2423,14 +2599,17 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Exception while sending a chat action for typing:\n{err}")
         # Non critical to the remaining functionality, continue
 
-    response = await conversation.runAgents()
+    try:
+        response = await conversation.runAgents()
+    except Exception as err:  # noqa: BLE001
+        logger.error(f"Conversation orchestration failed while replying in group chat:\n{err}")
+        await stageStatus.fail("I hit an internal error while processing that request.")
+        return
 
     # Send the conversational agent response
     try:
-        responseMessage = await context.bot.send_message(
-            chat_id=chat.id,
-            message_thread_id=topicID,
-            text=f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
+        responseMessage = await stageStatus.finalize(
+            f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
         )
     except Exception as err:
         logger.error(f"Exception while sending a telegram message:\n{err}")

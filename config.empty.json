@@ -102,7 +102,8 @@
       "minimum_community_score_other_group": 20,
       "minimum_community_score_link": 20,
       "minimum_community_score_forward": 20,
-      "get_updates_write_timeout": 500
+      "get_updates_write_timeout": 500,
+      "show_stage_progress": true
     },
     "security": {
       "password_min_length": 12

@@ -51,6 +51,7 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "minimum_community_score_link": 20,
         "minimum_community_score_forward": 20,
         "get_updates_write_timeout": 500,
+        "show_stage_progress": True,
     },
     "security": {
         "password_min_length": 12,
@@ -166,6 +167,7 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "telegram.minimum_community_score_link": (("RYO_TELEGRAM_MIN_SCORE_LINK",), "int"),
     "telegram.minimum_community_score_forward": (("RYO_TELEGRAM_MIN_SCORE_FORWARD",), "int"),
     "telegram.get_updates_write_timeout": (("RYO_TELEGRAM_GET_UPDATES_WRITE_TIMEOUT",), "int"),
+    "telegram.show_stage_progress": (("RYO_TELEGRAM_SHOW_STAGE_PROGRESS",), "bool"),
     "security.password_min_length": (("RYO_PASSWORD_MIN_LENGTH",), "int"),
     "vectors.embedding_dimensions": (("RYO_VECTOR_DIMENSIONS",), "int"),
     "retrieval.conversation_short_history_limit": (("RYO_RETRIEVAL_SHORT_HISTORY_LIMIT",), "int"),

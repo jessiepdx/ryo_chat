@@ -17,6 +17,7 @@
 ###########
 
 from datetime import datetime, timedelta, timezone
+import inspect
 import json
 import logging
 import requests
@@ -121,7 +122,9 @@ class ConversationOrchestrator:
         self._message = message
         self._messageID = messageID
         #self._context = context
-        self._options = options
+        self._options = options if isinstance(options, dict) else {}
+        stageCallback = self._options.get("stage_callback")
+        self._stage_callback = stageCallback if callable(stageCallback) else None
 
         # Check the context and get a short collection of recent chat history into the orchestrator's messages list
         self._chatHostID = None if context is None else context.get("chat_host_id")
@@ -177,7 +180,25 @@ class ConversationOrchestrator:
         # TODO Check options and pass to agents if necessary
         
     
+    async def _emit_stage(self, stage: str, detail: str = "", **meta: Any) -> None:
+        if not callable(self._stage_callback):
+            return
+        event = {
+            "stage": str(stage),
+            "detail": str(detail or ""),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "meta": meta if isinstance(meta, dict) else {},
+        }
+        try:
+            maybeAwaitable = self._stage_callback(event)
+            if inspect.isawaitable(maybeAwaitable):
+                await maybeAwaitable
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Stage callback failed [{stage}]: {error}")
+
+
     async def runAgents(self):
+        await self._emit_stage("orchestrator.start", "Accepted request and preparing context.")
         # Create all the agent calls in the flow as methods to call, each handles the messages passed to the actual agent
         # Make a copy of the local messages list and add the known context data. 
         # "Known Context is only in the message history for the analysis agent"
@@ -195,6 +216,7 @@ class ConversationOrchestrator:
         }
         
         analysisMessages.append(Message(role="tool", content=json.dumps(knownContext)))
+        await self._emit_stage("analysis.start", "Running message analysis policy and model selection.")
         self._analysisAgent = MessageAnalysisAgent(analysisMessages, options=self._options)
         self._analysisResponse = await self._analysisAgent.generateResponse()
 
@@ -215,12 +237,23 @@ class ConversationOrchestrator:
                     "eval_count": chunk.eval_count,
                     "eval_duration": chunk.eval_duration,
                 }
+        await self._emit_stage(
+            "analysis.complete",
+            "Analysis stage complete.",
+            model=getattr(self._analysisAgent, "_model", None),
+        )
 
         #print(ConsoleColors["default"])
         
         # TODO Just send the last USER message to the tools followed by the thoughts from analysis agent
+        await self._emit_stage("tools.start", "Evaluating tool calls.")
         self._toolsAgent = ToolCallingAgent(self._messages, options=self._options)
         toolResponses = await self._toolsAgent.generateResponse()
+        await self._emit_stage(
+            "tools.complete",
+            "Tool execution stage complete.",
+            tool_calls=len(toolResponses),
+        )
         # Non Streaming results
         # Waited to add the analysis agents response to chat history because it throws off the tool calling agent
         analysisMessage = Message(role="tool",content=analysisResponseMessage)
@@ -235,6 +268,11 @@ class ConversationOrchestrator:
         # Pass options=options to override the langauge model
 
         self._chatConversationAgent = ChatConversationAgent(messages=self._messages, options=self._options)
+        await self._emit_stage(
+            "response.start",
+            "Generating final response.",
+            model=getattr(self._chatConversationAgent, "_model", None),
+        )
         response = await self._chatConversationAgent.generateResponse()
 
         responseMessage = ""
@@ -253,6 +291,7 @@ class ConversationOrchestrator:
                     "eval_count": chunk.eval_count,
                     "eval_duration": chunk.eval_duration,
                 }
+        await self._emit_stage("response.complete", "Final response generated.")
 
         self._chatResponseMessage = responseMessage
         #print(ConsoleColors["default"])
@@ -264,6 +303,7 @@ class ConversationOrchestrator:
         assistantMessage = Message(role="assistant", content=responseMessage)
         # Add the final response to the overall chat history (role ASSISTANT)
         self._messages.append(assistantMessage)
+        await self._emit_stage("orchestrator.complete", "Completed end-to-end orchestration.")
 
         return responseMessage
 
@@ -1190,7 +1230,7 @@ def resolveAllowedModels(policyName: str, policy: dict) -> list[str]:
 def loadAgentPolicy(policyName: str, endpointOverride: str | None = None) -> dict:
     logger.info(f"Loading agent policy for: {policyName}")
     manager = _policyManager(endpointOverride=endpointOverride)
-    report = manager.validate_policy(policyName=policyName, strict_model_check=False)
+    report = manager.validate_policy(policy_name=policyName, strict_model_check=False)
 
     for warning in report.warnings:
         logger.warning(f"Policy validation warning [{policyName}]: {warning}")
