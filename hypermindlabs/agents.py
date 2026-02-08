@@ -26,6 +26,11 @@ from types import SimpleNamespace
 from typing import Any, AsyncIterator
 from hypermindlabs.model_router import ModelExecutionError, ModelRouter
 from hypermindlabs.policy_manager import PolicyManager, PolicyValidationError
+from hypermindlabs.temporal_context import (
+    build_temporal_context,
+    coerce_datetime_utc,
+    utc_now_iso,
+)
 from hypermindlabs.tool_registry import (
     build_tool_specs,
     model_tool_definitions,
@@ -80,6 +85,10 @@ def _runtime_float(path: str, default: float) -> float:
 
 def _runtime_value(path: str, default: Any = None) -> Any:
     return config.runtimeValue(path, default)
+
+
+def _runtime_bool(path: str, default: bool) -> bool:
+    return config.runtimeBool(path, default)
 
 
 def _fallback_stream(message_text: str) -> AsyncIterator[Any]:
@@ -290,11 +299,25 @@ class ConversationOrchestrator:
         self._stage_callback = stageCallback if callable(stageCallback) else None
 
         # Check the context and get a short collection of recent chat history into the orchestrator's messages list
-        self._chatHostID = None if context is None else context.get("chat_host_id")
-        self._chatType = None if context is None else context.get("chat_type")
-        self._communityID = None if context is None else context.get("community_id")
-        self._platform = None if context is None else context.get("platform")
-        self._topicID = None if context is None else context.get("topic_id")
+        self._context = context if isinstance(context, dict) else {}
+        self._chatHostID = self._context.get("chat_host_id")
+        self._chatType = self._context.get("chat_type")
+        self._communityID = self._context.get("community_id")
+        self._platform = self._context.get("platform")
+        self._topicID = self._context.get("topic_id")
+        self._messageTimestamp = coerce_datetime_utc(
+            self._context.get("message_timestamp"),
+            assume_tz=timezone.utc,
+        )
+        self._messageReceivedTimestamp = coerce_datetime_utc(
+            self._context.get("message_received_timestamp"),
+            assume_tz=timezone.utc,
+        )
+        if self._messageReceivedTimestamp is None:
+            self._messageReceivedTimestamp = datetime.now(timezone.utc)
+        if self._messageTimestamp is None:
+            self._messageTimestamp = self._messageReceivedTimestamp
+        self._shortHistory: list[dict[str, Any]] = []
 
         if self._chatHostID is None:
             if self._communityID is None:
@@ -316,6 +339,7 @@ class ConversationOrchestrator:
                 self._topicID,
                 limit=shortHistoryLimit,
             )
+            self._shortHistory = shortHistory if isinstance(shortHistory, list) else []
             for historyMessage in shortHistory:
                 role = "assistant" if historyMessage.get("member_id") is None else "user"
                 content = historyMessage.get("message_text")
@@ -337,7 +361,8 @@ class ConversationOrchestrator:
             memberID=memberID, 
             communityID=self._communityID,
             chatHostID=self._chatHostID,
-            topicID=self._topicID
+            topicID=self._topicID,
+            timestamp=self._messageTimestamp,
         )
 
         # TODO Check options and pass to agents if necessary
@@ -349,7 +374,7 @@ class ConversationOrchestrator:
         event = {
             "stage": str(stage),
             "detail": str(detail or ""),
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "timestamp": utc_now_iso(),
             "meta": meta if isinstance(meta, dict) else {},
         }
         try:
@@ -363,10 +388,37 @@ class ConversationOrchestrator:
     async def runAgents(self):
         await self._emit_stage("orchestrator.start", "Accepted request and preparing context.")
         # Create all the agent calls in the flow as methods to call, each handles the messages passed to the actual agent
-        # Make a copy of the local messages list and add the known context data. 
-        # "Known Context is only in the message history for the analysis agent"
-        analysisMessages = self._messages.copy()
-        # Create a pseudo tool call with the known context
+        # Build and append machine-readable known context for all downstream stages.
+        temporalEnabled = _runtime_bool("temporal.enabled", True)
+        temporalHistoryLimit = _runtime_int(
+            "temporal.history_limit",
+            _runtime_int("retrieval.conversation_short_history_limit", 20),
+        )
+        temporalExcerptMaxChars = _runtime_int("temporal.excerpt_max_chars", 160)
+        temporalTimezone = str(_runtime_value("temporal.default_timezone", "UTC") or "UTC")
+        temporalContext = (
+            build_temporal_context(
+                platform=self._platform,
+                chat_type=self._chatType,
+                chat_host_id=self._chatHostID,
+                topic_id=self._topicID,
+                timezone_name=temporalTimezone,
+                now_utc=datetime.now(timezone.utc),
+                inbound_sent_at=self._messageTimestamp,
+                inbound_received_at=self._messageReceivedTimestamp,
+                history_messages=self._shortHistory,
+                history_limit=max(0, temporalHistoryLimit),
+                excerpt_max_chars=max(0, temporalExcerptMaxChars),
+            )
+            if temporalEnabled
+            else {
+                "schema": "ryo.temporal_context.v1",
+                "enabled": False,
+                "reason": "runtime.temporal.enabled=false",
+                "clock": {"now_utc": utc_now_iso()},
+            }
+        )
+
         knownContext = {
             "tool_name": "Known Context",
             "tool_results": {
@@ -374,11 +426,12 @@ class ConversationOrchestrator:
                 "member_first_name": self._memberData.get("first_name"),
                 "telegram_username": self._memberData.get("username"),
                 "chat_type": self._chatType,
-                "timestamp": datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+                "timestamp_utc": temporalContext.get("clock", {}).get("now_utc", utc_now_iso()),
+                "temporal_context": temporalContext,
             }
         }
-        
-        analysisMessages.append(Message(role="tool", content=json.dumps(knownContext)))
+        self._messages.append(Message(role="tool", content=json.dumps(knownContext)))
+        analysisMessages = list(self._messages)
         await self._emit_stage("analysis.start", "Running message analysis policy and model selection.")
         self._analysisAgent = MessageAnalysisAgent(analysisMessages, options=self._options)
         self._analysisResponse = await self._analysisAgent.generateResponse()

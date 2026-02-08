@@ -53,6 +53,12 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "get_updates_write_timeout": 500,
         "show_stage_progress": True,
     },
+    "temporal": {
+        "enabled": True,
+        "default_timezone": "UTC",
+        "history_limit": 20,
+        "excerpt_max_chars": 160,
+    },
     "security": {
         "password_min_length": 12,
     },
@@ -168,6 +174,10 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "telegram.minimum_community_score_forward": (("RYO_TELEGRAM_MIN_SCORE_FORWARD",), "int"),
     "telegram.get_updates_write_timeout": (("RYO_TELEGRAM_GET_UPDATES_WRITE_TIMEOUT",), "int"),
     "telegram.show_stage_progress": (("RYO_TELEGRAM_SHOW_STAGE_PROGRESS",), "bool"),
+    "temporal.enabled": (("RYO_TEMPORAL_CONTEXT_ENABLED",), "bool"),
+    "temporal.default_timezone": (("RYO_TEMPORAL_DEFAULT_TIMEZONE",), "str"),
+    "temporal.history_limit": (("RYO_TEMPORAL_HISTORY_LIMIT",), "int"),
+    "temporal.excerpt_max_chars": (("RYO_TEMPORAL_EXCERPT_MAX_CHARS",), "int"),
     "security.password_min_length": (("RYO_PASSWORD_MIN_LENGTH",), "int"),
     "vectors.embedding_dimensions": (("RYO_VECTOR_DIMENSIONS",), "int"),
     "retrieval.conversation_short_history_limit": (("RYO_RETRIEVAL_SHORT_HISTORY_LIMIT",), "int"),

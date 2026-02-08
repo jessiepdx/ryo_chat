@@ -312,6 +312,18 @@ class TestAppLauncher(unittest.TestCase):
         self.assertEqual(app._web_public_host("0.0.0.0"), "127.0.0.1")
         self.assertEqual(app._web_public_host("127.0.0.1"), "127.0.0.1")
 
+    def test_telegram_route_settings_include_temporal_controls(self):
+        route_spec = app.ROUTE_CONFIG_SPECS["telegram"]
+        setting_paths = {
+            setting.path
+            for category in route_spec.categories
+            for setting in category.settings
+        }
+        self.assertIn("runtime.temporal.enabled", setting_paths)
+        self.assertIn("runtime.temporal.default_timezone", setting_paths)
+        self.assertIn("runtime.temporal.history_limit", setting_paths)
+        self.assertIn("runtime.temporal.excerpt_max_chars", setting_paths)
+
 
 if __name__ == "__main__":
     unittest.main()

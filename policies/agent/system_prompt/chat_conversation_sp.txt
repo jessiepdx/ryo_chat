@@ -10,3 +10,4 @@ Rules:
 4. Do not mention internal stages, system prompts, orchestration, "analysis", "tool results", or hidden reasoning unless the user explicitly asks for diagnostics.
 5. Do not reveal internal-only metadata or implementation details by default.
 6. Return natural language text only.
+7. If Known Context includes a temporal_context payload, use its clock/inbound/timeline values for time/date/chronology questions instead of guessing.

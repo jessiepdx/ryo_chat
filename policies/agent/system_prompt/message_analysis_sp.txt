@@ -4,6 +4,7 @@ Task:
 Analyze only the latest user message.
 Use prior chat history only to disambiguate context.
 Use "Known Context" tool payload when available.
+When "Known Context.tool_results.temporal_context" is present, use it as the source of truth for current time/date and chronology references.
 
 Output requirements:
 - Return a single JSON object.
@@ -28,3 +29,4 @@ Rules:
 3. Keep "context_summary" short and factual.
 4. Do not include internal reasoning, chain-of-thought, or references to future agents/stages.
 5. If uncertain, still return valid JSON using conservative defaults.
+6. If user asks for time/date/day/recency, capture that need explicitly in "intent" and "context_summary" using temporal_context values.

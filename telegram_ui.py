@@ -140,6 +140,27 @@ def _runtime_bool(path: str, default: bool) -> bool:
     return config.runtimeBool(path, default)
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _coerce_telegram_timestamp(value: datetime | None) -> datetime:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return _utc_now()
+
+
+def _message_temporal_context(message) -> dict[str, datetime]:
+    sent_at = _coerce_telegram_timestamp(getattr(message, "date", None))
+    received_at = _utc_now()
+    return {
+        "message_timestamp": sent_at,
+        "message_received_timestamp": received_at,
+    }
+
+
 def _default_generate_system_prompt() -> str:
     try:
         prompt = str(loadAgentSystemPrompt("chat_conversation") or "").strip()
@@ -2096,9 +2117,11 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     messageContext = {
         "community_id": community.get("community_id"),
+        "chat_host_id": community.get("community_id"),
+        "chat_type": "community",
         "platform": "telegram",
         "topic_id" : topicID,
-        "message_timestamp": datetime.now()
+        **_message_temporal_context(message),
     }
     
     stageStatus = TelegramStageStatus(
@@ -2237,10 +2260,12 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     messageData = {
         "community_id": None,
+        "chat_host_id": memberID,
+        "chat_type": "member",
         "member_id": member.get("member_id"),
         "platform": "telegram",
         "topic_id" : None,
-        "message_timestamp": datetime.now()
+        **_message_temporal_context(message),
     }
 
     stageStatus = TelegramStageStatus(
@@ -2589,12 +2614,14 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     messageData = {
         "community_id": communityID,
+        "chat_host_id": communityID,
+        "chat_type": "community",
         "member_id": memberID,
         "platform": "telegram",
         "topic_id" : topicID,
         "message_id": message.message_id,
         "message_text": message.text,
-        "message_timestamp": datetime.now()
+        **_message_temporal_context(message),
     }
     
     stageStatus = TelegramStageStatus(

@@ -881,7 +881,17 @@ class ChatHistoryManager:
         
         return cls._instance
     
-    def addChatHistory(self, messageID: int, messageText: str, platform: str, memberID: int = None, communityID: int = None, chatHostID: int = None, topicID: int = None, timestamp: datetime = datetime.now()) -> int:
+    def addChatHistory(
+        self,
+        messageID: int,
+        messageText: str,
+        platform: str,
+        memberID: int = None,
+        communityID: int = None,
+        chatHostID: int = None,
+        topicID: int = None,
+        timestamp: datetime | None = None,
+    ) -> int:
         logger.info(f"Adding a new chat history record.")
         chatHostID = chatHostID if chatHostID else communityID if communityID else memberID
         if not chatHostID:
@@ -890,6 +900,14 @@ class ChatHistoryManager:
         chatType = "community" if communityID is not None else "member"
         
         embedding = getEmbeddings(messageText)
+
+        if isinstance(timestamp, datetime):
+            timestampValue = timestamp
+        else:
+            timestampValue = datetime.now(timezone.utc)
+        if timestampValue.tzinfo is not None:
+            # Persist UTC wall-clock without timezone to match existing TIMESTAMP column.
+            timestampValue = timestampValue.astimezone(timezone.utc).replace(tzinfo=None)
 
         connection = None
         response = None
@@ -901,7 +919,10 @@ class ChatHistoryManager:
             insertHistory_sql = """INSERT INTO chat_history (member_id, community_id, chat_host_id, topic_id, chat_type, platform, message_id, message_text, message_timestamp)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING history_id;"""
-            cursor.execute(insertHistory_sql, (memberID, communityID, chatHostID, topicID, chatType, platform, messageID, messageText, timestamp))
+            cursor.execute(
+                insertHistory_sql,
+                (memberID, communityID, chatHostID, topicID, chatType, platform, messageID, messageText, timestampValue),
+            )
             result = cursor.fetchone()
             historyID = result.get("history_id")
             response = historyID

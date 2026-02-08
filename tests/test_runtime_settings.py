@@ -56,6 +56,26 @@ class TestRuntimeSettings(unittest.TestCase):
         self.assertTrue(settings["inference"]["prompt_model_selection_on_startup"])
         self.assertFalse(settings["watchdog"]["auto_start_routes"])
 
+    def test_build_runtime_settings_supports_temporal_overrides(self):
+        settings = build_runtime_settings(
+            config_data={
+                "runtime": {
+                    "temporal": {
+                        "default_timezone": "America/New_York",
+                        "history_limit": 44,
+                    }
+                }
+            },
+            env_data={
+                "RYO_TEMPORAL_CONTEXT_ENABLED": "false",
+                "RYO_TEMPORAL_EXCERPT_MAX_CHARS": "220",
+            },
+        )
+        self.assertFalse(settings["temporal"]["enabled"])
+        self.assertEqual(settings["temporal"]["default_timezone"], "America/New_York")
+        self.assertEqual(settings["temporal"]["history_limit"], 44)
+        self.assertEqual(settings["temporal"]["excerpt_max_chars"], 220)
+
     def test_build_runtime_settings_hydrates_from_public_community_requirements(self):
         config_data = {
             "runtime": {
