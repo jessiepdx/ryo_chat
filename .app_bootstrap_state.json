@@ -1,4 +1,5 @@
 {
   "setup_completed": true,
-  "last_run_epoch": 1770588827
+  "last_run_epoch": 1770590034,
+  "policy_model_sync_fingerprint": "{\"host\": \"http://127.0.0.1:11434\", \"models\": {\"chat_conversation\": [\"qwen3-vl:latest\"], \"dev_test\": [\"qwen3-vl:latest\"], \"message_analysis\": [\"qwen3-vl:latest\"], \"tool_calling\": [\"qwen3-vl:latest\"]}}"
 }

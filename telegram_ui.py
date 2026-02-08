@@ -222,11 +222,14 @@ _ORCHESTRATION_STAGE_LABELS = {
     "response.start": "Generating response",
     "response.progress": "Generating response",
     "response.complete": "Response generated",
+    "response.fallback": "Fallback response",
     "response.sanitized": "Sanitized response",
     "orchestrator.complete": "Wrapping up",
 }
 
 _TELEGRAM_STAGE_DETAIL_LEVELS = {"minimal", "normal", "debug"}
+_TELEGRAM_MAX_MESSAGE_CHARS = 4096
+_TELEGRAM_FALLBACK_FINAL_REPLY = "I could not generate a complete reply this turn. Please try again."
 _MINIMAL_VISIBLE_STAGES = {
     "orchestrator.start",
     "orchestrator.fast_path",
@@ -400,11 +403,24 @@ class TelegramStageStatus:
             json_text = json_text[: self._json_char_limit - len(suffix)].rstrip() + suffix
         return f"```json\n{json_text}\n```"
 
-    async def _safe_edit(self, text: str, *, parse_html: bool = False) -> None:
+    def _normalize_final_reply_text(self, text: str) -> str:
+        normalized = str(text or "").strip()
+        if not normalized:
+            normalized = _TELEGRAM_FALLBACK_FINAL_REPLY
+        if len(normalized) > _TELEGRAM_MAX_MESSAGE_CHARS:
+            suffix = "\n\n[truncated]"
+            keep = max(1, _TELEGRAM_MAX_MESSAGE_CHARS - len(suffix))
+            normalized = normalized[:keep].rstrip() + suffix
+        return normalized
+
+    async def _safe_edit(self, text: str, *, parse_html: bool = False) -> bool:
         if self._message is None:
-            return
+            return False
         if text == self._last_text:
-            return
+            return True
+        if str(text or "").strip() == "":
+            logger.warning("Failed to update stage status message: Message text is empty")
+            return False
         try:
             kwargs: dict[str, Any] = {}
             if parse_html:
@@ -412,8 +428,10 @@ class TelegramStageStatus:
                 kwargs["disable_web_page_preview"] = True
             await self._message.edit_text(text=text, **kwargs)
             self._last_text = text
+            return True
         except Exception as error:  # noqa: BLE001
             logger.warning(f"Failed to update stage status message: {error}")
+            return False
 
     async def start(self) -> None:
         if not self._enabled:
@@ -467,17 +485,26 @@ class TelegramStageStatus:
         await self._safe_edit(self._render(), parse_html=True)
 
     async def finalize(self, final_text: str):
+        final_text_safe = self._normalize_final_reply_text(final_text)
         if self._message is not None:
-            await self._safe_edit(final_text, parse_html=False)
-            return self._message
+            edited = await self._safe_edit(final_text_safe, parse_html=False)
+            if edited:
+                return self._message
 
-        if self._reply_message is not None:
-            return await self._reply_message.reply_text(text=final_text)
-        return await self._context.bot.send_message(
-            chat_id=self._chat_id,
-            message_thread_id=self._thread_id,
-            text=final_text,
-        )
+        try:
+            if self._reply_message is not None:
+                return await self._reply_message.reply_text(text=final_text_safe)
+            return await self._context.bot.send_message(
+                chat_id=self._chat_id,
+                message_thread_id=self._thread_id,
+                text=final_text_safe,
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Unable to send final response message: {error}")
+            if self._message is not None:
+                # Return existing status message as best effort fallback.
+                return self._message
+            raise
 
     async def fail(self, error_text: str) -> None:
         if self._message is not None:

@@ -1049,7 +1049,7 @@ def _sanitize_final_response(
 ) -> str:
     raw = str(text or "")
     if not raw.strip():
-        return raw
+        return "I could not generate a complete reply this turn. Please try again."
     if allow_internal_diagnostics or _user_requested_diagnostics(user_message):
         return raw.strip()
 
@@ -1486,6 +1486,12 @@ class ConversationOrchestrator:
             user_message=self._message,
             allow_internal_diagnostics=allowDiagnostics,
         )
+        if not str(sanitizedResponseMessage or "").strip():
+            sanitizedResponseMessage = "I could not generate a complete reply this turn. Please try again."
+            await self._emit_stage(
+                "response.fallback",
+                "Model returned empty output; emitted fallback response text.",
+            )
         if sanitizedResponseMessage != responseMessage:
             await self._emit_stage("response.sanitized", "Removed internal orchestration artifacts.")
         self._chatResponseMessage = sanitizedResponseMessage
