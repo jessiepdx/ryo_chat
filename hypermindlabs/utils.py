@@ -30,6 +30,7 @@ import textstat
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from hypermindlabs.database_router import DatabaseRouter
 from hypermindlabs.runtime_settings import (
@@ -79,6 +80,33 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db" / "migrations"
+MIGRATION_TOKEN_PATTERN = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+
+def _render_migration_sql(sql_text: str, context: dict[str, Any] | None = None) -> str:
+    migration_context = context or {}
+
+    def replace_token(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in migration_context:
+            raise KeyError(f"Missing migration template value: {key}")
+        value = migration_context[key]
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        raise ValueError(f"Unsupported migration template value for '{key}': {type(value).__name__}")
+
+    return MIGRATION_TOKEN_PATTERN.sub(replace_token, sql_text)
+
+
+def execute_migration(cursor: Any, migration_filename: str, context: dict[str, Any] | None = None) -> None:
+    migration_path = MIGRATIONS_DIR / migration_filename
+    migration_sql = migration_path.read_text(encoding="utf-8")
+    rendered_sql = _render_migration_sql(migration_sql, context=context)
+    cursor.execute(rendered_sql)
+
 
 # NOTE OLD - but other aspects of code still use... Maybe make into a class for dot syntax use
 # Create a dictionary containing color codes for console output
@@ -123,49 +151,19 @@ class MemberManager:
                 logger.debug(f"PostgreSQL connection established.")
 
                 # Create the member data table
-                memberData_sql = """CREATE TABLE IF NOT EXISTS member_data (
-                    member_id SERIAL PRIMARY KEY,
-                    first_name VARCHAR(96),
-                    last_name VARCHAR(96),
-                    email VARCHAR(72),
-                    roles VARCHAR(32)[],
-                    register_date TIMESTAMP NOT NULL,
-                    community_score REAL NOT NULL DEFAULT 0
-                );"""
-                cursor.execute(memberData_sql)
+                execute_migration(cursor, "001_member_data.sql")
                 connection.commit()
                 
                 # Create the member telegram table if it doesn't exist
-                memberTelegramTable_sql = """CREATE TABLE IF NOT EXISTS member_telegram (
-                    record_id SERIAL PRIMARY KEY,
-                    member_id INT UNIQUE NOT NULL,
-                    first_name VARCHAR(96),
-                    last_name VARCHAR(96),
-                    username VARCHAR(96),
-                    user_id BIGINT UNIQUE NOT NULL,
-                    CONSTRAINT member_link
-                        FOREIGN KEY(member_id)
-                        REFERENCES member_data(member_id)
-                        ON DELETE CASCADE
-                );"""
-                cursor.execute(memberTelegramTable_sql)
+                execute_migration(cursor, "002_member_telegram.sql")
                 connection.commit()
 
                 # Allow web-only accounts that are not yet linked to a Telegram user id.
-                cursor.execute("ALTER TABLE member_telegram ALTER COLUMN user_id DROP NOT NULL;")
+                execute_migration(cursor, "003_member_telegram_user_id_nullable.sql")
                 connection.commit()
 
                 # Create the member password hash table
-                memberSecureTable_sql = """CREATE TABLE IF NOT EXISTS member_secure (
-                    secure_id SERIAL PRIMARY KEY,
-                    member_id INTEGER UNIQUE NOT NULL,
-                    secure_hash BYTEA,
-                    CONSTRAINT member_link
-                        FOREIGN KEY(member_id)
-                        REFERENCES member_data(member_id)
-                        ON DELETE CASCADE
-                );"""
-                cursor.execute(memberSecureTable_sql)
+                execute_migration(cursor, "004_member_secure.sql")
                 connection.commit()
 
                 # Check for an empty member data table
@@ -750,42 +748,25 @@ class ChatHistoryManager:
                 logger.debug(f"PostgreSQL connection established.")
                 
                 # Create the chat history table if it does not exist
-                memberHistory_sql = """CREATE TABLE IF NOT EXISTS chat_history (
-                    history_id SERIAL PRIMARY KEY,
-                    member_id INT,
-                    community_id INT,
-                    chat_host_id INT,
-                    topic_id INT,
-                    chat_type VARCHAR(16),
-                    platform VARCHAR(24),
-                    message_id INT NOT NULL,
-                    message_text TEXT,
-                    message_timestamp TIMESTAMP
-                );"""
-                cursor.execute(memberHistory_sql)
+                execute_migration(cursor, "010_chat_history.sql")
                 connection.commit()
 
                 # pgvector can be unavailable in some local environments. Keep
                 # base chat history available even if embeddings setup fails.
                 vectorDimensions = max(1, ConfigManager().runtimeInt("vectors.embedding_dimensions", 768))
                 try:
-                    cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                    execute_migration(cursor, "011_create_vector_extension.sql")
                     connection.commit()
                 except (Exception, psycopg.DatabaseError) as error:
                     connection.rollback()
                     logger.warning(f"Unable to ensure pgvector extension. Continuing without vector features:\n{error}")
 
                 try:
-                    createHistorySQL = f"""CREATE TABLE IF NOT EXISTS chat_history_embeddings (
-                        embedding_id SERIAL PRIMARY KEY,
-                        history_id INT NOT NULL,
-                        embeddings vector({vectorDimensions}),
-                        CONSTRAINT message_link
-                            FOREIGN KEY(history_id)
-                            REFERENCES chat_history(history_id)
-                            ON DELETE CASCADE
-                    );"""
-                    cursor.execute(createHistorySQL)
+                    execute_migration(
+                        cursor,
+                        "012_chat_history_embeddings.sql",
+                        context={"vector_dimensions": vectorDimensions},
+                    )
                     connection.commit()
                 except (Exception, psycopg.DatabaseError) as error:
                     connection.rollback()
@@ -1176,33 +1157,10 @@ class CommunityManager:
                 logger.debug(f"PostgreSQL connection established.")
 
                 # Create the new community data table
-                communityData_sql = """CREATE TABLE IF NOT EXISTS community_data (
-                    community_id SERIAL PRIMARY KEY,
-                    community_name VARCHAR(96),
-                    community_link VARCHAR(256),
-                    roles VARCHAR(32)[],
-                    created_by INT,
-                    register_date TIMESTAMP NOT NULL,
-                    CONSTRAINT member_link
-                        FOREIGN KEY(created_by)
-                        REFERENCES member_data(member_id)
-                        ON DELETE SET NULL
-                );"""
-                cursor.execute(communityData_sql)
+                execute_migration(cursor, "020_community_data.sql")
                 
                 # Create the community telegram table if it doesn't exist
-                communityTelegramTable_sql = """CREATE TABLE IF NOT EXISTS community_telegram (
-                    record_id SERIAL PRIMARY KEY,
-                    community_id INT UNIQUE NOT NULL,
-                    chat_id BIGINT UNIQUE NOT NULL,
-                    chat_title VARCHAR(96),
-                    has_topics BOOL,
-                    CONSTRAINT community_link
-                        FOREIGN KEY(community_id)
-                        REFERENCES community_data(community_id)
-                        ON DELETE CASCADE
-                );"""
-                cursor.execute(communityTelegramTable_sql)
+                execute_migration(cursor, "021_community_telegram.sql")
                 connection.commit()
                 # Close the cursor
                 cursor.close()
@@ -1431,20 +1389,7 @@ class CommunityScoreManager:
                 logger.debug(f"PostgreSQL connection established.")
                 
                 # Create the individual accounts table if it doesn't exist
-                communityScoreTable_sql = """CREATE TABLE IF NOT EXISTS community_score (
-                    score_id SERIAL PRIMARY KEY,
-                    history_id INTEGER NOT NULL,
-                    event TEXT NOT NULL,
-                    read_score REAL,
-                    points_awarded REAL NOT NULL,
-                    awarded_from_id INTEGER NOT NULL,
-                    multiplier REAL NOT NULL,
-                    CONSTRAINT history_link
-                        FOREIGN KEY(history_id)
-                        REFERENCES chat_history(history_id)
-                        ON DELETE SET NULL
-                );"""
-                cursor.execute(communityScoreTable_sql)
+                execute_migration(cursor, "030_community_score.sql")
 
                 connection.commit()
                 # Close the cursor
@@ -1891,41 +1836,14 @@ class KnowledgeManager:
                 vectorDimensions = max(1, ConfigManager().runtimeInt("vectors.embedding_dimensions", 768))
                 
                 # Create the knowledge table if it does not exist
-                createKnowledgeSQL = f"""CREATE TABLE IF NOT EXISTS knowledge (
-                    knowledge_id SERIAL PRIMARY KEY,
-                    domains TEXT[],
-                    roles TEXT[],
-                    categories TEXT[],
-                    knowledge_document TEXT,
-                    document_metadata JSON,
-                    embeddings vector({vectorDimensions}),
-                    record_timestamp TIMESTAMP,
-                    record_metadata JSON
-                );"""
-                cursor.execute(createKnowledgeSQL)
+                execute_migration(
+                    cursor,
+                    "040_knowledge.sql",
+                    context={"vector_dimensions": vectorDimensions},
+                )
 
                 # Create the knowledge retrieval table if it does not exist
-                createRetrievalsSQL = """CREATE TABLE IF NOT EXISTS knowledge_retrievals (
-                    retrieval_id SERIAL PRIMARY KEY,
-                    prompt_id INT,
-                    response_id INT,
-                    knowledge_id INT,
-                    distance DOUBLE PRECISION,
-                    retrieval_timestamp TIMESTAMP,
-                    CONSTRAINT prompt_link
-                        FOREIGN KEY(prompt_id)
-                        REFERENCES chat_history(history_id)
-                        ON DELETE SET NULL,
-                    CONSTRAINT response_link
-                        FOREIGN KEY(response_id)
-                        REFERENCES chat_history(history_id)
-                        ON DELETE SET NULL,
-                    CONSTRAINT knowledge_link
-                        FOREIGN KEY(knowledge_id)
-                        REFERENCES knowledge(knowledge_id)
-                        ON DELETE CASCADE
-                );"""
-                cursor.execute(createRetrievalsSQL)
+                execute_migration(cursor, "041_knowledge_retrievals.sql")
 
                 connection.commit()
 
@@ -2073,24 +1991,10 @@ class ProposalManager:
                 logger.debug(f"PostgreSQL connection established.")
 
                 # Create the proposals table if it doesn't exist
-                proposalsTable_sql = """CREATE TABLE IF NOT EXISTS proposals (
-                    proposal_id SERIAL PRIMARY KEY,
-                    submitted_from TEXT,
-                    project_title TEXT,
-                    project_description TEXT,
-                    filename TEXT,
-                    submit_date timestamp
-                );"""
-                cursor.execute(proposalsTable_sql)
+                execute_migration(cursor, "050_proposals.sql")
 
                 # Create the proposal disclosure table if it doesn't exist
-                proposalDisclosure_sql = """CREATE TABLE IF NOT EXISTS proposal_disclosure (
-                    disclosure_id SERIAL PRIMARY KEY,
-                    user_id INT,
-                    proposal_id INT,
-                    agreement_date timestamp
-                );"""
-                cursor.execute(proposalDisclosure_sql)
+                execute_migration(cursor, "051_proposal_disclosure.sql")
                 
                 connection.commit()
                 # Close the cursor
@@ -2180,18 +2084,11 @@ class SpamManager:
                 vectorDimensions = max(1, ConfigManager().runtimeInt("vectors.embedding_dimensions", 768))
                 
                 # Create the knowledge table if it does not exist
-                createSpamSQL = f"""CREATE TABLE IF NOT EXISTS spam (
-                    spam_id SERIAL PRIMARY KEY,
-                    spam_text TEXT,
-                    embeddings vector({vectorDimensions}),
-                    record_timestamp TIMESTAMP,
-                    added_by INT,
-                    CONSTRAINT member_link
-                        FOREIGN KEY(added_by)
-                        REFERENCES member_data(member_id)
-                        ON DELETE SET NULL
-                );"""
-                cursor.execute(createSpamSQL)
+                execute_migration(
+                    cursor,
+                    "060_spam.sql",
+                    context={"vector_dimensions": vectorDimensions},
+                )
                 connection.commit()
 
                 # close the communication with the PostgreSQL
@@ -2315,26 +2212,7 @@ class UsageManager:
                 logger.debug(f"PostgreSQL connection established.")
                 
                 # Create the individual accounts table if it doesn't exist
-                usageTable_sql = """CREATE TABLE IF NOT EXISTS inference_usage (
-                    usage_id SERIAL PRIMARY KEY,
-                    prompt_history_id INT NOT NULL,
-                    response_history_id INT NOT NULL,
-                    load_duration BIGINT NOT NULL,
-                    prompt_eval_count INTEGER NOT NULL,
-                    prompt_eval_duration BIGINT NOT NULL,
-                    eval_count INTEGER NOT NULL,
-                    eval_duration BIGINT NOT NULL,
-                    total_duration BIGINT NOT NULL,
-                    CONSTRAINT prompt_history
-                        FOREIGN KEY(prompt_history_id)
-                        REFERENCES chat_history(history_id)
-                        ON DELETE CASCADE,
-                    CONSTRAINT response_history
-                        FOREIGN KEY(response_history_id)
-                        REFERENCES chat_history(history_id)
-                        ON DELETE CASCADE
-                );"""
-                cursor.execute(usageTable_sql)
+                execute_migration(cursor, "070_inference_usage.sql")
                 
                 connection.commit()
                 # Close the cursor

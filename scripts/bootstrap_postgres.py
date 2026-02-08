@@ -32,6 +32,7 @@ from psycopg import sql
 
 
 DEFAULT_VERIFY_SQL = Path(__file__).with_name("verify_pgvector.sql")
+DEFAULT_VECTOR_EXTENSION_SQL = Path(__file__).resolve().parent.parent / "db" / "migrations" / "011_create_vector_extension.sql"
 DEFAULT_PRIMARY_HOST = str(
     DEFAULT_RUNTIME_SETTINGS.get("database", {}).get("default_primary_host", "127.0.0.1")
 )
@@ -251,9 +252,10 @@ def _create_database(conninfo: str, target_db: str, retries: int, retry_delay: f
 
 
 def _ensure_vector_extension(conninfo: str, retries: int, retry_delay: float) -> None:
+    extension_sql = DEFAULT_VECTOR_EXTENSION_SQL.read_text(encoding="utf-8")
     with _connect_with_retry(conninfo, retries, retry_delay) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            cursor.execute(extension_sql)
 
 
 def _run_sql_check(conninfo: str, sql_path: Path, retries: int, retry_delay: float) -> None:
