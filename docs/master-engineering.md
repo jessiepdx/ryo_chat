@@ -5,259 +5,316 @@ This document is the engineering baseline for the current RYO Chat codebase and 
 
 It serves three functions:
 1. Capture the current architecture and operational reality.
-2. Define the target behavior for automation and graceful degradation.
+2. Define the target behavior for automation, graceful degradation, and agent-playground evolution.
 3. Drive implementation order, acceptance criteria, and operator documentation updates.
 
 ## 2. Scope
 This document covers:
-- Multi-platform runtime (`cli_ui.py`, `web_ui.py`, `telegram_ui.py`, `x_ui.py`)
-- Agent orchestration and tool-calling stack (`hypermindlabs/agents.py`)
-- Data and config runtime (`hypermindlabs/utils.py`, `config.json`)
-- Policy and system prompt stack (`policies/agent/*`)
-- Planned upgrades:
-1. Automatic model fallbacks
-2. Automatic PostgreSQL instance generation for remote fallback with curses setup
-3. Complete documentation and master engineering document
-4. Graceful degradation for tools with missing APIs
-5. Curses walkthrough for key ingress and model selection
-6. Policy walkthrough and setup
-7. Tool-calling stack review and improvements
-8. Automatic ingress of Telegram keys
-9. Master engineering documentation and prerequisite explainer
-10. Automated pgvector + PostgreSQL setup
+- Multi-platform runtime (`cli_ui.py`, `web_ui.py`, `telegram_ui.py`, `x_ui.py`, `app.py` launcher)
+- Agent orchestration and tool-calling stack (`hypermindlabs/agents.py`, `hypermindlabs/tool_runtime.py`, `hypermindlabs/tool_registry.py`)
+- Data/config runtime (`hypermindlabs/utils.py`, `hypermindlabs/runtime_settings.py`, `config.json`)
+- Policy/system prompt stack (`policies/agent/*`)
+- Existing upgrade items WO-001 through WO-010
+- New frontend modernization scope for a full agent playground aligned with CLI capabilities and future multi-user tiers
 
 ### 2.1 Implementation Status Snapshot (February 8, 2026)
-1. Automatic model fallbacks: Implemented (`ModelRouter` integrated into core multi-agent chain with graceful fallback handling when candidate models are exhausted, including fallback-exhaustion tests and route metadata logging).
-2. Automatic PostgreSQL fallback generation with setup flow: Implemented (`DatabaseRouter` integrated; fallback config support and setup workflow added; setup can now trigger immediate primary/fallback PostgreSQL bootstrap with optional docker provisioning).
-3. Complete documentation and master engineering documentation maintenance: Implemented in this cycle (checklist, changelog, and sync workflow artifacts added).
-4. Graceful degradation for tools with missing APIs: Implemented (structured tool runtime added with missing-key handling, arg validation, timeout/retry bounds, and error envelopes).
-5. Curses walkthrough for key ingress and model selection: Implemented (curses wizard with endpoint probing, model mapping, validation, optional `.env` updates, and resumable partial-state flow).
-6. Policy walkthrough and setup: Implemented (`PolicyManager` added with schema/prompt/model validation, warning/strict model compatibility checks, and guided CLI editor in `scripts/policy_wizard.py`).
-7. Tool-calling stack review and improvements: Implemented (canonical tool registry, strict argument parsing/coercion path, structured unknown-tool handling, and expanded tool-calling tests).
-8. Automatic ingress of Telegram keys: Implemented (telegram-only setup/rotation mode, config merge preservation for inference/DB sections, startup validation in Telegram/Web miniapp paths, and ingress validation tests).
-9. Master engineering documentation and prerequisite explainer: Implemented (`docs/prerequisites.md` and `docs/troubleshooting-startup.md` added, README linkage updated, and sync checklist expanded).
-10. Automated pgvector + PostgreSQL setup: Implemented (config/manual bootstrap utility expanded with idempotent DB creation, optional docker provisioning, extension/type verification, schema-sanity SQL checks, and bootstrap tests).
+1. WO-001 Automatic model fallbacks: Implemented.
+2. WO-002 Automatic PostgreSQL fallback generation + setup flow: Implemented.
+3. WO-003 Documentation and master engineering maintenance: Implemented.
+4. WO-004 Graceful degradation for tools with missing APIs: Implemented.
+5. WO-005 Curses walkthrough for key ingress/model selection: Implemented.
+6. WO-006 Policy walkthrough/setup: Implemented.
+7. WO-007 Tool-calling stack hardening: Implemented.
+8. WO-008 Automatic Telegram key ingress: Implemented.
+9. WO-009 Prerequisite explainer and doc sync: Implemented.
+10. WO-010 pgvector + PostgreSQL automation: Implemented.
+11. Frontend agent-playground modernization: Not implemented yet (discovery complete, work-order set defined in `workorders/frontend/`).
+
+### 2.2 Frontend Discovery Snapshot (February 8, 2026)
+
+#### 2.2.1 Confirmed Implemented
+1. Route + auth gating for web pages exists in `web_ui.py` (`/agent-playground`, `/knowledge-tools`, `/admin-tools`, `/community-engagement`, `/hydra-network`).
+2. Web login/signup/session plumbing exists (`/login`, `/signup`, `/logout`, `session["member_id"]`).
+3. Base panel framework exists (`templates/base-html.html`, `static/ui-managers.js`, `static/base-javascript.js`, `static/base-style.css`).
+4. Basic profile update endpoint exists for email (`/profile/email`) via `MemberData.storeData(...)`.
+5. Telegram miniapp auth ingress exists (`/miniapp-login`, `static/miniapp/index.html`).
+
+#### 2.2.2 Confirmed Partial / Stubbed
+1. `templates/agent-playground.html` is UI-demo only:
+- local message rendering in browser
+- no backend run execution call
+- no streaming transport
+- no trace/state/artifact ingestion
+2. Admin/community pages are placeholders with static copy.
+3. Knowledge tools page has list/editor shell but no completed save/update API flow.
+4. Frontend managers are panel/menu utilities, not agent-runtime/data-runtime clients.
+
+#### 2.2.3 Confirmed Missing (Implied Requirements)
+1. No run lifecycle API for web (create run, stream events, cancel, resume, replay).
+2. No append-only run event model surfaced to web UI.
+3. No trace timeline UI, state snapshots, artifact panel, inspector panel.
+4. No versioned frontend agent configuration objects (agent/tool/prompt/memory policy).
+5. No web tool registry UI, schema-driven forms, sandbox approvals, or test harness.
+6. No web evaluation workflows (datasets/evaluators/annotation queue/regression gates).
+7. No capability-manifest endpoints to hydrate UI from schemas.
+8. No workspace/project RBAC model in web tier.
+9. No frontend observability dashboards for run metrics/regressions.
 
 ## 3. Current State Review
 
 ### 3.1 Runtime Components
-- `telegram_ui.py`: primary production-style interface (commands, moderation, chat flows, knowledge ingestion, tweet workflow, newsletter workflow).
-- `web_ui.py`: Flask web interface and Telegram miniapp login validation.
-- `cli_ui.py`: local conversational CLI with model switch/list commands.
-- `x_ui.py`: X/Twitter integration entrypoint.
+- `telegram_ui.py`: most feature-rich interface (commands, moderation, chat flows, media flow, community logic).
+- `cli_ui.py`: conversational local interface with model commands and orchestrator integration.
+- `web_ui.py`: authentication, route rendering, miniapp login, and profile/email update endpoint.
+- `x_ui.py`: X/Twitter entry path.
+- `app.py`: single-entry bootstrap + watchdog + curses setup orchestration.
 
 ### 3.2 Agent and Tooling Stack
-- Orchestrator (`ConversationOrchestrator`) runs:
-1. Message analysis agent
-2. Tool-calling agent
-3. Chat-conversation agent
-- Tool set currently wired:
-1. `braveSearch`
-2. `chatHistorySearch`
-3. `knowledgeSearch`
-4. `skipTools` behavior prompting
-- Policies and system prompts are loaded from disk, with no centralized runtime manager.
+- `ConversationOrchestrator` executes analysis -> tool-calling -> chat response.
+- `ModelRouter` centralizes model candidate resolution and fallback.
+- `ToolRuntime` enforces arg validation/coercion, timeout/retry, missing-key behavior.
+- `tool_registry` is canonical source of tool metadata + model tool schemas.
 
-### 3.3 Data Layer and Vector Retrieval
-- PostgreSQL is the primary store.
-- Managers auto-create tables on startup.
-- `vector(768)` columns are used in chat history, knowledge, and spam tables.
-- Vector search uses `<->` distance operations through pgvector-compatible types.
+### 3.3 Data Layer and Retrieval
+- PostgreSQL primary with optional fallback router behavior.
+- pgvector-backed tables for chat/knowledge/spam embeddings.
+- `UsageManager` stores inference counters/latency per prompt-response pair.
+- Data model is currently chat-centric, not run-event-centric.
 
-### 3.4 Configuration and Secrets
-- Runtime config is loaded from `config.json` only (hard requirement).
-- Keys and endpoints are mostly file-based (no environment merge at runtime).
-- API credentials exist in config placeholders (`api_keys`, `twitter_keys`).
+### 3.4 Configuration and Runtime Contract
+- Runtime is driven by `config.json` + runtime hydration from `runtime` and env overrides.
+- Setup/bootstrap writes config/env templates and validates required values.
+- Community score gates now surfaced as editable config values and hydrated runtime values.
 
-### 3.5 Current Gaps/Risks (Observed)
-1. No startup migration/version system; table creation is distributed across managers.
-2. No explicit `CREATE EXTENSION IF NOT EXISTS vector` path in runtime bootstrap.
-3. Missing/failing external services (Ollama, Brave API, DB) are not consistently converted to graceful user-facing fallbacks.
-4. No standard health-check gate for model availability before agent chain execution.
-5. No central fallback routing for model/provider selection.
-6. Policy loading assumes files exist and expected keys are valid.
-7. Config template did not fully match runtime expectations (now corrected in `config.empty.json`).
-8. `.env` contract was missing, making upcoming bootstrap automation unclear (now added as `.env.example` for planning).
-9. Some feature paths are inconsistent with current agent signatures (notably parts of tweet flow), indicating need for integration hardening before expansion.
+### 3.5 Web/CLI Alignment Findings
+1. CLI path uses full orchestrator/tool routing chain, while Web playground currently does not execute that chain.
+2. CLI has model awareness and command controls; Web has no comparable runtime control surfaces.
+3. Observability data generated in backend (routing metadata, usage records) is not yet exposed to Web in structured run timelines.
+4. Tool-calling customization/policy surfaces exist in backend files but are not represented in a frontend builder/editor.
 
-## 4. Target Architecture (Upgrade Direction)
+## 4. North-Star Capability Requirements (Frontend Modernization)
+These are now codified as explicit engineering requirements for the next cycle.
 
-### 4.1 Model Fallback Layer
-Add a `ModelRouter` abstraction:
-- Inputs: capability (`analysis`, `tool`, `chat`, `embedding`, `multimodal`), policy constraints, user override.
-- Behavior:
-1. Attempt primary model for capability.
-2. On error/timeout/unavailable model, retry according to policy.
-3. Automatically select next compatible fallback model.
-4. Return structured metadata about fallback events for logs and usage tracking.
-- Output contract:
-1. Chosen model
-2. Host/provider
-3. Fallback reason
-4. Retry count
+### 4.1 Core UX Primitives
+1. Multi-pane workspace:
+- Chat/Run panel
+- Trace/Steps panel
+- State panel
+- Artifacts panel
+- Inspector panel
+2. Run modes:
+- Chat
+- Workflow/Graph
+- Batch
+- Compare
+- Replay
+3. Config-as-objects:
+- agent/tool/policy/memory/prompt definitions
+- versioning
+- copy/export JSON/YAML
 
-### 4.2 PostgreSQL Remote-to-Local Fallback
-Add `DatabaseRouter` with prioritized endpoints:
-1. Remote primary (`config.database`)
-2. Local fallback instance (auto-provisioned or pre-existing)
+### 4.2 Runtime Capabilities
+1. Agent composition: single + multi-agent + handoffs + planner/executor/verifier patterns.
+2. Reliability controls: stop/resume/cancel, retries, timeouts, budgets, determinism knobs.
+3. Guardrail hooks: pre/mid/post with trace visibility.
+4. Canonical `AgentState` with provenance.
 
-Behavior:
-- Pre-flight connection test at startup.
-- On remote failure:
-1. switch to local fallback
-2. surface warning state in UI/ops logs
-3. continue service where possible
-- Optionally enqueue sync jobs for eventual reconciliation (future phase).
+### 4.3 Tooling and Capability Marketplace
+1. Tool registry UX with schema metadata, auth requirements, side-effect class, sensitivity class.
+2. Tool sandbox controls and human approvals for mutating/risky calls.
+3. Tool isolation harness (fixtures/golden outputs/contract checks).
 
-### 4.3 pgvector/Postgres Automated Bootstrap
-Provide automation scripts for:
-1. Local Postgres provisioning
-2. pgvector extension enablement
-3. schema initialization
-4. connectivity verification
+### 4.4 Memory and Retrieval
+1. Short-term trimming/compression strategy controls.
+2. Long-term memory patterns (episodic/semantic/procedural pointers).
+3. RAG ingestion/versioning and retrieval debugging (chunks/scores/rerank/provenance).
+4. Memory write observability (author/confidence/TTL/evidence).
 
-Expected script outcomes:
-- Idempotent execution.
-- Clear terminal output for success/failure.
-- Generated config suggestions for `config.json` and `.env`.
+### 4.5 Observability and Debugging
+1. Trace-first design with nested spans and searchable metadata.
+2. Replay/time-travel with restored state and what-if edits.
+3. Metrics dashboards for latency/tool errors/token proxy/success rates/regression trends.
+4. Failure triage clustering and guided remediation suggestions.
 
-### 4.4 Curses Setup Wizard
-Create a guided terminal wizard for first-run setup:
-1. Collect Telegram values (bot name/id/token, owner metadata)
-2. Collect DB values (remote primary + optional local fallback)
-3. Collect API keys (Brave, optional X/Twitter)
-4. Probe Ollama host
-5. List available Ollama models and let user map models to capabilities
-6. Write `config.json`
-7. Optionally write `.env`
+### 4.6 Prompt Management and Evaluation
+1. Prompt IDE with templates/vars/versioning/environments.
+2. Prompt playground for rapid param experimentation.
+3. Structured output validation + repair loops.
+4. Dataset/evaluator pipelines + annotation queue + regression gates.
 
-Graceful wizard behavior:
-- Validate each step before continue.
-- Allow skip for optional keys.
-- Persist partial progress on exit.
+### 4.7 Collaboration, Governance, and Security
+1. Workspaces/projects/RBAC.
+2. Shared run permalinks and threaded review comments.
+3. Secrets management, audit logs, policy-based tool/data access.
+4. PII redaction hooks and environment isolation.
 
-### 4.5 Tool-Calling Degradation and Safety
-Introduce a `ToolRuntime` layer:
-- Schema validation for tool arguments.
-- Per-tool timeout and retry policy.
-- API-key presence checks before invocation.
-- Circuit breaker behavior for repeated failures.
-- Safe fallback response injected into agent context when tool unavailable.
+### 4.8 Ollama + Postgres Ops UX
+1. Ollama model cockpit (list/pull/pin/metadata/runtime controls).
+2. Compare harness for model behavior/tool behavior deltas.
+3. Postgres persistence for immutable runs + append-only events + snapshots + artifacts.
+4. JSONB-first storage with targeted indexes and tenancy boundaries.
 
-Required user-facing behavior:
-- No hard crash if Brave key missing.
-- Model can proceed without tools when tool execution fails.
+### 4.9 Hydratable UI Requirement
+Every subsystem must expose machine-readable capability manifests and JSON schemas so UI can render without hardcoded forms.
 
-### 4.6 Policy Walkthrough and Setup
-Implement `PolicyManager`:
-- Validate policy JSON schema on load.
-- Validate referenced model names against available models (warn vs fail by mode).
-- Provide CLI/curses policy walkthrough:
-1. select allowed models
-2. set prompt override allowance
-3. preview system prompt
-4. save with validation report
+## 5. Gap Analysis (What Exists vs Target)
 
-## 5. Configuration and Environment Contract
+### 5.1 Core UX
+- Current: Base panel shell exists.
+- Gap: No runtime-bound multi-pane agent workspace.
 
-### 5.1 Current Runtime Contract
-- `config.json` is mandatory.
-- Policy files in `policies/agent/` and `policies/agent/system_prompt/` are mandatory.
-- `logs/` directory must exist before app start.
+### 5.2 Run Lifecycle and Modes
+- Current: Orchestrator exists in backend and CLI.
+- Gap: No web run API/events, no workflow/batch/compare/replay modes.
 
-### 5.2 User-Editable Files
-1. `config.json`
-2. `.env` (for operator automation, planned bootstrap use)
-3. `policies/agent/*.json`
-4. `policies/agent/system_prompt/*.txt`
+### 5.3 Trace/State/Replay
+- Current: Backend logs and usage table exist.
+- Gap: No step-event store and no replay/time-travel UI.
 
-### 5.3 Required User Editing Rules
-1. Never commit real secrets.
-2. Keep model names valid for the target Ollama host.
-3. Keep role lists consistent (`roles_list`) for Telegram flows.
-4. If Brave tool is enabled, supply API key; otherwise disable tool at policy/runtime level.
-5. Ensure DB endpoint points to pgvector-enabled PostgreSQL.
+### 5.4 Tooling UX
+- Current: Tool runtime/registry exists.
+- Gap: No frontend tool registry editor/sandbox/test harness.
 
-## 6. Implementation Plan
+### 5.5 Memory/RAG UX
+- Current: Knowledge retrieval managers exist.
+- Gap: No ingestion/retrieval-debug UX and no memory strategy controls.
 
-### Phase 0: Documentation + Config Contract (done in this cycle)
-1. Master engineering doc created.
-2. README expanded with setup, prerequisites, and references.
-3. `config.empty.json` aligned with runtime keys.
-4. `.env.example` added for bootstrap contract.
+### 5.6 Prompt/Eval UX
+- Current: Prompt and policy files exist on disk.
+- Gap: No prompt IDE/versioning UI, no dataset/evaluator annotation workflows.
 
-### Phase 1: Reliability Foundations
-1. Add centralized health checks:
-- Ollama host/model checks
-- DB availability checks
-- API-key presence checks
-2. Add structured startup report.
-3. Add unified error classes for degradation paths.
+### 5.7 Collaboration/Security
+- Current: Role list and member model exist.
+- Gap: No workspace/RBAC model, no review workflow, no frontend governance controls.
 
-### Phase 2: Fallback Engines
-1. Implement `ModelRouter`.
-2. Implement `DatabaseRouter`.
-3. Implement tool-level graceful fallback behavior.
+### 5.8 Hydratable UI
+- Current: No capability-manifest API contracts.
+- Gap: Full manifest + schema renderer stack required.
 
-### Phase 3: Setup Automation
-1. Implement curses setup wizard.
-2. Implement Postgres+pgvector local provisioning workflow.
-3. Add config writer with backup and validation.
+## 6. Codebase TODO Backlog (Frontend and Integration)
+These TODOs are mandatory inputs for the new frontend work-order stream.
 
-### Phase 4: Policy and Tooling Hardening
-1. Implement `PolicyManager`.
-2. Implement `ToolRuntime` schema enforcement and retries.
-3. Add telemetry for fallback rates, tool failure rates, and model routing outcomes.
+1. TODO-FE-001: Add run lifecycle API (`create`, `stream`, `cancel`, `resume`, `replay`) in `web_ui.py` and backend service layer.
+2. TODO-FE-002: Define append-only run-event schema and persistence (run events, span events, custom events).
+3. TODO-FE-003: Add run-state snapshot model and checkpointing API.
+4. TODO-FE-004: Implement multi-pane workspace template + route in web UI.
+5. TODO-FE-005: Build trace timeline panel with nested spans and searchable filters.
+6. TODO-FE-006: Build inspector panel for payload/token/latency/retry metadata.
+7. TODO-FE-007: Build state panel with JSON diff-by-step and state rewind entrypoint.
+8. TODO-FE-008: Build artifacts panel (files/tables/images/markdown/diffs).
+9. TODO-FE-009: Implement chat/workflow/batch/compare/replay mode switching.
+10. TODO-FE-010: Define and store agent definitions as versioned objects (JSON schema + changelog).
+11. TODO-FE-011: Define and store prompt definitions as versioned objects with environment overlays.
+12. TODO-FE-012: Define and store tool definitions with schema/auth/risk metadata.
+13. TODO-FE-013: Expose backend policy + tool-runtime settings as editable objects for authorized users.
+14. TODO-FE-014: Implement tool registry UI with schema-driven argument editors.
+15. TODO-FE-015: Add tool sandbox policy controls and human approval queue for mutating tools.
+16. TODO-FE-016: Add isolated tool test harness with fixtures/golden outputs/contract tests.
+17. TODO-FE-017: Add memory strategy controls (trim/compress/episodic/semantic/procedural pointers).
+18. TODO-FE-018: Add RAG ingestion UI with chunking/metadata/versioning/dedupe controls.
+19. TODO-FE-019: Add retrieval-debug panel showing chunks/scores/query rewrite/reranker decisions.
+20. TODO-FE-020: Add citation/provenance-required response mode and evidence visualization.
+21. TODO-FE-021: Add metrics dashboard (latency, token proxy, tool errors, success/failure, eval trends).
+22. TODO-FE-022: Add failure triage clustering (schema mismatch, timeout, retrieval failure, policy violation).
+23. TODO-FE-023: Add prompt playground with model parameter sweep and side-by-side output diff.
+24. TODO-FE-024: Add structured-output validators and repair-loop UX.
+25. TODO-FE-025: Add dataset CRUD/versioning/tag slicing for evaluation.
+26. TODO-FE-026: Add evaluator execution APIs (rule-based + LLM-judge) with batch jobs.
+27. TODO-FE-027: Add annotation queue and reviewer assignment workflow.
+28. TODO-FE-028: Add regression gates to block degraded prompt/tool changes.
+29. TODO-FE-029: Add workspace/project scoping and RBAC enforcement in web routes/APIs.
+30. TODO-FE-030: Add run permalink sharing and trace commenting/review threads.
+31. TODO-FE-031: Add secret management boundaries (never expose plaintext in frontend/API responses).
+32. TODO-FE-032: Add PII detection/redaction hooks for logs/artifacts/exports.
+33. TODO-FE-033: Add audit log stream for run/config/policy/tool changes.
+34. TODO-FE-034: Add Ollama cockpit (list/pull/pin/metadata/runtime knobs/compare harness).
+35. TODO-FE-035: Add fallback chain editor (for schema repair escalation across models).
+36. TODO-FE-036: Evolve Postgres schema to immutable runs + append-only events + snapshots + artifacts + versioned entities.
+37. TODO-FE-037: Add JSONB indexes/search over run messages/tool outputs/tags/timestamps/model/tool IDs.
+38. TODO-FE-038: Introduce capability-manifest endpoints for models/tools/agents/memory/evals/renderers.
+39. TODO-FE-039: Implement frontend schema renderer for form/panel generation from manifests.
+40. TODO-FE-040: Add agent-assisted UI composition hooks (widget proposals, evaluator suggestions, bug report packaging).
 
-## 7. Acceptance Criteria
+## 7. Phased Implementation Plan (Next Cycle)
 
-### 7.1 Automatic Model Fallbacks
-- If primary model is unavailable, response still completes via fallback model.
-- Response metadata records fallback event.
-- No unhandled exception reaches UI handler.
+### Phase FE-0: Contracts and Foundations
+1. Define run/event/state/artifact API contracts.
+2. Define capability manifest schema contract.
+3. Define versioned object contracts (agents/tools/prompts/evals).
 
-### 7.2 Database Fallback
-- If remote DB is unavailable at startup, system can switch to local fallback and continue serving at least core chat operations.
-- Fallback state is visible in logs and operator status output.
+### Phase FE-1: Run + Trace Vertical Slice
+1. Implement run lifecycle API.
+2. Implement append-only event capture.
+3. Implement chat+trace+inspector minimal web UI.
+4. Add cancel and replay-from-start.
 
-### 7.3 Tool Degradation
-- Missing Brave API key does not crash the conversation.
-- Tool failure injects structured fallback context and conversation continues.
+### Phase FE-2: State/Artifacts/Replay
+1. Add snapshot persistence and state panel.
+2. Add artifact persistence and panel renderers.
+3. Add replay-from-step and state-edit replay path.
 
-### 7.4 Curses Walkthrough
-- First-time user can finish setup without manual file editing.
-- Wizard validates required fields before save.
-- Saved config starts at least one interface successfully.
+### Phase FE-3: Builder Surfaces
+1. Agent builder with versioning.
+2. Tool registry builder and schema-driven forms.
+3. Prompt IDE and parameter playground.
 
-### 7.5 Policy Walkthrough
-- Invalid policy/model references are surfaced before runtime execution.
-- Policy updates can be applied through guided flow and persisted correctly.
+### Phase FE-4: Memory/RAG/Eval
+1. RAG ingestion and retrieval debugging.
+2. Dataset/evaluator execution pipeline.
+3. Annotation queue and regression dashboards.
 
-## 8. Testing Strategy
+### Phase FE-5: Governance and Collaboration
+1. Workspaces/projects/RBAC.
+2. Audit logs and review workflows.
+3. Secret and redaction hardening.
+
+### Phase FE-6: Ollama and Ops Cockpit
+1. Model browser/pull/pin controls.
+2. Compare harness and fallback-chain editor.
+3. Run/resource controls and policy guardrails.
+
+## 8. Acceptance Criteria (Frontend Modernization)
+1. A user can create an agent config, run it, see streaming response, inspect trace/state, and replay from a selected step.
+2. Tool calls are visible as first-class trace spans with args/results/errors and retry metadata.
+3. A user can define/edit/version prompt + tool + agent configs from web UI and rerun without restarting services.
+4. Dataset-based evaluation can be launched from web UI and produces persisted, queryable results.
+5. Capability manifests are consumed by frontend schema renderer for at least tools, model params, and evaluator forms.
+6. Workspace RBAC gates editing actions while preserving view-only access for non-editors.
+7. Ollama model metadata and selected model tag are captured on every run record.
+8. Run/event/state/artifact records are persisted in Postgres with query indexes suitable for timeline and search UX.
+
+## 9. Testing Strategy (Frontend + Integration)
 1. Unit tests:
-- model routing decisions
-- DB routing decisions
-- tool runtime validation and fallback behavior
-2. Integration tests:
-- startup with healthy dependencies
-- startup with missing Brave key
-- startup with remote DB down + local DB up
-- startup with missing model in policy
-3. Smoke tests:
-- `telegram_ui.py` start path
-- `web_ui.py` start path
-- `cli_ui.py` login + one prompt round trip
+- manifest schema validation
+- renderer generation from schema
+- run state transition reducers
+- replay checkpoint selection logic
+2. API integration tests:
+- run lifecycle endpoints
+- event append/read APIs
+- cancel/resume/replay behavior
+- RBAC enforcement across endpoints
+3. E2E tests:
+- create config -> run -> trace inspect -> replay
+- tool error path with graceful degradation
+- dataset eval run -> annotation queue -> regression report
+4. Load tests:
+- concurrent run streaming
+- timeline query performance on indexed event tables
 
-## 9. Documentation Sync Policy
-On every major upgrade:
+## 10. Documentation Sync Policy
+On every frontend modernization merge:
 1. Update `docs/master-engineering.md` first.
-2. Update `readme.md` setup sections second.
-3. Update templates (`config.empty.json`, `.env.example`) third.
-4. Run startup smoke checks before merge.
-5. Add an entry to `docs/CHANGELOG_ENGINEERING.md`.
-6. Run and complete `docs/DOC_UPDATE_CHECKLIST.md`.
+2. Update related `workorders/frontend/*.md` status second.
+3. Update `readme.md` operator-facing setup/runtime changes third.
+4. Add a `docs/CHANGELOG_ENGINEERING.md` entry fourth.
+5. Run `docs/DOC_UPDATE_CHECKLIST.md` before merge.
 
-## 10. External References
+## 11. Linked Work Orders
+- Existing reliability track: `workorders/WO-001-...` through `workorders/WO-010-...`
+- Frontend modernization track: `workorders/frontend/WO-FE-001-...` through `workorders/frontend/WO-FE-019-...`
+
+## 12. External References
 - Ollama: https://ollama.com/
 - Ollama GitHub: https://github.com/ollama/ollama
 - PostgreSQL: https://www.postgresql.org/

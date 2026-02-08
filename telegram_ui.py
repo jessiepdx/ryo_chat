@@ -142,6 +142,19 @@ def _password_min_length() -> int:
     return max(8, _runtime_int("security.password_min_length", 12))
 
 
+def _database_unavailable() -> bool:
+    route = config.databaseRoute if isinstance(config.databaseRoute, dict) else {}
+    return str(route.get("status", "")).strip().lower() == "failed_all"
+
+
+def _database_unavailable_message() -> str:
+    return (
+        "Account services are temporarily unavailable because database "
+        "connection/authentication failed. Run setup to fix PostgreSQL "
+        "credentials, then send /start again."
+    )
+
+
 
 ###########################
 # DEFINE COMMAND HANDLERS #
@@ -173,7 +186,26 @@ async def startBot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "roles": ["user"],
                 "register_date": datetime.now()
             }
-            members.addMemberFromTelegram(newAccount)
+            createdMemberID = members.addMemberFromTelegram(newAccount)
+            if createdMemberID is None:
+                logger.error(
+                    "Unable to register %s (user_id: %s) because account persistence failed.",
+                    user.name,
+                    user.id,
+                )
+                await message.reply_text(_database_unavailable_message())
+                return
+
+            # Re-read the account to ensure registration committed.
+            member = members.getMemberByTelegramID(user.id)
+            if member is None:
+                logger.error(
+                    "Registration for %s (user_id: %s) did not persist after create.",
+                    user.name,
+                    user.id,
+                )
+                await message.reply_text(_database_unavailable_message())
+                return
 
         
             # TODO get official community chat links from config and insert into the welcome message
@@ -246,6 +278,8 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             helpMsg = helpMsg + """/info to display your user account info
 -------------------------------
 Send a message to begin chatting with the chatbot."""
+        elif _database_unavailable():
+            helpMsg = helpMsg + _database_unavailable_message() + "\n"
         else:
             helpMsg = helpMsg + "Use the /start command to get started.\n"
     elif chat.type == "group" or chat.type == "supergroup":
@@ -1985,7 +2019,10 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if member is None:
         logger.info(f"Unregistered user {user.name} (user_id: {user.id}) messaged the bot in a private message.")
         try:
-            await message.reply_text("Use the /start command to begin chatting with the chatbot.")
+            if _database_unavailable():
+                await message.reply_text(_database_unavailable_message())
+            else:
+                await message.reply_text("Use the /start command to begin chatting with the chatbot.")
         except Exception as err:
             logger.error(f"The following error occurred while sending a telegram message:\n{err}")
         finally:

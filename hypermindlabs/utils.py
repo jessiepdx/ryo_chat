@@ -323,9 +323,10 @@ class MemberManager:
             
             return response
 
-    def addMemberFromTelegram(self, memberData: dict):
+    def addMemberFromTelegram(self, memberData: dict) -> int | None:
         logger.info(f"Adding a new member from telegram.")
         connection = None
+        memberID = None
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
@@ -338,7 +339,10 @@ class MemberManager:
             
             cursor.execute(insertMember_sql, memberData)
             result = cursor.fetchone()
-            memberID = result.get("member_id")
+            memberID = result.get("member_id") if result else None
+            if memberID is None:
+                cursor.close()
+                return None
 
             memberTelegramData = {
                 "member_id": memberID,
@@ -361,6 +365,8 @@ class MemberManager:
             if (connection):
                 connection.close()
                 logger.debug(f"PostgreSQL connection is closed.")
+        
+        return memberID
 
     def registerWebMember(
         self,
