@@ -318,9 +318,11 @@ def collect_required_models(config_data: dict[str, Any]) -> list[str]:
             if cleaned and cleaned not in output:
                 output.append(cleaned)
 
+    # Use only models explicitly configured in config.json.
+    # Do not force-pull hardcoded defaults (for example multimodal) if the
+    # operator selected different models during setup.
     for key in INFERENCE_KEYS:
         add(current_model(config_data, key))
-        add(DEFAULT_MODELS.get(key))
 
     return output
 

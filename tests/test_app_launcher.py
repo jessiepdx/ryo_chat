@@ -70,6 +70,23 @@ class TestAppLauncher(unittest.TestCase):
         required = app.collect_required_models(config_data)
         self.assertIn("llama3.2:latest", required)
         self.assertEqual(required.count("llama3.2:latest"), 1)
+        self.assertNotIn("llama3.2-vision:latest", required)
+
+    def test_collect_required_models_uses_configured_values_only(self):
+        config_data = {
+            "inference": {
+                "embedding": {"model": "nomic-embed-text:latest"},
+                "generate": {"model": "qwen2.5:latest"},
+                "chat": {"model": "qwen2.5:latest"},
+                "tool": {"model": "qwen2.5:latest"},
+                "multimodal": {"model": "llava:latest"},
+            }
+        }
+        required = app.collect_required_models(config_data)
+        self.assertEqual(
+            required,
+            ["nomic-embed-text:latest", "qwen2.5:latest", "llava:latest"],
+        )
 
     def test_apply_default_text_model_sets_chat_generate_tool(self):
         source = {
