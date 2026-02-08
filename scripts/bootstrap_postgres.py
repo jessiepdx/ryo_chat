@@ -286,6 +286,12 @@ def _verify_vector_support(conninfo: str, retries: int, retry_delay: float) -> N
                 raise RuntimeError("vector probe insert/select check failed.")
 
 
+def _wait_for_target_accepting_connections(target: BootstrapTarget, retries: int, retry_delay: float) -> None:
+    maintenance_conn = _conninfo(target, db_name=target.maintenance_db)
+    with _connect_with_retry(maintenance_conn, retries=retries, retry_delay=retry_delay):
+        return
+
+
 def _required_fields_present(mapping: dict, required_keys: Iterable[str]) -> bool:
     for key in required_keys:
         value = mapping.get(key)
@@ -391,6 +397,7 @@ def _resolve_docker_host_port(
     scan_limit: int,
     retries: int,
     retry_delay: float,
+    reserved_ports: set[int] | None = None,
 ) -> tuple[str, bool, str]:
     try:
         desired_port = int(str(target.port))
@@ -402,8 +409,11 @@ def _resolve_docker_host_port(
 
     max_scan = max(0, int(scan_limit))
     upper_bound = desired_port + max_scan
+    reserved = reserved_ports if isinstance(reserved_ports, set) else set()
     last_identity_error = ""
     for port in range(desired_port, upper_bound + 1):
+        if port in reserved:
+            continue
         if _can_bind_host_port(target.host, port):
             return str(port), False, "selected free local port"
 
@@ -450,6 +460,7 @@ def _ensure_docker_container(
     scan_limit: int,
     retries: int,
     retry_delay: float,
+    reserved_ports: set[int] | None = None,
 ) -> bool:
     if shutil.which("docker") is None:
         raise RuntimeError("`docker` is not available on PATH.")
@@ -459,6 +470,7 @@ def _ensure_docker_container(
         scan_limit=scan_limit,
         retries=retries,
         retry_delay=retry_delay,
+        reserved_ports=reserved_ports,
     )
     if selected_port != str(target.port):
         print(f"[{target.label}] requested port {target.port} unavailable; switched to {selected_port}")
@@ -478,6 +490,19 @@ def _ensure_docker_container(
         exists = False
         running = False
 
+    # Existing containers without published host ports cannot be reused for app startup.
+    if exists:
+        mapped_port = _docker_container_host_port(container_name)
+        if not mapped_port:
+            print(
+                f"[{target.label}] existing container '{container_name}' has no published host port; recreating."
+            )
+            rm = _docker_exec(["docker", "rm", "-f", container_name])
+            if rm.returncode != 0:
+                raise RuntimeError(rm.stderr.strip() or f"failed to remove container {container_name}")
+            exists = False
+            running = False
+
     if exists and not running:
         start = _docker_exec(["docker", "start", container_name])
         if start.returncode != 0:
@@ -485,6 +510,7 @@ def _ensure_docker_container(
         mapped_port = _docker_container_host_port(container_name)
         if mapped_port:
             target.port = mapped_port
+        _wait_for_target_accepting_connections(target, retries=max(1, retries), retry_delay=retry_delay)
         print(f"Started existing docker container: {container_name} (host port: {target.port})")
         return True
 
@@ -492,6 +518,7 @@ def _ensure_docker_container(
         mapped_port = _docker_container_host_port(container_name)
         if mapped_port:
             target.port = mapped_port
+        _wait_for_target_accepting_connections(target, retries=max(1, retries), retry_delay=retry_delay)
         print(f"Docker container already running: {container_name} (host port: {target.port})")
         return True
 
@@ -520,6 +547,7 @@ def _ensure_docker_container(
     mapped_port = _docker_container_host_port(container_name)
     if mapped_port:
         target.port = mapped_port
+    _wait_for_target_accepting_connections(target, retries=max(1, retries), retry_delay=retry_delay)
     print(f"Created docker container: {container_name} ({image}) on host port {target.port}")
     return True
 
@@ -715,6 +743,7 @@ def main() -> int:
             return 2
 
     exit_code = 0
+    reserved_ports: set[int] = set()
     for target in targets:
         if args.docker:
             try:
@@ -727,7 +756,12 @@ def main() -> int:
                     scan_limit=args.port_scan_limit,
                     retries=max(0, args.connect_retries),
                     retry_delay=max(0.0, float(args.retry_delay)),
+                    reserved_ports=reserved_ports,
                 )
+                try:
+                    reserved_ports.add(int(str(target.port)))
+                except ValueError:
+                    pass
                 _persist_target_port_in_config(
                     config_path,
                     label=target.label,

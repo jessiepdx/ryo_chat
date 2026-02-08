@@ -116,10 +116,10 @@ def run_postgres_bootstrap(
     target: str,
     use_docker: bool = False,
 ) -> tuple[bool, str]:
-    bootstrap_script = Path(__file__).resolve().parent / "bootstrap_postgres.py"
     command = [
         sys.executable,
-        str(bootstrap_script),
+        "-m",
+        "scripts.bootstrap_postgres",
         "--config",
         str(config_path),
         "--target",

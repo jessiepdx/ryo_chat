@@ -268,7 +268,7 @@ def should_run_setup(state: dict[str, Any], artifacts: dict[str, bool], config_d
 
 
 def run_setup_wizard(non_interactive: bool) -> bool:
-    command = [sys.executable, "scripts/setup_wizard.py"]
+    command = [sys.executable, "-m", "scripts.setup_wizard"]
     if non_interactive:
         command.append("--non-interactive")
     print(f"[bootstrap] Running setup wizard: {' '.join(command)}")
@@ -276,7 +276,7 @@ def run_setup_wizard(non_interactive: bool) -> bool:
     if result.returncode != 0:
         print(
             "[bootstrap] Setup wizard did not complete successfully. "
-            "You can rerun later with: python3 scripts/setup_wizard.py"
+            "You can rerun later with: python3 -m scripts.setup_wizard"
         )
         return False
     return True
@@ -329,6 +329,11 @@ def ensure_database_migrations(runtime_settings: dict[str, Any]) -> None:
         print(
             "[db] Vector migrations partial/unavailable "
             f"(applied={len(vector_applied)}, failed={len(vector_failed)})."
+        )
+    elif vector_applied:
+        print(
+            "[db] Vector migrations ensured "
+            f"(route={route_status}/{active_target}, applied={len(vector_applied)})."
         )
 
 
