@@ -2850,7 +2850,7 @@ def monitor_dashboard(
         print_watchdog_status(watchdog)
         print("\nDashboard commands:")
         print("  q                 Back to launcher menu")
-        print("  a                 Start all routes")
+        print("  a                 Start auto-managed routes")
         print("  o                 Stop all routes")
         print("  t <route|number>  Toggle route")
         print("  l <route|number>  Tail route log")
@@ -2876,7 +2876,7 @@ def monitor_dashboard(
             _clear_screen()
             return
         if action == "a":
-            watchdog.start_all()
+            watchdog.start_all(include_manual=False)
             continue
         if action == "o":
             watchdog.stop_all()
@@ -2908,7 +2908,7 @@ def route_menu(
         print_watchdog_status(watchdog)
         print("\nActions:")
         print("  1. Toggle a route")
-        print("  2. Start all routes")
+        print("  2. Start auto-managed routes")
         print("  3. Stop all routes")
         print("  4. Show route log paths")
         print("  5. Open live monitor dashboard")
@@ -2923,9 +2923,9 @@ def route_menu(
             continue
 
         if choice == "2":
-            watchdog.start_all()
-            print("[launcher] Start signal sent to all routes.")
-            print("[launcher] Note: 'cli' and 'x' are manual routes and may exit quickly by design.")
+            watchdog.start_all(include_manual=False)
+            print("[launcher] Start signal sent to auto-managed routes (web, telegram).")
+            print("[launcher] Use route open action for interactive/manual routes (cli, x).")
             continue
 
         if choice == "3":
@@ -3910,7 +3910,7 @@ def watchdog_dashboard_curses(
                 stdscr,
                 7,
                 0,
-                "Controls: Up/Down select | Enter config | p policy editor | r open interface | Space toggle | s start | x stop | a/o all | l logs | q quit",
+                "Controls: Up/Down select | Enter config | p policy editor | r open interface | Space toggle | s start | x stop | a/o auto-all | l logs | q quit",
             )
             _safe_addstr(stdscr, 8, 0, f"Status: {last_status_text}")
             _safe_addstr(stdscr, 10, 0, "Route      Desired Running PID      User      Uptime   Restarts LastExit Policy  State")
@@ -4025,8 +4025,8 @@ def watchdog_dashboard_curses(
                     last_status_text = f"stopped route {route_key}"
                 continue
             if key == ord("a"):
-                watchdog.start_all()
-                last_status_text = "start-all signal sent"
+                watchdog.start_all(include_manual=False)
+                last_status_text = "start-all sent (auto-managed routes only)"
                 continue
             if key == ord("o"):
                 watchdog.stop_all()
