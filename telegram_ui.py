@@ -1926,12 +1926,14 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Check user usage
     memberUsage = usage.getUsageForMember(memberID)
+    memberUsage = memberUsage if isinstance(memberUsage, list) else list()
     rateLimits = communityScore.getRateLimits(memberID, "community")
 
     if (not any(role in rolesAvailable for role in allowedRoles)):
         # User does not have permission for non rate limited chat
         # Check if user has exceeded hourly rate
-        if len(memberUsage) >= rateLimits["message"]:
+        messageLimit = rateLimits.get("message", 0)
+        if messageLimit > 0 and len(memberUsage) >= messageLimit:
             logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly message rate in {community['chat_title']} group chat.")
             try:
                 await message.reply_text(text=f"You have reached your hourly rate limit.")
@@ -2037,19 +2039,27 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Check user usage
     memberUsage = usage.getUsageForMember(memberID)
+    memberUsage = memberUsage if isinstance(memberUsage, list) else list()
     rateLimits = communityScore.getRateLimits(memberID, chat.type)
+    memberCommunityScore = member.get("community_score", 0) or 0
 
     if (not any(role in rolesAvailable for role in allowedRoles)):
+        if memberCommunityScore < minimumCommunityScore:
+            try:
+                logger.info(f"User {user.name} (user_id: {user.id}) does not meet the minimum community score to use private chat with the chatbot. Community score:  {memberCommunityScore}/{minimumCommunityScore}")
+                await message.reply_text(f"You need a minimum community score of {minimumCommunityScore} to use the private chat features. Please join one of our community chats to build your community score.")
+            except Exception as err:
+                logger.error(f"The following error occurred while sending a telegram message:\n{err}")
+            finally:
+                return
+
         # User does not have permission for non rate limited chat
         # Check if user has exceeded hourly rate
-        if len(memberUsage) >= rateLimits["message"]:
+        messageLimit = rateLimits.get("message", 0)
+        if messageLimit > 0 and len(memberUsage) >= messageLimit:
             try:
-                if member["community_score"] < minimumCommunityScore:
-                    logger.info(f"User {user.name} (user_id: {user.id}) does not meet the minimum community score to use private chat with the chatbot. Community score:  {member['community_score']}/{minimumCommunityScore}")
-                    await message.reply_text(f"You need a minimum community score of {minimumCommunityScore} to use the private chat features. Please join one of our community chats to build your community score.")
-                else:
-                    logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly message rate in private chat.")
-                    await message.reply_text(text=f"You have reached your hourly rate limit.")
+                logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly message rate in private chat.")
+                await message.reply_text(text=f"You have reached your hourly rate limit.")
             except Exception as err:
                 logger.error(f"The following error occurred while sending a telegram message:\n{err}")
             finally:
@@ -2180,6 +2190,7 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # User does not have permission for non rate limited chat
         # Check if user has exceeded hourly rate
         memberUsage = usage.getUsageForMember(memberID)
+        memberUsage = memberUsage if isinstance(memberUsage, list) else list()
         if len(memberUsage) >= rateLimits["image"]:
             try:
                 if member["community_score"] < minimumCommunityScore:
@@ -2376,8 +2387,10 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # User does not have permission for non rate limited chat
         # Check if user has exceeded hourly rate
         memberUsage = usage.getUsageForMember(memberID)
-        rateLimits = communityScore.getRateLimits(member, "community")
-        if len(memberUsage) >= rateLimits["message"]:
+        memberUsage = memberUsage if isinstance(memberUsage, list) else list()
+        rateLimits = communityScore.getRateLimits(memberID, "community")
+        messageLimit = rateLimits.get("message", 0)
+        if messageLimit > 0 and len(memberUsage) >= messageLimit:
             logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly message rate in {community['chat_title']} group chat.")
             try:
                 await message.reply_text(text=f"You have reached your hourly rate limit.")

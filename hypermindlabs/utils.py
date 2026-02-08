@@ -763,18 +763,33 @@ class ChatHistoryManager:
                     message_timestamp TIMESTAMP
                 );"""
                 cursor.execute(memberHistory_sql)
-
-                createHistorySQL = f"""CREATE TABLE IF NOT EXISTS chat_history_embeddings (
-                    embedding_id SERIAL PRIMARY KEY,
-                    history_id INT NOT NULL,
-                    embeddings vector({vectorDimensions}),
-                    CONSTRAINT message_link
-                        FOREIGN KEY(history_id)
-                        REFERENCES chat_history(history_id)
-                        ON DELETE CASCADE
-                );"""
-                cursor.execute(createHistorySQL)
                 connection.commit()
+
+                # pgvector can be unavailable in some local environments. Keep
+                # base chat history available even if embeddings setup fails.
+                vectorDimensions = max(1, ConfigManager().runtimeInt("vectors.embedding_dimensions", 768))
+                try:
+                    cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                    connection.commit()
+                except (Exception, psycopg.DatabaseError) as error:
+                    connection.rollback()
+                    logger.warning(f"Unable to ensure pgvector extension. Continuing without vector features:\n{error}")
+
+                try:
+                    createHistorySQL = f"""CREATE TABLE IF NOT EXISTS chat_history_embeddings (
+                        embedding_id SERIAL PRIMARY KEY,
+                        history_id INT NOT NULL,
+                        embeddings vector({vectorDimensions}),
+                        CONSTRAINT message_link
+                            FOREIGN KEY(history_id)
+                            REFERENCES chat_history(history_id)
+                            ON DELETE CASCADE
+                    );"""
+                    cursor.execute(createHistorySQL)
+                    connection.commit()
+                except (Exception, psycopg.DatabaseError) as error:
+                    connection.rollback()
+                    logger.warning(f"Unable to create chat_history_embeddings table. Continuing without embeddings persistence:\n{error}")
 
                 # close the communication with the PostgreSQL
                 cursor.close()
@@ -811,14 +826,20 @@ class ChatHistoryManager:
             cursor.execute(insertHistory_sql, (memberID, communityID, chatHostID, topicID, chatType, platform, messageID, messageText, timestamp))
             result = cursor.fetchone()
             historyID = result.get("history_id")
-            
-            insertEmbeddings_sql = """INSERT INTO chat_history_embeddings (history_id, embeddings)
-            VALUES (%s, %s);"""
-            cursor.execute(insertEmbeddings_sql, (historyID, embedding))
-
             response = historyID
 
             connection.commit()
+
+            if embedding is not None:
+                try:
+                    insertEmbeddings_sql = """INSERT INTO chat_history_embeddings (history_id, embeddings)
+                    VALUES (%s, %s);"""
+                    cursor.execute(insertEmbeddings_sql, (historyID, embedding))
+                    connection.commit()
+                except (Exception, psycopg.DatabaseError) as error:
+                    connection.rollback()
+                    logger.warning(f"Unable to persist chat embeddings for history id {historyID}:\n{error}")
+
             # close the communication with the PostgreSQL
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
@@ -1535,15 +1556,27 @@ class CommunityScoreManager:
 
     def getRateLimits(self, memberID: int, chatType: str) -> int:
         logger.info(f"Get message rate for member id:  {memberID}.")
-        member = MemberManager().getMemberByID(memberID)
+        if isinstance(memberID, dict):
+            member = memberID
+        else:
+            member = MemberManager().getMemberByID(memberID)
 
-        memberScore = member.get("community_score")
+        if member is None:
+            logger.warning(f"Unable to resolve member for rate-limit lookup: {memberID}")
+            return {
+                "message": 0,
+                "image": 0
+            }
+
+        memberScore = member.get("community_score", 0) or 0
         rateLimits = {
             "message": 0,
             "image": 0
         }
         for rule in self.communityScoreRules:
-            if memberScore >= rule[chatType]["min"]:
+            scoreRule = rule.get(chatType) if isinstance(rule.get(chatType), dict) else rule.get("community", {})
+            minScore = scoreRule.get("min", 0)
+            if memberScore >= minScore:
                 rateLimits["message"] = rule["message_per_hour"]
                 rateLimits["image"] = rule["image_per_hour"]
             else:
@@ -2342,7 +2375,9 @@ class UsageManager:
         logger.info(f"Get a list of usage data for user.")
 
         connection = None
-        response = None
+        response = list()
+        if MemberID is None:
+            return response
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
