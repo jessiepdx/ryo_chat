@@ -89,6 +89,8 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "recent_user_messages": 6,
         "deweight_history_search_on_switch": True,
         "history_window_hours_on_switch": 2,
+        "trim_temporal_history_on_small_talk": True,
+        "small_talk_history_limit": 2,
     },
     "security": {
         "password_min_length": 12,
@@ -229,6 +231,8 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "topic_shift.recent_user_messages": (("RYO_TOPIC_SHIFT_RECENT_USER_MESSAGES",), "int"),
     "topic_shift.deweight_history_search_on_switch": (("RYO_TOPIC_SHIFT_DEWEIGHT_HISTORY_ON_SWITCH",), "bool"),
     "topic_shift.history_window_hours_on_switch": (("RYO_TOPIC_SHIFT_HISTORY_WINDOW_HOURS_ON_SWITCH",), "int"),
+    "topic_shift.trim_temporal_history_on_small_talk": (("RYO_TOPIC_SHIFT_TRIM_TEMPORAL_ON_SMALL_TALK",), "bool"),
+    "topic_shift.small_talk_history_limit": (("RYO_TOPIC_SHIFT_SMALL_TALK_HISTORY_LIMIT",), "int"),
     "security.password_min_length": (("RYO_PASSWORD_MIN_LENGTH",), "int"),
     "vectors.embedding_dimensions": (("RYO_VECTOR_DIMENSIONS",), "int"),
     "retrieval.conversation_short_history_limit": (("RYO_RETRIEVAL_SHORT_HISTORY_LIMIT",), "int"),

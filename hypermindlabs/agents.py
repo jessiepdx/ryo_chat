@@ -306,6 +306,72 @@ def _coerce_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _clip_text(value: Any, max_chars: int = 140) -> str:
+    text = _as_text(value)
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 3:
+        return text[:max_chars]
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _known_context_stage_preview(tool_results: dict[str, Any] | None) -> dict[str, Any]:
+    payload = _coerce_dict(tool_results)
+    temporal = _coerce_dict(payload.get("temporal_context"))
+    timeline = _coerce_dict(temporal.get("timeline"))
+    recent_raw = timeline.get("recent")
+    recent = recent_raw if isinstance(recent_raw, list) else []
+
+    latest_user_excerpt = ""
+    latest_assistant_excerpt = ""
+    for entry in reversed(recent):
+        if not isinstance(entry, dict):
+            continue
+        role = _as_text(entry.get("role")).lower()
+        excerpt = _clip_text(entry.get("excerpt"), 120)
+        if not excerpt:
+            continue
+        if not latest_user_excerpt and role == "user":
+            latest_user_excerpt = excerpt
+        elif not latest_assistant_excerpt and role == "assistant":
+            latest_assistant_excerpt = excerpt
+        if latest_user_excerpt and latest_assistant_excerpt:
+            break
+
+    preview = {
+        "user_interface": payload.get("user_interface"),
+        "member_first_name": payload.get("member_first_name"),
+        "telegram_username": payload.get("telegram_username"),
+        "chat_type": payload.get("chat_type"),
+        "timestamp_utc": payload.get("timestamp_utc"),
+        "temporal_context": {
+            "clock": _coerce_dict(temporal.get("clock")),
+            "inbound": _coerce_dict(temporal.get("inbound")),
+            "timeline": {
+                "chat_type": timeline.get("chat_type"),
+                "chat_host_id": timeline.get("chat_host_id"),
+                "topic_id": timeline.get("topic_id"),
+                "recent_count": len(recent),
+                "latest_user_excerpt": latest_user_excerpt,
+                "latest_assistant_excerpt": latest_assistant_excerpt,
+                "history_trimmed_for_small_talk": bool(timeline.get("history_trimmed_for_small_talk")),
+            },
+        },
+        "topic_transition": _coerce_dict(payload.get("topic_transition")),
+        "memory_circuit": {
+            "strategy": _coerce_dict(payload.get("memory_circuit")).get("strategy"),
+            "active_topic": _coerce_dict(payload.get("memory_circuit")).get("active_topic"),
+            "history_search_allowed": _coerce_dict(payload.get("memory_circuit")).get("history_search_allowed"),
+            "history_recall_requested": _coerce_dict(payload.get("memory_circuit")).get("history_recall_requested"),
+            "small_talk_turn": _coerce_dict(payload.get("memory_circuit")).get("small_talk_turn"),
+            "routing_note": _coerce_dict(payload.get("memory_circuit")).get("routing_note"),
+        },
+    }
+    return preview
+
+
 def _history_recall_requested(text: str) -> bool:
     lowered = _as_text(text).lower()
     if not lowered:
@@ -406,6 +472,7 @@ def _detect_topic_transition(
     current_text = _as_text(current_message)
     previous_text = _last_user_message_text(history_messages)
     history_recall = _history_recall_requested(current_text)
+    small_talk_turn = _is_small_talk_message(current_text)
 
     current_tokens = set(_tokenize_topic_text(current_text))
     previous_tokens = set(_tokenize_topic_text(previous_text))
@@ -422,7 +489,7 @@ def _detect_topic_transition(
         len(current_tokens) >= min_token_count
         and len(previous_tokens) >= min_token_count
         and jaccard_similarity <= jaccard_threshold
-        and not _is_small_talk_message(current_text)
+        and not small_talk_turn
     )
 
     from_topic = _topic_label(previous_text, max_terms=keyword_terms, fallback="general")
@@ -437,6 +504,10 @@ def _detect_topic_transition(
     confidence = "low"
     if history_recall:
         reason = "history_recall_requested"
+    elif small_talk_turn:
+        to_topic = "general"
+        reason = "small_talk_neutral"
+        confidence = "high"
     elif not previous_text:
         reason = "no_prior_user_message"
     elif explicit_switch and to_topic != from_topic:
@@ -455,7 +526,9 @@ def _detect_topic_transition(
         )
     else:
         summary = (
-            f"Continue focus on topic '{to_topic}'"
+            "Latest message is a short social turn; keep context lightweight and avoid reviving stale topics."
+            if reason == "small_talk_neutral"
+            else f"Continue focus on topic '{to_topic}'"
             if to_topic != "general"
             else "No strong topic anchor detected in the latest user message."
         )
@@ -469,6 +542,7 @@ def _detect_topic_transition(
         "confidence": confidence,
         "jaccard_similarity": round(jaccard_similarity, 4),
         "history_recall_requested": history_recall,
+        "small_talk_turn": small_talk_turn,
     }
 
 
@@ -511,10 +585,16 @@ def _build_memory_circuit(
 
     switched = _as_bool(transition.get("switched"), False)
     history_recall_requested = _as_bool(transition.get("history_recall_requested"), False) or _history_recall_requested(current_message)
+    small_talk_turn = _as_bool(transition.get("small_talk_turn"), False) or _is_small_talk_message(current_message)
     history_search_allowed = bool(history_recall_requested or not (switched and deweight_history_on_switch))
+    if small_talk_turn and not history_recall_requested:
+        active_topic = "general"
+        history_search_allowed = False
 
     routing_note = (
-        f"Favor new topic '{active_topic}' and suppress semantic history search unless explicitly requested."
+        "Short social turn detected; skip heavy history recall unless user explicitly asks for it."
+        if small_talk_turn and not history_recall_requested
+        else f"Favor new topic '{active_topic}' and suppress semantic history search unless explicitly requested."
         if switched and not history_search_allowed
         else f"Memory can include recent context for topic '{active_topic}'."
     )
@@ -527,6 +607,7 @@ def _build_memory_circuit(
         "topic_transition": transition,
         "history_recall_requested": history_recall_requested,
         "history_search_allowed": history_search_allowed,
+        "small_talk_turn": small_talk_turn,
         "routing_note": routing_note,
     }
 
@@ -831,6 +912,20 @@ class ConversationOrchestrator:
                 "clock": {"now_utc": utc_now_iso()},
             }
         )
+        if (
+            _runtime_bool("topic_shift.trim_temporal_history_on_small_talk", True)
+            and _is_small_talk_message(self._message)
+            and not _history_recall_requested(self._message)
+        ):
+            smallTalkHistoryLimit = max(0, _runtime_int("topic_shift.small_talk_history_limit", 2))
+            temporalMap = _coerce_dict(temporalContext)
+            timelineMap = _coerce_dict(temporalMap.get("timeline"))
+            recentEntries = timelineMap.get("recent")
+            if isinstance(recentEntries, list):
+                timelineMap["recent"] = recentEntries[-smallTalkHistoryLimit:] if smallTalkHistoryLimit > 0 else []
+                timelineMap["history_trimmed_for_small_talk"] = True
+                temporalMap["timeline"] = timelineMap
+                temporalContext = temporalMap
         topicTransition = _detect_topic_transition(
             current_message=self._message,
             history_messages=self._shortHistory,
@@ -865,7 +960,7 @@ class ConversationOrchestrator:
         await self._emit_stage(
             "context.built",
             "Known context assembled for downstream stages.",
-            json=knownContext.get("tool_results"),
+            json=_known_context_stage_preview(knownContext.get("tool_results")),
         )
         self._messages.append(Message(role="tool", content=json.dumps(knownContext)))
         analysisMessages = list(self._messages)
