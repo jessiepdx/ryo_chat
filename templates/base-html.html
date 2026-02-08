@@ -366,10 +366,11 @@
                             <input id="signup-first-name" placeholder="first name (optional)" type="text" name="first_name" />
                             <input id="signup-last-name" placeholder="last name (optional)" type="text" name="last_name" />
                             <input id="signup-username" placeholder="username" type="text" name="username" autocomplete="username" />
-                            <input id="signup-password" placeholder="password" type="password" name="userpass" autocomplete="new-password" />
-                            <input id="signup-password-confirm" placeholder="confirm password" type="password" name="userpass-confirm" autocomplete="new-password" />
+                            <input id="signup-password" placeholder="password" type="password" name="userpass" autocomplete="new-password" minlength="{{ passwordPolicyMinLength }}" title="{{ passwordPolicyHint }}" />
+                            <input id="signup-password-confirm" placeholder="confirm password" type="password" name="userpass-confirm" autocomplete="new-password" minlength="{{ passwordPolicyMinLength }}" title="{{ passwordPolicyHint }}" />
                             <input id="submit-signup" name="signup-btn" type="submit" value="Create Account" />
                         </form>
+                        <div class="auth-policy">{{ passwordPolicyHint }}</div>
 
                         {% if authMessage %}
                         <div class="auth-message {{ authMessageKind }}">{{ authMessage }}</div>

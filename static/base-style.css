@@ -311,6 +311,17 @@ select {
     background-color: var(--accent-midway);
 }
 
+.auth-policy {
+    margin-top: var(--micro-rem);
+    margin-bottom: var(--micro-rem);
+    padding: var(--micro-rem);
+    border-radius: calc(0.5 * var(--border-radius));
+    border: var(--border-width) dashed var(--accent-midway);
+    color: var(--accent-midway);
+    font-size: calc(var(--micro-rem) * 0.92);
+    line-height: 1.35;
+}
+
 #logo {
     height: 100%;
     display: flex;

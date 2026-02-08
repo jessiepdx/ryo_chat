@@ -196,6 +196,30 @@ def _username_is_valid(value: str) -> bool:
     return USERNAME_PATTERN.fullmatch(value) is not None
 
 
+def _password_min_length() -> int:
+    return max(8, _runtime_int("security.password_min_length", 12))
+
+
+def _password_policy_hint() -> str:
+    min_length = _password_min_length()
+    return (
+        "Password policy: "
+        f"at least {min_length} characters, including uppercase, lowercase, a number, and a symbol."
+    )
+
+
+def _password_policy_error(password: str) -> str | None:
+    min_length = _password_min_length()
+    pattern = re.compile(
+        r"(?=.*\d)(?=.*[a-z])(?=.*[A-Z])(?=.*[-+_!@#$%^&*.,?]).{"
+        + str(min_length)
+        + r",}"
+    )
+    if pattern.search(str(password or "")) is None:
+        return _password_policy_hint()
+    return None
+
+
 def _api_auth_error(message: str = "Authentication required.") -> tuple[Response, int]:
     return jsonify({"status": "error", "message": message}), 401
 
@@ -265,7 +289,13 @@ def loadUser():
         g.menuData = None
     else:
         member = members.getMemberByID(session["member_id"])
-        print(member)
+        if member is None:
+            logger.warning("Session member_id=%s not found. Clearing stale auth session.", session.get("member_id"))
+            session.pop("member_id", None)
+            g.memberData = None
+            g.menuData = None
+            return
+
         g.memberData = member
         # Create the menu data based on user roles
         memberRoles = member.get("roles")
@@ -280,6 +310,8 @@ def baseTemplateData():
         "menuData": g.menuData,
         "authMessage": g.authMessage,
         "authMessageKind": g.authMessageKind,
+        "passwordPolicyHint": _password_policy_hint(),
+        "passwordPolicyMinLength": _password_min_length(),
     }
     return baseTemplateContext
 
@@ -513,6 +545,10 @@ def signup():
         return redirect(url_for("index"))
     if password != passwordConfirm:
         _set_auth_message("Password confirmation does not match.", kind="error")
+        return redirect(url_for("index"))
+    passwordError = _password_policy_error(password)
+    if passwordError is not None:
+        _set_auth_message(passwordError, kind="error")
         return redirect(url_for("index"))
 
     member, errorMessage = members.registerWebMember(
