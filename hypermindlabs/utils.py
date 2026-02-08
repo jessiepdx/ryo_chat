@@ -1063,27 +1063,34 @@ class ChatHistoryManager:
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
             
-            beginQuery_sql = """SELECT history_id, member_id, message_id, message_text, message_timestamp
+            baseQuery_sql = """SELECT history_id, member_id, message_id, message_text, message_timestamp
                 FROM chat_history
                 WHERE chat_host_id = %s
                 AND chat_type = %s
                 AND platform = %s
                 AND message_timestamp > %s"""
-            
-            endQuery_sql = " ORDER BY message_timestamp"
 
             valueArray = [chatHostID, chatType, platform, timePeriod]
 
             if topicID:
-                beginQuery_sql = beginQuery_sql + " AND topic_id = %s"
+                baseQuery_sql = baseQuery_sql + " AND topic_id = %s"
                 valueArray.append(topicID)
             else:
-                beginQuery_sql = beginQuery_sql + " AND topic_id IS NULL"
-            if int(limit) > 0:
-                endQuery_sql += " LIMIT %s"
-                valueArray.append(int(limit))
+                baseQuery_sql = baseQuery_sql + " AND topic_id IS NULL"
 
-            historyQuery_sql = beginQuery_sql + endQuery_sql + ";"
+            if int(limit) > 0:
+                # Fetch the most recent N records, then reorder chronologically for downstream prompt assembly.
+                historyQuery_sql = (
+                    "SELECT history_id, member_id, message_id, message_text, message_timestamp "
+                    "FROM ("
+                    + baseQuery_sql
+                    + " ORDER BY message_timestamp DESC LIMIT %s"
+                    + ") AS recent_history "
+                    "ORDER BY message_timestamp;"
+                )
+                valueArray.append(int(limit))
+            else:
+                historyQuery_sql = baseQuery_sql + " ORDER BY message_timestamp;"
             cursor.execute(historyQuery_sql, valueArray)
 
             results = cursor.fetchall()
@@ -1121,7 +1128,7 @@ class ChatHistoryManager:
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
             
-            beginQuery_sql = """SELECT ch.history_id, ch.message_id, ch.message_text, ch.message_timestamp, mem.member_id, mem.first_name, mem.last_name
+            baseQuery_sql = """SELECT ch.history_id, ch.message_id, ch.message_text, ch.message_timestamp, mem.member_id, mem.first_name, mem.last_name
                 FROM chat_history AS ch
                 LEFT JOIN member_data AS mem
                 ON ch.member_id = mem.member_id
@@ -1129,21 +1136,27 @@ class ChatHistoryManager:
                 AND chat_type = %s
                 AND platform = %s
                 AND message_timestamp > %s"""
-            
-            endQuery_sql = " ORDER BY message_timestamp"
 
             valueArray = [chatHostID, chatType, platform, timePeriod]
 
             if topicID:
-                beginQuery_sql = beginQuery_sql + " AND topic_id = %s"
+                baseQuery_sql = baseQuery_sql + " AND topic_id = %s"
                 valueArray.append(topicID)
             else:
-                beginQuery_sql = beginQuery_sql + " AND topic_id IS NULL"
-            if int(limit) > 0:
-                endQuery_sql += " LIMIT %s"
-                valueArray.append(int(limit))
+                baseQuery_sql = baseQuery_sql + " AND topic_id IS NULL"
 
-            historyQuery_sql = beginQuery_sql + endQuery_sql + ";"
+            if int(limit) > 0:
+                historyQuery_sql = (
+                    "SELECT history_id, message_id, message_text, message_timestamp, member_id, first_name, last_name "
+                    "FROM ("
+                    + baseQuery_sql
+                    + " ORDER BY ch.message_timestamp DESC LIMIT %s"
+                    + ") AS recent_history "
+                    "ORDER BY message_timestamp;"
+                )
+                valueArray.append(int(limit))
+            else:
+                historyQuery_sql = baseQuery_sql + " ORDER BY ch.message_timestamp;"
             cursor.execute(historyQuery_sql, valueArray)
 
             results = cursor.fetchall()
@@ -1221,11 +1234,24 @@ class ChatHistoryManager:
             
             return response
 
-    def searchChatHistory(self, text: str, limit: int | None = None) -> list:
+    def searchChatHistory(
+        self,
+        text: str,
+        limit: int | None = None,
+        chatHostID: int | None = None,
+        chatType: str | None = None,
+        platform: str | None = None,
+        topicID: int | None = None,
+        scopeTopic: bool = False,
+        timeInHours: int | None = None,
+    ) -> list:
         logger.info(f"Searching chat history records.")
         embedding = getEmbeddings(text)
         if limit is None:
             limit = ConfigManager().runtimeInt("retrieval.chat_history_default_limit", 1)
+        if timeInHours is None:
+            timeInHours = ConfigManager().runtimeInt("retrieval.chat_history_window_hours", 12)
+        timePeriod = datetime.now() - timedelta(hours=max(0, int(timeInHours)))
         
         connection = None
         response = None
@@ -1233,14 +1259,39 @@ class ChatHistoryManager:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
-            
-            querySQL = """SELECT ch.history_id, ch.message_id, ch.message_text, ch.message_timestamp, che.embeddings <-> %s::vector AS distance
+
+            whereClauses = ["ch.message_timestamp > %s"]
+            values: list[Any] = [embedding, timePeriod]
+
+            if chatHostID is not None:
+                whereClauses.append("ch.chat_host_id = %s")
+                values.append(chatHostID)
+            if isinstance(chatType, str) and chatType.strip():
+                whereClauses.append("ch.chat_type = %s")
+                values.append(chatType.strip())
+            if isinstance(platform, str) and platform.strip():
+                whereClauses.append("ch.platform = %s")
+                values.append(platform.strip())
+
+            if scopeTopic:
+                if topicID:
+                    whereClauses.append("ch.topic_id = %s")
+                    values.append(topicID)
+                else:
+                    whereClauses.append("ch.topic_id IS NULL")
+            elif topicID:
+                whereClauses.append("ch.topic_id = %s")
+                values.append(topicID)
+
+            querySQL = f"""SELECT ch.history_id, ch.message_id, ch.message_text, ch.message_timestamp, che.embeddings <-> %s::vector AS distance
             FROM chat_history AS ch
             JOIN chat_history_embeddings AS che
             ON ch.history_id = che.history_id
+            WHERE {" AND ".join(whereClauses)}
             ORDER BY distance
             LIMIT %s"""
-            cursor.execute(querySQL, (embedding, max(1, int(limit))))
+            values.append(max(1, int(limit)))
+            cursor.execute(querySQL, values)
             results = cursor.fetchall()
             response = results
             # close the communication with the PostgreSQL

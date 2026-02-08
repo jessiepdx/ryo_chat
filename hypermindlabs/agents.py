@@ -489,7 +489,18 @@ class ConversationOrchestrator:
         await self._emit_stage("tools.start", "Evaluating tool calls.")
         toolStageMessages = list(self._messages)
         toolStageMessages.append(Message(role="tool", content=json.dumps(analysisMessagePayload)))
-        self._toolsAgent = ToolCallingAgent(toolStageMessages, options=self._options)
+        toolOptions = dict(self._options)
+        toolRuntimeContext = _coerce_dict(toolOptions.get("tool_runtime_context"))
+        toolRuntimeContext.update(
+            {
+                "chat_host_id": self._chatHostID,
+                "chat_type": self._chatType,
+                "platform": self._platform,
+                "topic_id": self._topicID,
+            }
+        )
+        toolOptions["tool_runtime_context"] = toolRuntimeContext
+        self._toolsAgent = ToolCallingAgent(toolStageMessages, options=toolOptions)
         toolResponses = await self._toolsAgent.generateResponse()
         await self._emit_stage(
             "tools.complete",
@@ -643,24 +654,44 @@ def braveSearch(queryString: str, count: int = 5) -> list:
 
 
 # Need to limit this only search within the context of the current conversation
-def chatHistorySearch(queryString: str, count: int = 2) -> list:
+def chatHistorySearch(queryString: str, count: int = 2, runtime_context: dict | None = None) -> list:
     """
     Search the chat history database for a vector match on text. 
 
     Args:
         queryString (str): The search query to look up related messages in the chat history
         count (int): (Optional) The number of search results to return. Defaults to 1
+        runtime_context (dict): (Optional) Active chat scope passed by the orchestrator/tool runtime
 
     Returns:
         list: A list of search results. Each search result is a JSON structure
     """
 
-    # Need to limit this only search within the context of the current conversation
-    results = chatHistory.searchChatHistory(text=queryString, limit=1)
-    logger.debug(f"Chat history tool results:\n{results}")
+    context = _coerce_dict(runtime_context)
+    scopedSearch = bool(context.get("chat_host_id") is not None or context.get("chat_type") or context.get("platform"))
+    results = chatHistory.searchChatHistory(
+        text=queryString,
+        limit=max(1, int(count)),
+        chatHostID=context.get("chat_host_id"),
+        chatType=context.get("chat_type"),
+        platform=context.get("platform"),
+        topicID=context.get("topic_id"),
+        scopeTopic=scopedSearch,
+    )
+    scopeInfo = {
+        "chat_host_id": context.get("chat_host_id"),
+        "chat_type": context.get("chat_type"),
+        "platform": context.get("platform"),
+        "topic_id": context.get("topic_id"),
+    }
+    logger.debug(
+        "Chat history tool results:\n"
+        f"scope={scopeInfo}\n"
+        f"results={results}"
+    )
     
     convertedResults = list()
-    for result in results:
+    for result in results or []:
         chatHistoryRecord = dict()
         for key, value in result.items():
             chatHistoryRecord[key] = value.strftime("%Y-%m-%d %H:%M:%S") if key == "message_timestamp" else value
@@ -767,6 +798,7 @@ class ToolCallingAgent():
             "run_id": str(runContext.get("run_id") or "").strip() or None,
             "member_id": runContext.get("member_id"),
         }
+        self._toolRuntimeContext = _coerce_dict(optionMap.get("tool_runtime_context"))
         if options:
             modelRequested = options.get("model_requested")
             if modelRequested in self._allowed_models:
@@ -845,10 +877,11 @@ class ToolCallingAgent():
             optionMap.get("tool_approval_poll_interval_seconds"),
             _runtime_float("tool_runtime.approval_poll_interval_seconds", 0.25),
         )
-        runtimeContext = {
-            "run_id": self._runContext.get("run_id"),
-            "member_id": self._runContext.get("member_id"),
-        }
+        runtimeContext = dict(self._toolRuntimeContext)
+        if not str(runtimeContext.get("run_id") or "").strip():
+            runtimeContext["run_id"] = self._runContext.get("run_id")
+        if runtimeContext.get("member_id") is None:
+            runtimeContext["member_id"] = self._runContext.get("member_id")
         sandboxEnforcer = ToolSandboxEnforcer(default_policy=sandboxDefaults)
         approvalManager = ApprovalManager()
 

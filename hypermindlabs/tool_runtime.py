@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
+import inspect
 import json
 from typing import Any, Callable
 
@@ -500,12 +501,23 @@ class ToolRuntime:
         # Max retries means additional attempts after the first one.
         max_attempts = 1 + max(0, tool.max_retries)
 
+        call_args = dict(prepared_args)
+        try:
+            functionSignature = inspect.signature(tool.function)
+            parameters = functionSignature.parameters
+            acceptsKwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+            if ("runtime_context" in parameters or acceptsKwargs) and "runtime_context" not in call_args:
+                call_args["runtime_context"] = copy.deepcopy(self._context)
+        except (TypeError, ValueError):
+            # Some callables may not expose a signature; fallback to prepared args only.
+            call_args = dict(prepared_args)
+
         while attempts < max_attempts:
             attempts += 1
             executor = ThreadPoolExecutor(max_workers=1)
             future = None
             try:
-                future = executor.submit(tool.function, **prepared_args)
+                future = executor.submit(tool.function, **call_args)
                 output = future.result(timeout=tool.timeout_seconds)
                 return self._success_result(
                     tool_name=tool_name,
