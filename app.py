@@ -52,6 +52,7 @@ from hypermindlabs.runtime_settings import (
     get_runtime_setting,
     load_dotenv_file,
 )
+from hypermindlabs.policy_manager import PolicyManager
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -65,6 +66,7 @@ ENV_TEMPLATE = PROJECT_ROOT / ".env.example"
 ENV_FILE = PROJECT_ROOT / ".env"
 LOGS_DIR = PROJECT_ROOT / "logs"
 WATCHDOG_LOG_DIR = LOGS_DIR / "watchdog"
+POLICIES_DIR = PROJECT_ROOT / "policies" / "agent"
 LIVE_LOG_BUFFER_LINE_LIMIT = 400
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
@@ -93,6 +95,21 @@ COMMUNITY_SCORE_REQUIREMENTS: tuple[tuple[str, str, str], ...] = (
     ("link_sharing", "minimum_community_score_link", "Link sharing"),
     ("message_forwarding", "minimum_community_score_forward", "Message forwarding"),
 )
+
+POLICY_TO_CAPABILITY_ORDER: dict[str, tuple[str, ...]] = {
+    "message_analysis": ("tool", "chat", "generate"),
+    "tool_calling": ("tool", "chat", "generate"),
+    "chat_conversation": ("chat", "generate", "tool"),
+    "dev_test": ("chat", "generate", "tool"),
+}
+
+CAPABILITY_TO_RUNTIME_MODEL_PATH: dict[str, str] = {
+    "embedding": "inference.default_embedding_model",
+    "generate": "inference.default_generate_model",
+    "chat": "inference.default_chat_model",
+    "tool": "inference.default_tool_model",
+    "multimodal": "inference.default_multimodal_model",
+}
 
 
 def is_windows() -> bool:
@@ -430,6 +447,146 @@ def collect_required_models(config_data: dict[str, Any]) -> list[str]:
         add(current_model(config_data, key))
 
     return output
+
+
+def _dedupe_models(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        cleaned = str(value or "").strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        output.append(cleaned)
+    return output
+
+
+def _preferred_model_for_capability(
+    config_data: dict[str, Any],
+    *,
+    runtime_settings: dict[str, Any],
+    capability: str,
+) -> str | None:
+    configured = current_model(config_data, capability)
+    if configured:
+        return configured
+    runtime_path = CAPABILITY_TO_RUNTIME_MODEL_PATH.get(capability)
+    default_value = DEFAULT_MODELS.get(capability, DEFAULT_MODELS["chat"])
+    if runtime_path:
+        value = get_runtime_setting(runtime_settings, runtime_path, default_value)
+    else:
+        value = default_value
+    cleaned = str(value or "").strip()
+    return cleaned if cleaned else None
+
+
+def _generated_allowed_models_for_policy(
+    policy_name: str,
+    *,
+    config_data: dict[str, Any],
+    runtime_settings: dict[str, Any],
+    available_models: list[str] | None = None,
+) -> list[str]:
+    capability_order = POLICY_TO_CAPABILITY_ORDER.get(policy_name, ("chat", "tool", "generate"))
+    preferred_models: list[str] = []
+    for capability in capability_order:
+        preferred = _preferred_model_for_capability(
+            config_data,
+            runtime_settings=runtime_settings,
+            capability=capability,
+        )
+        if preferred:
+            preferred_models.append(preferred)
+    preferred_models = _dedupe_models(preferred_models)
+
+    if preferred_models:
+        return preferred_models
+
+    discovered = _dedupe_models(list(available_models or []))
+    if discovered:
+        return discovered[:1]
+
+    fallback = _preferred_model_for_capability(
+        config_data,
+        runtime_settings=runtime_settings,
+        capability="chat",
+    )
+    return [fallback] if fallback else [DEFAULT_MODELS["chat"]]
+
+
+def sync_agent_policies_from_runtime_models(
+    config_data: dict[str, Any],
+    *,
+    runtime_settings: dict[str, Any],
+    available_models: list[str] | None = None,
+) -> tuple[int, int, list[str]]:
+    inference_config = config_data.get("inference")
+    manager = PolicyManager(
+        inference_config=inference_config if isinstance(inference_config, dict) else {},
+        endpoint_override=resolve_ollama_host(config_data, runtime_settings=runtime_settings),
+    )
+    policy_names = manager.list_policy_names()
+    if not policy_names:
+        return 0, 0, []
+
+    changed = 0
+    unchanged = 0
+    failures: list[str] = []
+    for policy_name in policy_names:
+        policy_payload = manager.load_policy(policy_name=policy_name, strict=False, strict_model_check=False)
+        existing_allowed = _dedupe_models(
+            policy_payload.get("allowed_models") if isinstance(policy_payload.get("allowed_models"), list) else []
+        )
+        generated_allowed = _generated_allowed_models_for_policy(
+            policy_name,
+            config_data=config_data,
+            runtime_settings=runtime_settings,
+            available_models=available_models,
+        )
+        if existing_allowed == generated_allowed:
+            unchanged += 1
+            continue
+
+        save_result = manager.save_policy(
+            policy_name=policy_name,
+            updates={"allowed_models": generated_allowed},
+            strict_model_check=False,
+        )
+        if save_result.saved:
+            changed += 1
+            continue
+
+        reasons = save_result.report.errors or save_result.report.warnings
+        reason_text = "; ".join(reasons[:3]) if reasons else "unknown error"
+        failures.append(f"{policy_name}: {reason_text}")
+
+    return changed, unchanged, failures
+
+
+def policy_model_sync_fingerprint(
+    config_data: dict[str, Any],
+    *,
+    runtime_settings: dict[str, Any],
+    available_models: list[str] | None = None,
+) -> str:
+    policy_names = sorted(
+        path.stem.removesuffix("_policy")
+        for path in POLICIES_DIR.glob("*_policy.json")
+        if path.stem.endswith("_policy")
+    )
+    model_map: dict[str, list[str]] = {}
+    for policy_name in policy_names:
+        model_map[policy_name] = _generated_allowed_models_for_policy(
+            policy_name,
+            config_data=config_data,
+            runtime_settings=runtime_settings,
+            available_models=available_models,
+        )
+    payload = {
+        "host": resolve_ollama_host(config_data, runtime_settings=runtime_settings),
+        "models": model_map,
+    }
+    return json.dumps(payload, sort_keys=True, ensure_ascii=True)
 
 
 def prompt_yes_no(prompt: str, default: bool = True, non_interactive: bool = False) -> bool:
@@ -3348,6 +3505,333 @@ def _curses_view_route_log(stdscr: Any, watchdog: InterfaceWatchdog, route_key: 
             return
 
 
+def _policy_file_path(policy_name: str) -> Path:
+    return POLICIES_DIR / f"{policy_name}_policy.json"
+
+
+def _read_policy_payload_for_editor(policy_name: str) -> dict[str, Any]:
+    payload = load_json(_policy_file_path(policy_name), fallback={})
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _policy_models_from_payload(payload: dict[str, Any]) -> list[str]:
+    allowed = payload.get("allowed_models")
+    if not isinstance(allowed, list):
+        return []
+    return _dedupe_models([str(value) for value in allowed if isinstance(value, str)])
+
+
+def _parse_allowed_models_input(raw: str) -> list[str]:
+    tokens = re.split(r"[,;\n]+", str(raw or ""))
+    return _dedupe_models([token.strip() for token in tokens])
+
+
+def _curses_edit_policy(
+    stdscr: Any,
+    *,
+    manager: PolicyManager,
+    policy_name: str,
+    config_data: dict[str, Any],
+    runtime_settings: dict[str, Any],
+    available_models: list[str],
+) -> str:
+    payload = _read_policy_payload_for_editor(policy_name)
+    initial_allow_custom = bool(payload.get("allow_custom_system_prompt", False))
+    initial_allowed_models = _policy_models_from_payload(payload)
+    if not initial_allowed_models:
+        initial_allowed_models = _generated_allowed_models_for_policy(
+            policy_name,
+            config_data=config_data,
+            runtime_settings=runtime_settings,
+            available_models=available_models,
+        )
+
+    allow_custom = bool(initial_allow_custom)
+    allowed_models = list(initial_allowed_models)
+    status_text = "ready"
+
+    while True:
+        stdscr.erase()
+        generated_models = _generated_allowed_models_for_policy(
+            policy_name,
+            config_data=config_data,
+            runtime_settings=runtime_settings,
+            available_models=available_models,
+        )
+        dirty = (allow_custom != initial_allow_custom) or (allowed_models != initial_allowed_models)
+        _safe_addstr(stdscr, 0, 0, f"Policy Editor: {policy_name}", curses.A_BOLD if curses else 0)
+        _safe_addstr(stdscr, 1, 0, f"Dirty: {'yes' if dirty else 'no'} | allow_custom_system_prompt: {'true' if allow_custom else 'false'}")
+        _safe_addstr(
+            stdscr,
+            2,
+            0,
+            "Controls: t toggle allow_custom | m edit models | r reset generated | s save | q back",
+        )
+        _safe_addstr(stdscr, 3, 0, f"Status: {status_text}")
+        _safe_addstr(stdscr, 5, 0, f"Generated from setup-selected runtime models: {', '.join(generated_models) or '(none)'}")
+        _safe_addstr(stdscr, 6, 0, f"Discovered Ollama models: {len(available_models)}")
+        _safe_addstr(stdscr, 8, 0, "Allowed Models:")
+        row = 9
+        if allowed_models:
+            for model_name in allowed_models[: max(3, stdscr.getmaxyx()[0] - 13)]:
+                _safe_addstr(stdscr, row, 0, f"- {model_name}")
+                row += 1
+        else:
+            _safe_addstr(stdscr, row, 0, "(none)")
+            row += 1
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (ord("q"), 27):
+            if dirty:
+                should_discard = _curses_prompt_yes_no(
+                    stdscr,
+                    f"Discard Unsaved Policy Changes: {policy_name}",
+                    [
+                        f"Policy: {policy_name}",
+                        "Unsaved changes were detected.",
+                        "Discard changes and return?",
+                    ],
+                    default=False,
+                )
+                if not should_discard:
+                    status_text = "discard cancelled"
+                    continue
+            return "closed policy editor"
+        if key == ord("t"):
+            allow_custom = not allow_custom
+            status_text = f"allow_custom_system_prompt={'true' if allow_custom else 'false'}"
+            continue
+        if key == ord("m"):
+            default_text = ", ".join(allowed_models) if allowed_models else ", ".join(generated_models)
+            raw = _curses_prompt_text(
+                stdscr,
+                f"Allowed Models: {policy_name}",
+                [
+                    "Enter comma-separated model list.",
+                    "Example: qwen3-vl:latest, llama3.2:latest",
+                    f"Discovered models on host: {len(available_models)}",
+                ],
+                default=default_text,
+                required=True,
+            )
+            parsed = _parse_allowed_models_input(raw)
+            if not parsed:
+                _curses_message(
+                    stdscr,
+                    "Invalid Model List",
+                    ["Allowed models cannot be empty."],
+                )
+                status_text = "invalid model list"
+                continue
+            allowed_models = parsed
+            status_text = f"updated allowed_models ({len(allowed_models)})"
+            continue
+        if key == ord("r"):
+            allowed_models = list(generated_models)
+            status_text = "reset to generated runtime-selected models"
+            continue
+        if key == ord("s"):
+            if not allowed_models:
+                _curses_message(stdscr, "Save Failed", ["Allowed models cannot be empty."])
+                status_text = "save failed: empty allowed models"
+                continue
+            save_result = manager.save_policy(
+                policy_name=policy_name,
+                updates={
+                    "allow_custom_system_prompt": bool(allow_custom),
+                    "allowed_models": list(allowed_models),
+                },
+                strict_model_check=False,
+            )
+            if not save_result.saved:
+                errors = save_result.report.errors or ["unknown save error"]
+                _curses_message(
+                    stdscr,
+                    f"Save Failed: {policy_name}",
+                    [*errors[:6], *(save_result.report.warnings[:2] if save_result.report.warnings else [])],
+                )
+                status_text = "save failed"
+                continue
+
+            warning_suffix = ""
+            if save_result.report.warnings:
+                warning_suffix = f" (warnings: {len(save_result.report.warnings)})"
+            return f"saved policy {policy_name}{warning_suffix}"
+
+
+def _curses_policy_editor_workspace(
+    stdscr: Any,
+    *,
+    config_data: dict[str, Any],
+    runtime_settings: dict[str, Any],
+) -> str:
+    inference_config = config_data.get("inference")
+    manager = PolicyManager(
+        inference_config=inference_config if isinstance(inference_config, dict) else {},
+        endpoint_override=resolve_ollama_host(config_data, runtime_settings=runtime_settings),
+    )
+
+    policy_names = manager.list_policy_names()
+    if not policy_names:
+        _curses_message(stdscr, "Policy Editor", [f"No policy files found under {POLICIES_DIR}"])
+        return "no policy files found"
+
+    host = resolve_ollama_host(config_data, runtime_settings=runtime_settings)
+    probe_timeout = float(get_runtime_setting(runtime_settings, "inference.probe_timeout_seconds", 3.0))
+    available_models, discovery_error = fetch_ollama_models(host, timeout=probe_timeout)
+
+    selected_idx = 0
+    status_text = "ready"
+    while True:
+        policy_names = manager.list_policy_names()
+        if not policy_names:
+            _curses_message(stdscr, "Policy Editor", [f"No policy files found under {POLICIES_DIR}"])
+            return "no policy files found"
+        selected_idx = max(0, min(selected_idx, len(policy_names) - 1))
+
+        rows: list[dict[str, Any]] = []
+        for policy_name in policy_names:
+            payload = _read_policy_payload_for_editor(policy_name)
+            allowed_models = _policy_models_from_payload(payload)
+            generated_models = _generated_allowed_models_for_policy(
+                policy_name,
+                config_data=config_data,
+                runtime_settings=runtime_settings,
+                available_models=available_models,
+            )
+            rows.append(
+                {
+                    "policy_name": policy_name,
+                    "allow_custom": bool(payload.get("allow_custom_system_prompt", False)),
+                    "allowed_models": allowed_models,
+                    "generated_models": generated_models,
+                    "drifted": allowed_models != generated_models,
+                }
+            )
+
+        selected = rows[selected_idx]
+        stdscr.erase()
+        _safe_addstr(stdscr, 0, 0, "Policy Editor", curses.A_BOLD if curses else 0)
+        _safe_addstr(stdscr, 1, 0, f"Host: {host}")
+        if discovery_error:
+            _safe_addstr(stdscr, 2, 0, f"Model discovery warning: {discovery_error}")
+        else:
+            _safe_addstr(stdscr, 2, 0, f"Discovered Ollama models: {len(available_models)}")
+        _safe_addstr(
+            stdscr,
+            3,
+            0,
+            "Controls: Up/Down select | Enter edit | g regenerate from setup models | v validate | f refresh models | q back",
+        )
+        _safe_addstr(stdscr, 4, 0, f"Status: {status_text}")
+        _safe_addstr(stdscr, 6, 0, "Policy              Custom  Models Drift  Preview")
+        _safe_addstr(stdscr, 7, 0, "--------------------------------------------------------------------------")
+
+        row = 8
+        for idx, item in enumerate(rows):
+            preview = ", ".join(item["allowed_models"][:3]) if item["allowed_models"] else "(none)"
+            if len(item["allowed_models"]) > 3:
+                preview = preview + ", ..."
+            drift = "*" if item["drifted"] else "-"
+            line = (
+                f"{item['policy_name']:<19} "
+                f"{('yes' if item['allow_custom'] else 'no'):<7} "
+                f"{len(item['allowed_models']):<6} "
+                f"{drift:<5} "
+                f"{preview}"
+            )
+            attr = curses.A_REVERSE if (curses and idx == selected_idx) else 0
+            _safe_addstr(stdscr, row, 0, line, attr)
+            row += 1
+
+        detail_row = row + 1
+        _safe_addstr(stdscr, detail_row, 0, f"Selected: {selected['policy_name']}", curses.A_BOLD if curses else 0)
+        _safe_addstr(
+            stdscr,
+            detail_row + 1,
+            0,
+            f"Generated model chain: {', '.join(selected['generated_models']) or '(none)'}",
+        )
+        _safe_addstr(
+            stdscr,
+            detail_row + 2,
+            0,
+            f"Allowed model chain: {', '.join(selected['allowed_models']) or '(none)'}",
+        )
+        _safe_addstr(
+            stdscr,
+            detail_row + 3,
+            0,
+            "Drift marker '*': policy differs from setup-selected generated chain.",
+        )
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (ord("q"), 27):
+            return status_text
+        if key in (curses.KEY_UP if curses else -1, ord("k")):
+            selected_idx = max(0, selected_idx - 1)
+            continue
+        if key in (curses.KEY_DOWN if curses else -1, ord("j")):
+            selected_idx = min(len(rows) - 1, selected_idx + 1)
+            continue
+        if key in (10, 13):
+            status_text = _curses_edit_policy(
+                stdscr,
+                manager=manager,
+                policy_name=selected["policy_name"],
+                config_data=config_data,
+                runtime_settings=runtime_settings,
+                available_models=available_models,
+            )
+            continue
+        if key == ord("g"):
+            changed, unchanged, failures = sync_agent_policies_from_runtime_models(
+                config_data,
+                runtime_settings=runtime_settings,
+                available_models=available_models,
+            )
+            if failures:
+                _curses_message(
+                    stdscr,
+                    "Policy Sync Failures",
+                    [*failures[:8], f"updated={changed}, unchanged={unchanged}"],
+                )
+                status_text = f"sync failures: {len(failures)}"
+            else:
+                status_text = f"sync complete: updated={changed}, unchanged={unchanged}"
+            continue
+        if key == ord("v"):
+            report = manager.validate_policy(
+                policy_name=selected["policy_name"],
+                strict_model_check=False,
+            )
+            lines = [
+                f"Policy: {selected['policy_name']}",
+                f"Endpoint: {report.endpoint_host}",
+                f"Available models discovered: {len(report.available_models)}",
+            ]
+            if report.errors:
+                lines.append("Errors:")
+                lines.extend([f"- {line}" for line in report.errors[:6]])
+            if report.warnings:
+                lines.append("Warnings:")
+                lines.extend([f"- {line}" for line in report.warnings[:6]])
+            if not report.errors and not report.warnings:
+                lines.append("Validation clean.")
+            _curses_message(stdscr, "Policy Validation", lines)
+            status_text = f"validated {selected['policy_name']}"
+            continue
+        if key == ord("f"):
+            host = resolve_ollama_host(config_data, runtime_settings=runtime_settings)
+            available_models, discovery_error = fetch_ollama_models(host, timeout=probe_timeout)
+            status_text = "refreshed model inventory"
+            continue
+
+
 def watchdog_dashboard_curses(
     watchdog: InterfaceWatchdog,
     *,
@@ -3426,7 +3910,7 @@ def watchdog_dashboard_curses(
                 stdscr,
                 7,
                 0,
-                "Controls: Up/Down select | Enter config | r open interface | Space toggle | s start | x stop | a/o all | l logs | q quit",
+                "Controls: Up/Down select | Enter config | p policy editor | r open interface | Space toggle | s start | x stop | a/o all | l logs | q quit",
             )
             _safe_addstr(stdscr, 8, 0, f"Status: {last_status_text}")
             _safe_addstr(stdscr, 10, 0, "Route      Desired Running PID      User      Uptime   Restarts LastExit Policy  State")
@@ -3498,6 +3982,13 @@ def watchdog_dashboard_curses(
                         config_data=config_data,
                         runtime_settings=runtime_settings,
                     )
+                continue
+            if key == ord("p"):
+                last_status_text = _curses_policy_editor_workspace(
+                    stdscr,
+                    config_data=config_data,
+                    runtime_settings=runtime_settings,
+                )
                 continue
             if key == ord("r"):
                 if keys:
@@ -3707,6 +4198,38 @@ def main() -> int:
         print(f"[bootstrap] Updated config: {CONFIG_FILE}")
 
     runtime_settings = build_runtime_settings(config_data=config_data)
+    policy_probe_timeout = float(
+        get_runtime_setting(runtime_settings, "inference.probe_timeout_seconds", 3.0)
+    )
+    policy_host = resolve_ollama_host(config_data, runtime_settings=runtime_settings)
+    policy_models, policy_probe_error = fetch_ollama_models(policy_host, timeout=policy_probe_timeout)
+    if policy_probe_error:
+        print(f"[policy] Model discovery warning on {policy_host}: {policy_probe_error}")
+        policy_models = []
+    desired_policy_fingerprint = policy_model_sync_fingerprint(
+        config_data,
+        runtime_settings=runtime_settings,
+        available_models=policy_models,
+    )
+    current_policy_fingerprint = str(state.get("policy_model_sync_fingerprint", ""))
+    should_sync_policies = desired_policy_fingerprint != current_policy_fingerprint
+    if should_sync_policies:
+        changed_policies, unchanged_policies, policy_failures = sync_agent_policies_from_runtime_models(
+            config_data,
+            runtime_settings=runtime_settings,
+            available_models=policy_models,
+        )
+        if changed_policies > 0:
+            print(f"[policy] Updated {changed_policies} policy file(s) from setup-selected runtime models.")
+        elif unchanged_policies > 0:
+            print("[policy] Policy model chains already aligned with setup-selected runtime models.")
+        if policy_failures:
+            print(f"[policy] Failed to update {len(policy_failures)} policy file(s):")
+            for failure in policy_failures:
+                print(f"  - {failure}")
+        else:
+            state["policy_model_sync_fingerprint"] = desired_policy_fingerprint
+
     ensure_database_migrations(runtime_settings=runtime_settings)
 
     state["last_run_epoch"] = int(time.time())
