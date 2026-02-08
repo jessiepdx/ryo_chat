@@ -15,6 +15,7 @@ Responsibilities:
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -507,13 +508,22 @@ def _curses_message(stdscr: Any, title: str, lines: list[str]) -> None:
     stdscr.getch()
 
 
-def _curses_prompt_text(stdscr: Any, title: str, prompt: str, default: str = "") -> str:
+def _curses_prompt_text(
+    stdscr: Any,
+    title: str,
+    prompt: str,
+    default: str = "",
+    *,
+    allow_empty: bool = False,
+) -> str:
     while True:
         stdscr.erase()
         _safe_addstr(stdscr, 0, 0, title, curses.A_BOLD if curses else 0)
         _safe_addstr(stdscr, 2, 0, prompt)
         if default:
             _safe_addstr(stdscr, 3, 0, f"Default: {default}")
+        elif allow_empty:
+            _safe_addstr(stdscr, 3, 0, "Default: (empty)")
         _safe_addstr(stdscr, 5, 0, "> ")
         stdscr.refresh()
         if curses:
@@ -523,8 +533,12 @@ def _curses_prompt_text(stdscr: Any, title: str, prompt: str, default: str = "")
             curses.noecho()
         value = raw.decode(errors="ignore").strip()
         if value == "":
-            value = default
-        if value:
+            if default:
+                return default
+            if allow_empty:
+                return ""
+            continue
+        if value or allow_empty:
             return value
 
 
@@ -1105,6 +1119,638 @@ class RouteState:
     started_epoch: float | None = None
 
 
+@dataclass(frozen=True)
+class RouteSettingSpec:
+    id: str
+    label: str
+    path: str
+    value_type: str
+    description: str
+    default: Any = None
+    default_runtime_path: str | None = None
+    required: bool = False
+    min_value: float | None = None
+    max_value: float | None = None
+    choices: tuple[str, ...] = ()
+    sensitive: bool = False
+    restart_required: bool = True
+    env_override_keys: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RouteCategorySpec:
+    id: str
+    label: str
+    settings: tuple[RouteSettingSpec, ...]
+
+
+@dataclass(frozen=True)
+class RouteConfigSpec:
+    route_key: str
+    label: str
+    categories: tuple[RouteCategorySpec, ...]
+
+
+ROUTE_CONFIG_SPECS: dict[str, RouteConfigSpec] = {
+    "telegram": RouteConfigSpec(
+        route_key="telegram",
+        label="Telegram",
+        categories=(
+            RouteCategorySpec(
+                id="pipeline",
+                label="Pipeline",
+                settings=(
+                    RouteSettingSpec(
+                        id="show_stage_progress",
+                        label="Show Stage Progress",
+                        path="runtime.telegram.show_stage_progress",
+                        value_type="bool",
+                        description="Show editable transient stage updates before final Telegram reply.",
+                        default_runtime_path="telegram.show_stage_progress",
+                        env_override_keys=("RYO_TELEGRAM_SHOW_STAGE_PROGRESS",),
+                    ),
+                    RouteSettingSpec(
+                        id="get_updates_write_timeout",
+                        label="Updates Write Timeout",
+                        path="runtime.telegram.get_updates_write_timeout",
+                        value_type="int",
+                        description="Telegram polling write timeout in seconds.",
+                        default_runtime_path="telegram.get_updates_write_timeout",
+                        min_value=1,
+                        max_value=3600,
+                        env_override_keys=("RYO_TELEGRAM_GET_UPDATES_WRITE_TIMEOUT",),
+                    ),
+                ),
+            ),
+            RouteCategorySpec(
+                id="access",
+                label="Access / Score Gates",
+                settings=(
+                    RouteSettingSpec(
+                        id="min_private_chat",
+                        label="Min Score Private Chat",
+                        path="community_score_requirements.private_chat",
+                        value_type="int",
+                        description="Minimum score required for private chat with bot.",
+                        default_runtime_path="telegram.minimum_community_score_private_chat",
+                        min_value=0,
+                        env_override_keys=("RYO_TELEGRAM_MIN_SCORE_PRIVATE_CHAT",),
+                    ),
+                    RouteSettingSpec(
+                        id="min_private_image",
+                        label="Min Score Private Image",
+                        path="community_score_requirements.private_image",
+                        value_type="int",
+                        description="Minimum score required for private image actions.",
+                        default_runtime_path="telegram.minimum_community_score_private_image",
+                        min_value=0,
+                        env_override_keys=("RYO_TELEGRAM_MIN_SCORE_PRIVATE_IMAGE",),
+                    ),
+                    RouteSettingSpec(
+                        id="min_group_image",
+                        label="Min Score Group Image",
+                        path="community_score_requirements.group_image",
+                        value_type="int",
+                        description="Minimum score required for group image actions.",
+                        default_runtime_path="telegram.minimum_community_score_group_image",
+                        min_value=0,
+                        env_override_keys=("RYO_TELEGRAM_MIN_SCORE_GROUP_IMAGE",),
+                    ),
+                    RouteSettingSpec(
+                        id="min_other_group",
+                        label="Min Score Other Group",
+                        path="community_score_requirements.other_group",
+                        value_type="int",
+                        description="Minimum score threshold for non-directed group content.",
+                        default_runtime_path="telegram.minimum_community_score_other_group",
+                        min_value=0,
+                        env_override_keys=("RYO_TELEGRAM_MIN_SCORE_OTHER_GROUP",),
+                    ),
+                    RouteSettingSpec(
+                        id="min_link",
+                        label="Min Score Link Sharing",
+                        path="community_score_requirements.link_sharing",
+                        value_type="int",
+                        description="Minimum score required for link sharing behaviors.",
+                        default_runtime_path="telegram.minimum_community_score_link",
+                        min_value=0,
+                        env_override_keys=("RYO_TELEGRAM_MIN_SCORE_LINK",),
+                    ),
+                    RouteSettingSpec(
+                        id="min_forward",
+                        label="Min Score Message Forwarding",
+                        path="community_score_requirements.message_forwarding",
+                        value_type="int",
+                        description="Minimum score required for message forwarding behaviors.",
+                        default_runtime_path="telegram.minimum_community_score_forward",
+                        min_value=0,
+                        env_override_keys=("RYO_TELEGRAM_MIN_SCORE_FORWARD",),
+                    ),
+                ),
+            ),
+            RouteCategorySpec(
+                id="identity",
+                label="Identity",
+                settings=(
+                    RouteSettingSpec(
+                        id="bot_name",
+                        label="Bot Username",
+                        path="bot_name",
+                        value_type="string",
+                        description="Telegram bot username used for direct link fallback.",
+                        env_override_keys=("TELEGRAM_BOT_NAME",),
+                    ),
+                    RouteSettingSpec(
+                        id="bot_id",
+                        label="Bot ID",
+                        path="bot_id",
+                        value_type="int",
+                        description="Telegram bot id used by command handlers.",
+                        min_value=0,
+                        env_override_keys=("TELEGRAM_BOT_ID",),
+                    ),
+                    RouteSettingSpec(
+                        id="bot_token",
+                        label="Bot Token",
+                        path="bot_token",
+                        value_type="secret",
+                        description="Telegram bot token (sensitive).",
+                        sensitive=True,
+                        env_override_keys=("TELEGRAM_BOT_TOKEN",),
+                    ),
+                ),
+            ),
+            RouteCategorySpec(
+                id="runtime",
+                label="Runtime",
+                settings=(
+                    RouteSettingSpec(
+                        id="default_ollama_host",
+                        label="Default Ollama Host",
+                        path="runtime.inference.default_ollama_host",
+                        value_type="url",
+                        description="Default Ollama endpoint used when route capability URLs are missing.",
+                        default_runtime_path="inference.default_ollama_host",
+                        required=True,
+                        env_override_keys=("RYO_DEFAULT_OLLAMA_HOST", "OLLAMA_HOST"),
+                    ),
+                ),
+            ),
+        ),
+    ),
+    "web": RouteConfigSpec(
+        route_key="web",
+        label="Web",
+        categories=(
+            RouteCategorySpec(
+                id="bind_port",
+                label="Bind / Port",
+                settings=(
+                    RouteSettingSpec(
+                        id="web_host",
+                        label="Bind Host",
+                        path="runtime.web.host",
+                        value_type="string",
+                        description="Host/interface web_ui binds to.",
+                        default_runtime_path="web.host",
+                        required=True,
+                        env_override_keys=("RYO_WEB_HOST",),
+                    ),
+                    RouteSettingSpec(
+                        id="web_port",
+                        label="Bind Port",
+                        path="runtime.web.port",
+                        value_type="port",
+                        description="Preferred local web port (auto-increments if occupied).",
+                        default_runtime_path="web.port",
+                        env_override_keys=("RYO_WEB_PORT",),
+                    ),
+                    RouteSettingSpec(
+                        id="web_port_scan_limit",
+                        label="Port Scan Limit",
+                        path="runtime.web.port_scan_limit",
+                        value_type="int",
+                        description="How many incremental ports to probe when bind port is occupied.",
+                        default_runtime_path="web.port_scan_limit",
+                        min_value=0,
+                        max_value=2000,
+                        env_override_keys=("RYO_WEB_PORT_SCAN_LIMIT",),
+                    ),
+                ),
+            ),
+            RouteCategorySpec(
+                id="runtime",
+                label="Runtime",
+                settings=(
+                    RouteSettingSpec(
+                        id="web_debug",
+                        label="Debug Mode",
+                        path="runtime.web.debug",
+                        value_type="bool",
+                        description="Enable Flask debug mode for web UI route.",
+                        default_runtime_path="web.debug",
+                        env_override_keys=("RYO_WEB_DEBUG",),
+                    ),
+                    RouteSettingSpec(
+                        id="web_reloader",
+                        label="Use Reloader",
+                        path="runtime.web.use_reloader",
+                        value_type="bool",
+                        description="Enable Flask auto-reloader for web UI route.",
+                        default_runtime_path="web.use_reloader",
+                        env_override_keys=("RYO_WEB_USE_RELOADER",),
+                    ),
+                ),
+            ),
+            RouteCategorySpec(
+                id="external_url",
+                label="External URL",
+                settings=(
+                    RouteSettingSpec(
+                        id="web_ui_url",
+                        label="External Web UI URL",
+                        path="web_ui_url",
+                        value_type="url",
+                        description="Public URL used by integrations (for example Telegram miniapp).",
+                        required=True,
+                        env_override_keys=("WEB_UI_URL",),
+                    ),
+                ),
+            ),
+        ),
+    ),
+    "cli": RouteConfigSpec(
+        route_key="cli",
+        label="CLI",
+        categories=(
+            RouteCategorySpec(
+                id="conversation",
+                label="Conversation",
+                settings=(
+                    RouteSettingSpec(
+                        id="knowledge_threshold",
+                        label="Knowledge Lookup Word Threshold",
+                        path="runtime.conversation.knowledge_lookup_word_threshold",
+                        value_type="int",
+                        description="Minimum prompt word count before knowledge lookup runs.",
+                        default_runtime_path="conversation.knowledge_lookup_word_threshold",
+                        min_value=0,
+                        env_override_keys=("RYO_CONVERSATION_KNOWLEDGE_WORD_THRESHOLD",),
+                    ),
+                    RouteSettingSpec(
+                        id="knowledge_result_limit",
+                        label="Knowledge Result Limit",
+                        path="runtime.conversation.knowledge_lookup_result_limit",
+                        value_type="int",
+                        description="Maximum knowledge retrieval records per lookup.",
+                        default_runtime_path="conversation.knowledge_lookup_result_limit",
+                        min_value=0,
+                        env_override_keys=("RYO_CONVERSATION_KNOWLEDGE_RESULT_LIMIT",),
+                    ),
+                ),
+            ),
+            RouteCategorySpec(
+                id="retrieval",
+                label="Retrieval",
+                settings=(
+                    RouteSettingSpec(
+                        id="short_history_limit",
+                        label="Short History Limit",
+                        path="runtime.retrieval.conversation_short_history_limit",
+                        value_type="int",
+                        description="Short history window used by orchestrator context preload.",
+                        default_runtime_path="retrieval.conversation_short_history_limit",
+                        min_value=1,
+                        env_override_keys=("RYO_RETRIEVAL_SHORT_HISTORY_LIMIT",),
+                    ),
+                ),
+            ),
+            RouteCategorySpec(
+                id="tool_runtime",
+                label="Tool Runtime",
+                settings=(
+                    RouteSettingSpec(
+                        id="tool_default_timeout",
+                        label="Default Tool Timeout (s)",
+                        path="runtime.tool_runtime.default_timeout_seconds",
+                        value_type="float",
+                        description="Default timeout for tool runtime execution calls.",
+                        default_runtime_path="tool_runtime.default_timeout_seconds",
+                        min_value=0.1,
+                        env_override_keys=("RYO_TOOL_RUNTIME_DEFAULT_TIMEOUT_SECONDS",),
+                    ),
+                    RouteSettingSpec(
+                        id="tool_default_retries",
+                        label="Default Tool Retries",
+                        path="runtime.tool_runtime.default_max_retries",
+                        value_type="int",
+                        description="Default retry attempts for tool runtime execution calls.",
+                        default_runtime_path="tool_runtime.default_max_retries",
+                        min_value=0,
+                        env_override_keys=("RYO_TOOL_RUNTIME_DEFAULT_MAX_RETRIES",),
+                    ),
+                ),
+            ),
+        ),
+    ),
+    "x": RouteConfigSpec(
+        route_key="x",
+        label="X / Twitter",
+        categories=(
+            RouteCategorySpec(
+                id="twitter_keys",
+                label="Twitter Keys",
+                settings=(
+                    RouteSettingSpec(
+                        id="consumer_key",
+                        label="Consumer Key",
+                        path="twitter_keys.consumer_key",
+                        value_type="secret",
+                        description="Twitter API consumer key.",
+                        sensitive=True,
+                        env_override_keys=("TWITTER_CONSUMER_KEY",),
+                    ),
+                    RouteSettingSpec(
+                        id="consumer_secret",
+                        label="Consumer Secret",
+                        path="twitter_keys.consumer_secret",
+                        value_type="secret",
+                        description="Twitter API consumer secret.",
+                        sensitive=True,
+                        env_override_keys=("TWITTER_CONSUMER_SECRET",),
+                    ),
+                    RouteSettingSpec(
+                        id="access_token",
+                        label="Access Token",
+                        path="twitter_keys.access_token",
+                        value_type="secret",
+                        description="Twitter access token.",
+                        sensitive=True,
+                        env_override_keys=("TWITTER_ACCESS_TOKEN",),
+                    ),
+                    RouteSettingSpec(
+                        id="access_token_secret",
+                        label="Access Token Secret",
+                        path="twitter_keys.access_token_secret",
+                        value_type="secret",
+                        description="Twitter access token secret.",
+                        sensitive=True,
+                        env_override_keys=("TWITTER_ACCESS_TOKEN_SECRET",),
+                    ),
+                ),
+            ),
+            RouteCategorySpec(
+                id="runtime",
+                label="Runtime",
+                settings=(
+                    RouteSettingSpec(
+                        id="watchdog_auto_start",
+                        label="Watchdog Auto Start Routes",
+                        path="runtime.watchdog.auto_start_routes",
+                        value_type="bool",
+                        description="Whether launcher auto-starts managed routes on dashboard start.",
+                        default_runtime_path="watchdog.auto_start_routes",
+                        env_override_keys=("RYO_WATCHDOG_AUTO_START_ROUTES",),
+                    ),
+                ),
+            ),
+        ),
+    ),
+}
+
+
+_MISSING = object()
+
+
+def _dot_path_parts(path: str) -> list[str]:
+    return [part for part in str(path).split(".") if part]
+
+
+def _get_config_path(config_data: dict[str, Any], path: str, default: Any = _MISSING) -> Any:
+    cursor: Any = config_data
+    for part in _dot_path_parts(path):
+        if not isinstance(cursor, dict) or part not in cursor:
+            return default
+        cursor = cursor.get(part)
+    return cursor
+
+
+def _set_config_path(config_data: dict[str, Any], path: str, value: Any) -> None:
+    parts = _dot_path_parts(path)
+    if not parts:
+        return
+    cursor: dict[str, Any] = config_data
+    for part in parts[:-1]:
+        next_value = cursor.get(part)
+        if not isinstance(next_value, dict):
+            next_value = {}
+            cursor[part] = next_value
+        cursor = next_value
+    cursor[parts[-1]] = value
+
+
+def _setting_runtime_path(setting: RouteSettingSpec) -> str | None:
+    if setting.default_runtime_path:
+        return setting.default_runtime_path
+    if setting.path.startswith("runtime."):
+        return setting.path[len("runtime.") :]
+    return None
+
+
+def _empty_value_for_setting(setting: RouteSettingSpec) -> Any:
+    if setting.value_type in {"string", "secret", "url"}:
+        return ""
+    if setting.value_type == "bool":
+        return False
+    if setting.value_type in {"int", "port"}:
+        if setting.min_value is not None:
+            return int(setting.min_value)
+        return 0
+    if setting.value_type == "float":
+        if setting.min_value is not None:
+            return float(setting.min_value)
+        return 0.0
+    return ""
+
+
+def _default_value_for_setting(setting: RouteSettingSpec) -> Any:
+    if setting.default is not None:
+        return copy.deepcopy(setting.default)
+
+    runtime_path = _setting_runtime_path(setting)
+    if runtime_path:
+        value = get_runtime_setting(DEFAULT_RUNTIME_SETTINGS, runtime_path, _MISSING)
+        if value is not _MISSING:
+            return copy.deepcopy(value)
+
+    return _empty_value_for_setting(setting)
+
+
+def _setting_env_override_active(setting: RouteSettingSpec) -> bool:
+    for env_key in setting.env_override_keys:
+        raw = os.getenv(env_key)
+        if raw is None:
+            continue
+        if str(raw).strip() == "":
+            continue
+        return True
+    return False
+
+
+def _resolve_setting_value(
+    setting: RouteSettingSpec,
+    *,
+    config_data: dict[str, Any],
+    pending_changes: dict[str, Any],
+    runtime_settings: dict[str, Any],
+) -> tuple[Any, str, bool]:
+    if setting.path in pending_changes:
+        value = pending_changes[setting.path]
+        source = "pending"
+    else:
+        configured = _get_config_path(config_data, setting.path, _MISSING)
+        if configured is not _MISSING:
+            value = configured
+            source = "config"
+        else:
+            runtime_path = _setting_runtime_path(setting)
+            if runtime_path:
+                value = get_runtime_setting(runtime_settings, runtime_path, _default_value_for_setting(setting))
+                source = "runtime-default"
+            elif setting.default is not None:
+                value = copy.deepcopy(setting.default)
+                source = "spec-default"
+            else:
+                value = _default_value_for_setting(setting)
+                source = "unset"
+
+    env_override_active = _setting_env_override_active(setting)
+    if env_override_active:
+        source = f"{source}+env"
+    return value, source, env_override_active
+
+
+def _mask_secret(value: Any) -> str:
+    text = str(value or "")
+    if text == "":
+        return "(empty)"
+    if len(text) <= 4:
+        return "*" * len(text)
+    return text[:2] + ("*" * (len(text) - 4)) + text[-2:]
+
+
+def _format_setting_value(value: Any, *, sensitive: bool = False) -> str:
+    if sensitive:
+        return _mask_secret(value)
+    if value is None:
+        return "(unset)"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=True)
+        except (TypeError, ValueError):
+            return str(value)
+    text = str(value)
+    return text if text.strip() != "" else "(empty)"
+
+
+def _setting_type_label(setting: RouteSettingSpec) -> str:
+    if setting.value_type == "bool":
+        return "bool"
+    if setting.value_type == "int":
+        return "int"
+    if setting.value_type == "float":
+        return "float"
+    if setting.value_type == "port":
+        return "port"
+    if setting.value_type == "url":
+        return "url"
+    if setting.value_type == "secret":
+        return "secret"
+    if setting.choices:
+        return "enum"
+    return "string"
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    cleaned = str(value).strip().lower()
+    if cleaned in {"1", "true", "yes", "y", "on"}:
+        return True
+    if cleaned in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError("expected boolean value (true/false)")
+
+
+def _coerce_setting_value(setting: RouteSettingSpec, raw_value: Any) -> tuple[bool, Any, str]:
+    value_type = _setting_type_label(setting)
+    value: Any = raw_value
+
+    try:
+        if value_type == "bool":
+            value = _coerce_bool(raw_value)
+        elif value_type == "int":
+            if isinstance(raw_value, bool):
+                raise ValueError("expected integer")
+            value = int(str(raw_value).strip())
+        elif value_type == "float":
+            if isinstance(raw_value, bool):
+                raise ValueError("expected float")
+            value = float(str(raw_value).strip())
+        elif value_type == "port":
+            if isinstance(raw_value, bool):
+                raise ValueError("expected port number")
+            value = int(str(raw_value).strip())
+            if value < 1 or value > 65535:
+                raise ValueError("port must be between 1 and 65535")
+        elif value_type == "url":
+            value = str(raw_value).strip()
+            if setting.required and value == "":
+                raise ValueError("value is required")
+            if value != "" and not valid_http_url(value):
+                raise ValueError("expected URL like http://127.0.0.1:11434")
+        else:
+            value = str(raw_value)
+            if setting.value_type != "secret":
+                value = value.strip()
+    except ValueError as error:
+        return False, None, str(error)
+
+    if value_type in {"int", "float"}:
+        numeric = float(value)
+        if setting.min_value is not None and numeric < float(setting.min_value):
+            return False, None, f"value must be >= {setting.min_value}"
+        if setting.max_value is not None and numeric > float(setting.max_value):
+            return False, None, f"value must be <= {setting.max_value}"
+
+    if setting.choices:
+        value_str = str(value)
+        if value_str not in setting.choices:
+            allowed = ", ".join(setting.choices)
+            return False, None, f"value must be one of: {allowed}"
+
+    if setting.required:
+        if value is None:
+            return False, None, "value is required"
+        if isinstance(value, str) and value.strip() == "":
+            return False, None, "value is required"
+
+    return True, value, ""
+
+
+def _iter_route_settings(route_spec: RouteConfigSpec) -> list[RouteSettingSpec]:
+    settings: list[RouteSettingSpec] = []
+    for category in route_spec.categories:
+        settings.extend(category.settings)
+    return settings
+
+
+def _settings_by_path(route_spec: RouteConfigSpec) -> dict[str, RouteSettingSpec]:
+    return {setting.path: setting for setting in _iter_route_settings(route_spec)}
+
+
 class InterfaceWatchdog:
     def __init__(
         self,
@@ -1138,6 +1784,12 @@ class InterfaceWatchdog:
 
     def route_keys(self) -> list[str]:
         return list(self._routes.keys())
+
+    def update_runtime_settings(self, runtime_settings: dict[str, Any] | None) -> None:
+        with self._lock:
+            self._runtime_settings = runtime_settings if isinstance(runtime_settings, dict) else {}
+            # Force fresh port resolution for future web spawns after settings edits.
+            self._route_env_overrides.pop("web", None)
 
     @staticmethod
     def _stamp_now() -> float:
@@ -1917,6 +2569,536 @@ def route_menu(
             return
 
 
+def _curses_select_option(
+    stdscr: Any,
+    *,
+    title: str,
+    body_lines: list[str],
+    options: list[str],
+    current: str | None = None,
+) -> str | None:
+    if not options:
+        return None
+
+    try:
+        index = options.index(current) if current is not None else 0
+    except ValueError:
+        index = 0
+
+    while True:
+        stdscr.erase()
+        _safe_addstr(stdscr, 0, 0, title, curses.A_BOLD if curses else 0)
+        row = 2
+        for line in body_lines:
+            _safe_addstr(stdscr, row, 0, line)
+            row += 1
+        _safe_addstr(stdscr, row + 1, 0, "Use up/down arrows, Enter to confirm, q/Esc to cancel.")
+        row += 3
+        start = max(0, index - 8)
+        end = min(len(options), start + 16)
+        for option_idx in range(start, end):
+            option = options[option_idx]
+            marker = "* " if option == current else "  "
+            attr = curses.A_REVERSE if (curses and option_idx == index) else 0
+            _safe_addstr(stdscr, row, 0, f"{marker}{option}", attr)
+            row += 1
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (curses.KEY_UP if curses else -1, ord("k")):
+            index = max(0, index - 1)
+            continue
+        if key in (curses.KEY_DOWN if curses else -1, ord("j")):
+            index = min(len(options) - 1, index + 1)
+            continue
+        if key in (10, 13):
+            return options[index]
+        if key in (27, ord("q")):
+            return None
+
+
+def _edit_route_setting_curses(
+    stdscr: Any,
+    *,
+    route_spec: RouteConfigSpec,
+    category_spec: RouteCategorySpec,
+    setting: RouteSettingSpec,
+    config_data: dict[str, Any],
+    runtime_settings: dict[str, Any],
+    pending_changes: dict[str, Any],
+) -> tuple[bool, Any, str]:
+    current_value, source, env_override = _resolve_setting_value(
+        setting,
+        config_data=config_data,
+        pending_changes=pending_changes,
+        runtime_settings=runtime_settings,
+    )
+    default_value = _default_value_for_setting(setting)
+    type_label = _setting_type_label(setting)
+    title = f"{route_spec.label} > {category_spec.label} > {setting.label}"
+    details = [
+        f"Path: {setting.path}",
+        f"Type: {type_label}",
+        f"Current: {_format_setting_value(current_value, sensitive=setting.sensitive)}",
+        f"Default: {_format_setting_value(default_value, sensitive=setting.sensitive)}",
+        f"Source: {source}",
+        setting.description,
+    ]
+    if env_override and setting.env_override_keys:
+        details.append("Environment override present: " + ", ".join(setting.env_override_keys))
+
+    if type_label == "bool":
+        selected = _curses_prompt_yes_no(
+            stdscr,
+            title,
+            details + ["Set new value for this flag?"],
+            default=bool(current_value),
+        )
+        ok, parsed, error = _coerce_setting_value(setting, selected)
+        if not ok:
+            return False, current_value, error
+        return True, parsed, "updated"
+
+    if setting.choices:
+        selected = _curses_select_option(
+            stdscr,
+            title=title,
+            body_lines=details,
+            options=list(setting.choices),
+            current=str(current_value) if current_value is not None else None,
+        )
+        if selected is None:
+            return False, current_value, "cancelled"
+        ok, parsed, error = _coerce_setting_value(setting, selected)
+        if not ok:
+            return False, current_value, error
+        return True, parsed, "updated"
+
+    if setting.sensitive:
+        should_replace = _curses_prompt_yes_no(
+            stdscr,
+            title,
+            details + ["Replace secret value now?"],
+            default=False,
+        )
+        if not should_replace:
+            return False, current_value, "cancelled"
+        raw_value = _curses_prompt_text(
+            stdscr,
+            title,
+            "Enter new value (input hidden from previews after save):",
+            default="",
+            allow_empty=not setting.required,
+        )
+    else:
+        default_candidate = default_value if current_value is None else current_value
+        default_text = "" if default_candidate is None else str(default_candidate)
+        raw_value = _curses_prompt_text(
+            stdscr,
+            title,
+            "Enter new value:",
+            default=default_text,
+            allow_empty=not setting.required,
+        )
+
+    ok, parsed, error = _coerce_setting_value(setting, raw_value)
+    if not ok:
+        return False, current_value, error
+    return True, parsed, "updated"
+
+
+def _curses_route_category_menu(
+    stdscr: Any,
+    *,
+    watchdog: InterfaceWatchdog,
+    route_spec: RouteConfigSpec,
+    route_key: str,
+    category_spec: RouteCategorySpec,
+    config_data: dict[str, Any],
+    runtime_settings: dict[str, Any],
+    pending_changes: dict[str, Any],
+    save_callback: Any,
+) -> str:
+    selected_idx = 0
+    status_text = "ready"
+    settings = list(category_spec.settings)
+
+    while True:
+        selected_idx = max(0, min(selected_idx, max(0, len(settings) - 1)))
+        stdscr.erase()
+        status = watchdog.status().get(route_key, {})
+        running = "yes" if status.get("running") else "no"
+        desired = "on" if status.get("desired") else "off"
+
+        _safe_addstr(
+            stdscr,
+            0,
+            0,
+            f"Route Config > {route_spec.label} > {category_spec.label}",
+            curses.A_BOLD if curses else 0,
+        )
+        _safe_addstr(stdscr, 1, 0, f"Route state: desired={desired} running={running}")
+        _safe_addstr(
+            stdscr,
+            2,
+            0,
+            "Controls: Up/Down select | Enter edit | d default | u reset category | s save | b/q back",
+        )
+        _safe_addstr(stdscr, 3, 0, f"Pending changes: {len(pending_changes)}")
+        _safe_addstr(stdscr, 4, 0, f"Status: {status_text}")
+
+        _safe_addstr(stdscr, 6, 0, "Setting                     Value                          Source           Type")
+        _safe_addstr(stdscr, 7, 0, "---------------------------------------------------------------------------------------")
+        row = 8
+        for idx, setting in enumerate(settings):
+            value, source, _ = _resolve_setting_value(
+                setting,
+                config_data=config_data,
+                pending_changes=pending_changes,
+                runtime_settings=runtime_settings,
+            )
+            value_text = _format_setting_value(value, sensitive=setting.sensitive)
+            marker = "*" if setting.path in pending_changes else " "
+            line = (
+                f"{marker} {setting.label:<25} "
+                f"{_trim_text(value_text, 30):<30} "
+                f"{source:<15} {_setting_type_label(setting)}"
+            )
+            attr = curses.A_REVERSE if (curses and idx == selected_idx) else 0
+            _safe_addstr(stdscr, row, 0, line, attr)
+            row += 1
+
+        details_row = row + 1
+        if settings:
+            selected = settings[selected_idx]
+            default_value = _default_value_for_setting(selected)
+            _safe_addstr(stdscr, details_row, 0, f"Selected: {selected.label}", curses.A_BOLD if curses else 0)
+            _safe_addstr(stdscr, details_row + 1, 0, f"Path: {selected.path}")
+            _safe_addstr(
+                stdscr,
+                details_row + 2,
+                0,
+                f"Default: {_format_setting_value(default_value, sensitive=selected.sensitive)}",
+            )
+            _safe_addstr(stdscr, details_row + 3, 0, selected.description)
+            if selected.env_override_keys:
+                env_text = ", ".join(selected.env_override_keys)
+                _safe_addstr(stdscr, details_row + 4, 0, f"Env keys: {env_text}")
+
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (ord("q"), ord("b"), 27):
+            return status_text
+        if key in (curses.KEY_UP if curses else -1, ord("k")):
+            selected_idx = max(0, selected_idx - 1)
+            continue
+        if key in (curses.KEY_DOWN if curses else -1, ord("j")):
+            selected_idx = min(len(settings) - 1, selected_idx + 1) if settings else 0
+            continue
+        if key in (10, 13):
+            if not settings:
+                continue
+            selected = settings[selected_idx]
+            changed, new_value, edit_status = _edit_route_setting_curses(
+                stdscr,
+                route_spec=route_spec,
+                category_spec=category_spec,
+                setting=selected,
+                config_data=config_data,
+                runtime_settings=runtime_settings,
+                pending_changes=pending_changes,
+            )
+            if changed:
+                pending_changes[selected.path] = new_value
+                status_text = f"updated pending: {selected.label}"
+            else:
+                status_text = edit_status
+                if edit_status and edit_status not in {"cancelled", "updated"}:
+                    _curses_message(
+                        stdscr,
+                        "Invalid Value",
+                        [f"Setting: {selected.label}", f"Reason: {edit_status}"],
+                    )
+            continue
+        if key == ord("d"):
+            if not settings:
+                continue
+            selected = settings[selected_idx]
+            pending_changes[selected.path] = _default_value_for_setting(selected)
+            status_text = f"reset pending to default: {selected.label}"
+            continue
+        if key == ord("u"):
+            should_reset = _curses_prompt_yes_no(
+                stdscr,
+                f"Reset Category Defaults: {category_spec.label}",
+                [
+                    f"Route: {route_spec.label}",
+                    f"Category: {category_spec.label}",
+                    "Reset every setting in this category to defaults?",
+                ],
+                default=False,
+            )
+            if should_reset:
+                for setting in settings:
+                    pending_changes[setting.path] = _default_value_for_setting(setting)
+                status_text = f"reset category to defaults: {category_spec.label}"
+            else:
+                status_text = "reset cancelled"
+            continue
+        if key == ord("s"):
+            status_text = str(save_callback())
+            continue
+
+
+def _curses_route_config_workspace(
+    stdscr: Any,
+    *,
+    watchdog: InterfaceWatchdog,
+    route_key: str,
+    config_data: dict[str, Any],
+    runtime_settings: dict[str, Any],
+) -> str:
+    route_spec = ROUTE_CONFIG_SPECS.get(route_key)
+    if route_spec is None:
+        _curses_message(
+            stdscr,
+            "Route Config",
+            [f"No configuration schema defined for route: {route_key}"],
+        )
+        return f"no config schema for route {route_key}"
+
+    category_idx = 0
+    pending_changes: dict[str, Any] = {}
+    status_text = "ready"
+    settings_by_path = _settings_by_path(route_spec)
+
+    def _save_pending_changes() -> str:
+        nonlocal status_text
+        if not pending_changes:
+            return "no pending changes"
+
+        next_config = copy.deepcopy(config_data)
+        changed_paths: list[str] = []
+        for path, pending_value in pending_changes.items():
+            setting = settings_by_path.get(path)
+            if setting is None:
+                continue
+            ok, parsed, error = _coerce_setting_value(setting, pending_value)
+            if not ok:
+                _curses_message(
+                    stdscr,
+                    "Save Failed",
+                    [f"Invalid value for {setting.label}", f"Reason: {error}"],
+                )
+                return f"save failed: {setting.label}"
+            _set_config_path(next_config, path, parsed)
+            changed_paths.append(path)
+
+        if not changed_paths:
+            return "no valid pending changes"
+
+        try:
+            backup = backup_file(CONFIG_FILE)
+            write_json_atomic(CONFIG_FILE, next_config)
+        except OSError as error:
+            _curses_message(
+                stdscr,
+                "Save Failed",
+                [f"Could not write config file: {error}"],
+            )
+            return f"save failed: {error}"
+
+        next_runtime = build_runtime_settings(config_data=next_config)
+        config_data.clear()
+        config_data.update(next_config)
+        runtime_settings.clear()
+        runtime_settings.update(next_runtime)
+        watchdog.update_runtime_settings(runtime_settings)
+
+        restart_required = any(
+            settings_by_path[path].restart_required
+            for path in changed_paths
+            if path in settings_by_path
+        )
+        pending_changes.clear()
+
+        save_message = f"saved {len(changed_paths)} setting(s)"
+        if backup:
+            save_message += f" (backup: {backup.name})"
+
+        route_status = watchdog.status().get(route_key, {})
+        is_running = bool(route_status.get("running"))
+        if restart_required and is_running:
+            restart_now = _curses_prompt_yes_no(
+                stdscr,
+                f"Restart Route: {route_key}",
+                [
+                    "One or more saved settings require restart to apply.",
+                    f"Restart route '{route_key}' now?",
+                ],
+                default=True,
+            )
+            if restart_now:
+                watchdog.stop(route_key)
+                watchdog.start(route_key)
+                save_message += " | route restarted"
+            else:
+                save_message += " | restart pending"
+
+        return save_message
+
+    while True:
+        status = watchdog.status().get(route_key, {})
+        categories = list(route_spec.categories)
+        category_idx = max(0, min(category_idx, max(0, len(categories) - 1)))
+
+        stdscr.erase()
+        running = "yes" if status.get("running") else "no"
+        desired = "on" if status.get("desired") else "off"
+        policy = "auto" if status.get("restart_on_exit") else "manual"
+
+        _safe_addstr(stdscr, 0, 0, f"Route Config: {route_spec.label}", curses.A_BOLD if curses else 0)
+        _safe_addstr(
+            stdscr,
+            1,
+            0,
+            f"Route: {route_key} | Script: {status.get('script', '-') } | Desired: {desired} | Running: {running} | Policy: {policy}",
+        )
+        _safe_addstr(
+            stdscr,
+            2,
+            0,
+            f"Access: {_route_access_summary(route_key, config_data, runtime_settings, entry=status)}",
+        )
+        _safe_addstr(
+            stdscr,
+            3,
+            0,
+            "Controls: Up/Down select | Enter category | s save | d discard | r restart route | t toggle | o open | q back",
+        )
+        _safe_addstr(stdscr, 4, 0, f"Pending changes: {len(pending_changes)}")
+        _safe_addstr(stdscr, 5, 0, f"Status: {status_text}")
+
+        _safe_addstr(stdscr, 7, 0, "Categories")
+        _safe_addstr(stdscr, 8, 0, "---------------------------------------------------------------")
+        row = 9
+        for idx, category in enumerate(categories):
+            category_pending = sum(1 for setting in category.settings if setting.path in pending_changes)
+            line = f"{category.label:<28} settings={len(category.settings):<3} pending={category_pending:<3}"
+            attr = curses.A_REVERSE if (curses and idx == category_idx) else 0
+            _safe_addstr(stdscr, row, 0, line, attr)
+            row += 1
+
+        preview_row = row + 1
+        if categories:
+            selected_category = categories[category_idx]
+            _safe_addstr(
+                stdscr,
+                preview_row,
+                0,
+                f"Selected category: {selected_category.label}",
+                curses.A_BOLD if curses else 0,
+            )
+            preview_row += 1
+            for setting in selected_category.settings[:6]:
+                value, source, _ = _resolve_setting_value(
+                    setting,
+                    config_data=config_data,
+                    pending_changes=pending_changes,
+                    runtime_settings=runtime_settings,
+                )
+                marker = "*" if setting.path in pending_changes else " "
+                line = (
+                    f"{marker} {setting.label:<24} "
+                    f"{_trim_text(_format_setting_value(value, sensitive=setting.sensitive), 26):<26} "
+                    f"{source}"
+                )
+                _safe_addstr(stdscr, preview_row, 0, line)
+                preview_row += 1
+
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (ord("q"), ord("b"), 27):
+            if pending_changes:
+                should_discard = _curses_prompt_yes_no(
+                    stdscr,
+                    f"Discard Pending Changes: {route_spec.label}",
+                    [
+                        f"Route: {route_key}",
+                        f"Unsaved settings: {len(pending_changes)}",
+                        "Discard pending edits and return to dashboard?",
+                    ],
+                    default=False,
+                )
+                if not should_discard:
+                    status_text = "discard cancelled"
+                    continue
+            return status_text
+        if key in (curses.KEY_UP if curses else -1, ord("k")):
+            category_idx = max(0, category_idx - 1)
+            continue
+        if key in (curses.KEY_DOWN if curses else -1, ord("j")):
+            category_idx = min(len(categories) - 1, category_idx + 1) if categories else 0
+            continue
+        if key in (10, 13):
+            if not categories:
+                continue
+            selected_category = categories[category_idx]
+            status_text = _curses_route_category_menu(
+                stdscr,
+                watchdog=watchdog,
+                route_spec=route_spec,
+                route_key=route_key,
+                category_spec=selected_category,
+                config_data=config_data,
+                runtime_settings=runtime_settings,
+                pending_changes=pending_changes,
+                save_callback=_save_pending_changes,
+            )
+            continue
+        if key == ord("s"):
+            status_text = _save_pending_changes()
+            continue
+        if key == ord("d"):
+            if not pending_changes:
+                status_text = "no pending changes"
+                continue
+            should_discard = _curses_prompt_yes_no(
+                stdscr,
+                f"Discard Pending Changes: {route_spec.label}",
+                [
+                    f"Route: {route_key}",
+                    f"Unsaved settings: {len(pending_changes)}",
+                    "Discard all pending edits?",
+                ],
+                default=False,
+            )
+            if should_discard:
+                pending_changes.clear()
+                status_text = "discarded pending changes"
+            else:
+                status_text = "discard cancelled"
+            continue
+        if key == ord("t"):
+            watchdog.toggle(route_key)
+            status_text = f"toggled route {route_key}"
+            continue
+        if key == ord("r"):
+            route_status = watchdog.status().get(route_key, {})
+            if route_status.get("running"):
+                watchdog.stop(route_key)
+                watchdog.start(route_key)
+                status_text = f"restarted route {route_key}"
+            else:
+                status_text = f"route {route_key} not running"
+            continue
+        if key == ord("o"):
+            opened, lines = _route_open_action(route_key, status, config_data, runtime_settings)
+            _curses_message(stdscr, f"Open Interface: {route_key}", lines)
+            status_text = f"opened route {route_key}" if opened else f"open failed for {route_key}"
+            continue
+
+
 def _curses_view_route_log(stdscr: Any, watchdog: InterfaceWatchdog, route_key: str) -> None:
     while True:
         stdscr.erase()
@@ -1983,17 +3165,24 @@ def watchdog_dashboard_curses(
             _safe_addstr(stdscr, 3, 0, f"Postgres fallback: {fallback_pg_link or '(disabled)'}")
             _safe_addstr(stdscr, 4, 0, f"Web: {web_ui_url}")
             _safe_addstr(stdscr, 5, 0, f"Telegram: {telegram_url}")
+            stage_progress_enabled = bool(get_runtime_setting(runtime_settings, "telegram.show_stage_progress", True))
             _safe_addstr(
                 stdscr,
                 6,
                 0,
-                "Controls: Up/Down select | Enter/r open interface | Space toggle | s start | x stop | a/o all | l logs | q quit",
+                f"Telegram stage progress: {'on' if stage_progress_enabled else 'off'}",
             )
-            _safe_addstr(stdscr, 7, 0, f"Status: {last_status_text}")
-            _safe_addstr(stdscr, 9, 0, "Route      Desired Running PID      User      Uptime   Restarts LastExit Policy  State")
-            _safe_addstr(stdscr, 10, 0, "------------------------------------------------------------------------------------------------")
+            _safe_addstr(
+                stdscr,
+                7,
+                0,
+                "Controls: Up/Down select | Enter config | r open interface | Space toggle | s start | x stop | a/o all | l logs | q quit",
+            )
+            _safe_addstr(stdscr, 8, 0, f"Status: {last_status_text}")
+            _safe_addstr(stdscr, 10, 0, "Route      Desired Running PID      User      Uptime   Restarts LastExit Policy  State")
+            _safe_addstr(stdscr, 11, 0, "------------------------------------------------------------------------------------------------")
 
-            row = 11
+            row = 12
             for idx, key in enumerate(keys):
                 entry = status[key]
                 desired = "on" if entry["desired"] else "off"
@@ -2040,7 +3229,18 @@ def watchdog_dashboard_curses(
             if key in (curses.KEY_DOWN if curses else -1, ord("j")):
                 selected_idx = min(len(keys) - 1, selected_idx + 1) if keys else 0
                 continue
-            if key in (10, 13, ord("r")):
+            if key in (10, 13):
+                if keys:
+                    route_key = keys[selected_idx]
+                    last_status_text = _curses_route_config_workspace(
+                        stdscr,
+                        watchdog=watchdog,
+                        route_key=route_key,
+                        config_data=config_data,
+                        runtime_settings=runtime_settings,
+                    )
+                continue
+            if key == ord("r"):
                 if keys:
                     route_key = keys[selected_idx]
                     opened, lines = _route_open_action(
