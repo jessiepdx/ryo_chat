@@ -11,6 +11,8 @@ For the full engineering baseline and upgrade roadmap, see:
 - `docs/master-engineering.md`
 - `docs/CHANGELOG_ENGINEERING.md`
 - `docs/DOC_UPDATE_CHECKLIST.md`
+- `docs/prerequisites.md`
+- `docs/troubleshooting-startup.md`
 - `docs/policy-guide.md`
 
 ## References
@@ -45,6 +47,10 @@ python3 telegram_ui.py
 python3 web_ui.py
 python3 cli_ui.py
 ```
+
+Prerequisite and startup guides:
+1. `docs/prerequisites.md`
+2. `docs/troubleshooting-startup.md`
 
 Optional setup flags:
 ```bash
@@ -88,6 +94,29 @@ Critical notes:
 
 ## PostgreSQL + pgvector Setup
 The app auto-creates tables, but it expects pgvector types to be available.
+
+Automated bootstrap (idempotent):
+```bash
+# bootstrap using current config.json primary DB settings
+python3 scripts/bootstrap_postgres.py --config config.json --target primary
+
+# bootstrap both primary + enabled fallback DB targets from config.json
+python3 scripts/bootstrap_postgres.py --config config.json --target both
+
+# verification-only run using default SQL check (scripts/verify_pgvector.sql)
+python3 scripts/bootstrap_postgres.py --config config.json --target primary --verify-only
+```
+
+Optional local dockerized provisioning:
+```bash
+python3 scripts/bootstrap_postgres.py \
+  --user postgres_user \
+  --password postgres_password \
+  --db-name ryo_chat \
+  --host 127.0.0.1 \
+  --port 5432 \
+  --docker
+```
 
 ### Option A: Docker (simple local dev)
 ```bash

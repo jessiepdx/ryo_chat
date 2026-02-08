@@ -1542,6 +1542,7 @@ def main() -> int:
         print("Setup precedence (host): explicit custom -> existing config -> default local")
         print(f"Ollama endpoint in use: {state['ollama_host']}")
     print("Startup hints:")
+    print("  python3 scripts/bootstrap_postgres.py --config config.json --target both")
     print("  python3 telegram_ui.py")
     print("  python3 web_ui.py")
     print("  python3 cli_ui.py")

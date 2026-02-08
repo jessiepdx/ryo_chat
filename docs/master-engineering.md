@@ -35,8 +35,8 @@ This document covers:
 6. Policy walkthrough and setup: Implemented (`PolicyManager` added with schema/prompt/model validation, warning/strict model compatibility checks, and guided CLI editor in `scripts/policy_wizard.py`).
 7. Tool-calling stack review and improvements: Implemented (canonical tool registry, strict argument parsing/coercion path, structured unknown-tool handling, and expanded tool-calling tests).
 8. Automatic ingress of Telegram keys: Implemented (telegram-only setup/rotation mode, config merge preservation for inference/DB sections, startup validation in Telegram/Web miniapp paths, and ingress validation tests).
-9. Master engineering documentation and prerequisite explainer: In progress.
-10. Automated pgvector + PostgreSQL setup: Partially implemented (bootstrap script exists; wider orchestration integration pending).
+9. Master engineering documentation and prerequisite explainer: Implemented (`docs/prerequisites.md` and `docs/troubleshooting-startup.md` added, README linkage updated, and sync checklist expanded).
+10. Automated pgvector + PostgreSQL setup: Implemented (config/manual bootstrap utility expanded with idempotent DB creation, optional docker provisioning, extension/type verification, SQL check support, and bootstrap tests).
 
 ## 3. Current State Review
 

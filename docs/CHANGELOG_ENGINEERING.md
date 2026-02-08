@@ -117,3 +117,31 @@ Implemented:
    - `web_ui.py` now reports configuration errors for miniapp login with explicit 4xx/5xx responses instead of unsafe failures.
 7. Added tests in `tests/test_telegram_config_ingress.py` for Telegram ingress merge behavior and env preservation.
 8. Updated operator documentation in `readme.md` and status snapshot in `docs/master-engineering.md`.
+
+### WO-009: Master Engineering Documentation and Prerequisite Explainer
+Status: Implemented
+
+Implemented:
+1. Added prerequisite matrix and config key contract documentation in `docs/prerequisites.md`.
+2. Added startup symptom-based runbook in `docs/troubleshooting-startup.md`.
+3. Documented required-vs-optional key behavior for Telegram, Ollama, PostgreSQL fallback, Brave, and X/Twitter surfaces.
+4. Added explicit Ollama host precedence and custom-host troubleshooting flow in prerequisite docs.
+5. Updated `readme.md` to link and surface prerequisite and troubleshooting documentation.
+6. Updated sync workflow expectations in `docs/DOC_UPDATE_CHECKLIST.md`.
+7. Updated implementation snapshot in `docs/master-engineering.md` (item #9).
+8. Aligned `.env.example` fallback PostgreSQL labeling with current setup/runtime behavior.
+
+### WO-010: Automated pgvector and PostgreSQL Setup
+Status: Implemented
+
+Implemented:
+1. Expanded `scripts/bootstrap_postgres.py` into an idempotent operator bootstrap tool with:
+   - manual target mode
+   - config-driven target mode (`--config` with `primary`/`fallback`/`both`)
+   - explicit retry behavior and non-zero exits on failure
+2. Added optional dockerized local provisioning (`--docker`) for pgvector-backed PostgreSQL bootstrap flows.
+3. Added extension/type verification and vector probe checks to ensure pgvector usability before runtime startup.
+4. Added SQL-based verification hook and default check file `scripts/verify_pgvector.sql`.
+5. Added unit tests in `tests/test_pg_bootstrap.py` for config target loading, redaction behavior, and failure-path exit handling.
+6. Updated operator setup docs in `readme.md` with automated bootstrap commands.
+7. Updated implementation snapshot in `docs/master-engineering.md` (item #10).

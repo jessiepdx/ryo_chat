@@ -16,14 +16,17 @@ Use this checklist for every change that affects setup, config/env schemas, runt
 1. Update `docs/master-engineering.md`:
    - status snapshot
    - architecture/plan changes
-2. Update `readme.md`:
+2. Update prerequisite-facing docs:
+   - `docs/prerequisites.md`
+   - `docs/troubleshooting-startup.md`
+3. Update `readme.md`:
    - setup commands
    - prerequisites
    - key behavior notes
-3. Update templates:
+4. Update templates:
    - `config.empty.json`
    - `.env.example`
-4. Update this changelog:
+5. Update this changelog:
    - `docs/CHANGELOG_ENGINEERING.md`
 
 ## 3. Setup and Endpoint Consistency Checks
@@ -36,6 +39,7 @@ Use this checklist for every change that affects setup, config/env schemas, runt
    - fallback route
    - degraded/failed status handling
 3. Confirm setup scripts preserve unrelated config sections when editing one domain.
+4. Confirm README links to `docs/prerequisites.md` and `docs/troubleshooting-startup.md`.
 
 ## 4. Policy and Secondary File Checks
 1. If policy behavior changed, update:
