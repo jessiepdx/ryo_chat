@@ -22,6 +22,32 @@ For the full engineering baseline and upgrade roadmap, see:
 - pgvector: https://github.com/pgvector/pgvector
 
 ## Quick Start
+Single-entry launcher (recommended):
+```bash
+python3 app.py
+```
+
+`app.py` handles:
+1. `.venv` creation/re-entry
+2. dependency install when `requirements.txt` changes
+3. `logs/` creation
+4. `config.json` + `.env` templating if missing
+5. first-run/recovery setup-wizard invocation
+6. Ollama reachability/model checks + default text-model selection
+7. central watchdog menu to toggle `web_ui.py`, `telegram_ui.py`, `cli_ui.py`, and `x_ui.py`
+
+`app.py` optional flags:
+```bash
+# run bootstrap only, skip watchdog menu
+python3 app.py --bootstrap-only
+
+# avoid prompts where possible
+python3 app.py --non-interactive
+```
+
+Note: `--non-interactive` runs bootstrap checks and exits (no watchdog menu).
+
+Manual flow (advanced/legacy):
 1. Create a virtual environment and install dependencies.
 ```bash
 python3 -m venv .venv
