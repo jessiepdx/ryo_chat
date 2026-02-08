@@ -1,5 +1,8 @@
 import copy
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import app
 
@@ -106,6 +109,30 @@ class TestAppLauncher(unittest.TestCase):
         self.assertEqual(updated["inference"]["tool"]["model"], "qwen2.5:latest")
         for key in app.INFERENCE_KEYS:
             self.assertEqual(updated["inference"][key]["url"], "http://127.0.0.1:11434")
+
+    def test_ensure_requirements_installed_uses_venv_python(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_root = Path(tmp_dir)
+            requirements_file = tmp_root / "requirements.txt"
+            requirements_file.write_text("pytest==8.4.0\n", encoding="utf-8")
+            venv_dir = tmp_root / ".venv"
+            venv_python = venv_dir / "bin" / "python"
+            venv_python.parent.mkdir(parents=True, exist_ok=True)
+            venv_python.write_text("", encoding="utf-8")
+            requirements_stamp = venv_dir / ".requirements.sha256"
+
+            with (
+                mock.patch.object(app, "REQUIREMENTS_FILE", requirements_file),
+                mock.patch.object(app, "REQUIREMENTS_STAMP", requirements_stamp),
+                mock.patch.object(app, "VENV_DIR", venv_dir),
+                mock.patch.object(app, "run_command") as run_mock,
+            ):
+                app.ensure_requirements_installed()
+
+            self.assertTrue(run_mock.called)
+            invoked_command = run_mock.call_args.args[0]
+            self.assertEqual(invoked_command[0], str(venv_python))
+            self.assertEqual(invoked_command[1:4], ["-m", "pip", "install"])
 
 
 if __name__ == "__main__":

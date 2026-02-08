@@ -10,7 +10,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from hypermindlabs.runtime_settings import DEFAULT_RUNTIME_SETTINGS
 from hypermindlabs.tool_runtime import ToolDefinition, ToolRuntime
+
+
+_TOOL_RUNTIME_DEFAULTS = DEFAULT_RUNTIME_SETTINGS.get("tool_runtime", {})
+DEFAULT_TIMEOUT_SECONDS = float(_TOOL_RUNTIME_DEFAULTS.get("default_timeout_seconds", 8.0))
+DEFAULT_MAX_RETRIES = int(_TOOL_RUNTIME_DEFAULTS.get("default_max_retries", 1))
+BRAVE_TIMEOUT_SECONDS = float(_TOOL_RUNTIME_DEFAULTS.get("brave_timeout_seconds", 10.0))
+CHAT_HISTORY_TIMEOUT_SECONDS = float(_TOOL_RUNTIME_DEFAULTS.get("chat_history_timeout_seconds", 6.0))
+KNOWLEDGE_TIMEOUT_SECONDS = float(_TOOL_RUNTIME_DEFAULTS.get("knowledge_timeout_seconds", 6.0))
+SKIP_TOOLS_TIMEOUT_SECONDS = float(_TOOL_RUNTIME_DEFAULTS.get("skip_tools_timeout_seconds", 2.0))
 
 
 def _coerce_query(value: Any) -> str:
@@ -59,8 +69,8 @@ class ToolSpec:
     function: Callable[..., Any]
     args: tuple[ToolArgSpec, ...]
     required_api_key: str | None = None
-    default_timeout_seconds: float = 8.0
-    default_max_retries: int = 1
+    default_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    default_max_retries: int = DEFAULT_MAX_RETRIES
 
     @property
     def required_args(self) -> tuple[str, ...]:
@@ -150,7 +160,7 @@ def build_tool_specs(
             function=brave_search_fn,
             args=(query_arg, count_arg),
             required_api_key="brave_search",
-            default_timeout_seconds=10.0,
+            default_timeout_seconds=BRAVE_TIMEOUT_SECONDS,
             default_max_retries=1,
         ),
         "chatHistorySearch": ToolSpec(
@@ -158,7 +168,7 @@ def build_tool_specs(
             description="Search prior chat history for semantically related messages.",
             function=chat_history_search_fn,
             args=(query_arg, narrow_count_arg),
-            default_timeout_seconds=6.0,
+            default_timeout_seconds=CHAT_HISTORY_TIMEOUT_SECONDS,
             default_max_retries=0,
         ),
         "knowledgeSearch": ToolSpec(
@@ -169,7 +179,7 @@ def build_tool_specs(
             ),
             function=knowledge_search_fn,
             args=(query_arg, narrow_count_arg),
-            default_timeout_seconds=6.0,
+            default_timeout_seconds=KNOWLEDGE_TIMEOUT_SECONDS,
             default_max_retries=0,
         ),
         "skipTools": ToolSpec(
@@ -177,7 +187,7 @@ def build_tool_specs(
             description="Skip tool usage and continue to the next agent.",
             function=skip_tools_fn,
             args=(),
-            default_timeout_seconds=2.0,
+            default_timeout_seconds=SKIP_TOOLS_TIMEOUT_SECONDS,
             default_max_retries=0,
         ),
     }
@@ -212,8 +222,8 @@ def register_runtime_tools(
     runtime: ToolRuntime,
     specs: dict[str, ToolSpec],
     tool_policy: dict[str, Any] | None = None,
-    default_timeout_seconds: float = 8.0,
-    default_max_retries: int = 1,
+    default_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    default_max_retries: int = DEFAULT_MAX_RETRIES,
     reject_unknown_args: bool = False,
 ) -> None:
     tool_policy = tool_policy if isinstance(tool_policy, dict) else {}

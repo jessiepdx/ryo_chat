@@ -15,13 +15,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from hypermindlabs.runtime_settings import DEFAULT_RUNTIME_SETTINGS
+
 try:
     from ollama import Client
 except Exception:  # noqa: BLE001
     Client = None
 
 
-DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_HOST = str(
+    DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_ollama_host", "http://127.0.0.1:11434")
+)
 FALLBACK_SYSTEM_PROMPT = "You are a helpful AI assistant."
 INFERENCE_HOST_ORDER = ("tool", "chat", "generate", "embedding", "multimodal")
 
@@ -183,7 +187,24 @@ class PolicyManager:
             model_name = section.get("model")
             if isinstance(model_name, str) and model_name.strip():
                 return model_name.strip()
-        return "llama3.2:latest"
+
+        runtimeKey = {
+            "embedding": "inference.default_embedding_model",
+            "generate": "inference.default_generate_model",
+            "tool": "inference.default_tool_model",
+            "chat": "inference.default_chat_model",
+            "multimodal": "inference.default_multimodal_model",
+        }.get(inference_key, "inference.default_chat_model")
+        fallback = DEFAULT_RUNTIME_SETTINGS
+        for part in runtimeKey.split("."):
+            if not isinstance(fallback, dict):
+                break
+            fallback = fallback.get(part)
+        if isinstance(fallback, str) and fallback.strip():
+            return fallback.strip()
+        return str(
+            DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_chat_model", "llama3.2:latest")
+        )
 
     def default_policy(self, policy_name: str) -> dict[str, Any]:
         fallback = {

@@ -12,6 +12,13 @@ from typing import Any
 
 import psycopg
 
+from hypermindlabs.runtime_settings import DEFAULT_RUNTIME_SETTINGS
+
+
+DEFAULT_DB_CONNECT_TIMEOUT = int(
+    DEFAULT_RUNTIME_SETTINGS.get("database", {}).get("connect_timeout_seconds", 2)
+)
+
 
 @dataclass
 class DatabaseRoute:
@@ -37,7 +44,7 @@ class DatabaseRouter:
         primary_database: dict | None,
         fallback_database: dict | None = None,
         fallback_enabled: bool | None = None,
-        connect_timeout: int = 2,
+        connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     ):
         self._primary_database = primary_database or {}
         self._fallback_database = fallback_database or {}

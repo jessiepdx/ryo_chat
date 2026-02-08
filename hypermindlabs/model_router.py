@@ -11,10 +11,13 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
+from hypermindlabs.runtime_settings import DEFAULT_RUNTIME_SETTINGS
 from ollama import AsyncClient
 
 
-DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_HOST = str(
+    DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_ollama_host", "http://127.0.0.1:11434")
+)
 
 
 class ModelRouterError(Exception):

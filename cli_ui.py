@@ -61,7 +61,10 @@ ollamaClient = Client(host=toolInference.get("url"))
 # Think of this as UI or user policy
 settings = {
     "show_stats": False,
-    "model": "llama3.2:latest"
+    "model": config.inference.get("chat", {}).get(
+        "model",
+        config.runtimeValue("inference.default_chat_model", "llama3.2:latest"),
+    ),
 }
 
 logger.info(f"Database route status: {config.databaseRoute}")
@@ -110,7 +113,8 @@ async def main():
     lastMessageID = 0
     # Load in some chat history
     if len(messageHistory) == 0:
-        shortHistory = chats.getChatHistory(memberID, "member", "cli", limit=20)
+        shortHistoryLimit = config.runtimeInt("retrieval.conversation_short_history_limit", 20)
+        shortHistory = chats.getChatHistory(memberID, "member", "cli", limit=shortHistoryLimit)
         for historyMessage in shortHistory:
             role = "assistant" if historyMessage.get("member_id") is None else "user"
             content = historyMessage.get("message_text")

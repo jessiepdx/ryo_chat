@@ -30,7 +30,13 @@ import textstat
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from hypermindlabs.database_router import DatabaseRouter
+from hypermindlabs.runtime_settings import (
+    build_runtime_settings,
+    get_runtime_setting,
+    load_dotenv_file,
+)
 from math import ceil
 from ollama import Client
 from psycopg.rows import dict_row
@@ -405,19 +411,24 @@ class MemberManager:
         member = self.getMemberByID(memberID)
         if member is None:
             return None
+        minPasswordLength = ConfigManager().runtimeInt("security.password_min_length", 12)
         
         # Create a random password if none was sent
         if password is None:
             alphabet = string.ascii_letters + string.digits
             while True:
-                password = ''.join(secrets.choice(alphabet) for i in range(12))
+                password = ''.join(secrets.choice(alphabet) for i in range(max(8, minPasswordLength)))
                 if (any(c.islower() for c in password)
                         and any(c.isupper() for c in password)
                         and sum(c.isdigit() for c in password) >= 2):
                     break
         else:
             # Return None if the password does not meet minimum requirements
-            pattern = re.compile(r"(?=.*\d)(?=.*[a-z])(?=.*[A-Z])(?=.*[-+_!@#$%^&*.,?]).{12,}")
+            pattern = re.compile(
+                r"(?=.*\d)(?=.*[a-z])(?=.*[A-Z])(?=.*[-+_!@#$%^&*.,?]).{"
+                + str(max(8, minPasswordLength))
+                + r",}"
+            )
             validPassword = pattern.search(password)
             if validPassword is None:
                 logger.error("Invalid password.")
@@ -505,6 +516,7 @@ class MemberManager:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                 cursor = connection.cursor()
                 logger.debug(f"PostgreSQL connection established.")
+                vectorDimensions = max(1, ConfigManager().runtimeInt("vectors.embedding_dimensions", 768))
                 
                 updateRoles_sql = "UPDATE member_data SET roles = %s WHERE member_id = %s;"
                 valueTuple = (roles, memberID)
@@ -637,10 +649,10 @@ class ChatHistoryManager:
                 );"""
                 cursor.execute(memberHistory_sql)
 
-                createHistorySQL = """CREATE TABLE IF NOT EXISTS chat_history_embeddings (
+                createHistorySQL = f"""CREATE TABLE IF NOT EXISTS chat_history_embeddings (
                     embedding_id SERIAL PRIMARY KEY,
                     history_id INT NOT NULL,
-                    embeddings vector(768),
+                    embeddings vector({vectorDimensions}),
                     CONSTRAINT message_link
                         FOREIGN KEY(history_id)
                         REFERENCES chat_history(history_id)
@@ -793,9 +805,21 @@ class ChatHistoryManager:
             
             return response
 
-    def getChatHistory(self, chatHostID: int, chatType: str, platform: str, topicID: int = None, timeInHours: int = 12, limit: int = 1) -> list:
+    def getChatHistory(
+        self,
+        chatHostID: int,
+        chatType: str,
+        platform: str,
+        topicID: int = None,
+        timeInHours: int | None = None,
+        limit: int | None = None,
+    ) -> list:
         logger.info(f"Getting chat history records.")
-        timePeriod = datetime.now() - timedelta(hours=timeInHours)
+        if timeInHours is None:
+            timeInHours = ConfigManager().runtimeInt("retrieval.chat_history_window_hours", 12)
+        if limit is None:
+            limit = ConfigManager().runtimeInt("retrieval.chat_history_default_limit", 1)
+        timePeriod = datetime.now() - timedelta(hours=max(0, int(timeInHours)))
         
         connection = None
         results = None
@@ -811,7 +835,7 @@ class ChatHistoryManager:
                 AND platform = %s
                 AND message_timestamp > %s"""
             
-            endQuery_sql = " ORDER BY message_timestamp;"
+            endQuery_sql = " ORDER BY message_timestamp"
 
             valueArray = [chatHostID, chatType, platform, timePeriod]
 
@@ -820,9 +844,11 @@ class ChatHistoryManager:
                 valueArray.append(topicID)
             else:
                 beginQuery_sql = beginQuery_sql + " AND topic_id IS NULL"
-            
+            if int(limit) > 0:
+                endQuery_sql += " LIMIT %s"
+                valueArray.append(int(limit))
 
-            historyQuery_sql = beginQuery_sql + endQuery_sql
+            historyQuery_sql = beginQuery_sql + endQuery_sql + ";"
             cursor.execute(historyQuery_sql, valueArray)
 
             results = cursor.fetchall()
@@ -837,9 +863,21 @@ class ChatHistoryManager:
             
             return results
 
-    def getChatHistoryWithSenderData(self, chatHostID: int, chatType: str, platform: str, topicID: int = None, timeInHours: int = 12, limit: int = 0) -> list:
+    def getChatHistoryWithSenderData(
+        self,
+        chatHostID: int,
+        chatType: str,
+        platform: str,
+        topicID: int = None,
+        timeInHours: int | None = None,
+        limit: int | None = None,
+    ) -> list:
         logger.info(f"Getting chat history records.")
-        timePeriod = datetime.now() - timedelta(hours=timeInHours)
+        if timeInHours is None:
+            timeInHours = ConfigManager().runtimeInt("retrieval.chat_history_sender_window_hours", 12)
+        if limit is None:
+            limit = ConfigManager().runtimeInt("retrieval.chat_history_sender_default_limit", 0)
+        timePeriod = datetime.now() - timedelta(hours=max(0, int(timeInHours)))
         
         connection = None
         results = None
@@ -857,7 +895,7 @@ class ChatHistoryManager:
                 AND platform = %s
                 AND message_timestamp > %s"""
             
-            endQuery_sql = " ORDER BY message_timestamp;"
+            endQuery_sql = " ORDER BY message_timestamp"
 
             valueArray = [chatHostID, chatType, platform, timePeriod]
 
@@ -866,9 +904,11 @@ class ChatHistoryManager:
                 valueArray.append(topicID)
             else:
                 beginQuery_sql = beginQuery_sql + " AND topic_id IS NULL"
-            
+            if int(limit) > 0:
+                endQuery_sql += " LIMIT %s"
+                valueArray.append(int(limit))
 
-            historyQuery_sql = beginQuery_sql + endQuery_sql
+            historyQuery_sql = beginQuery_sql + endQuery_sql + ";"
             cursor.execute(historyQuery_sql, valueArray)
 
             results = cursor.fetchall()
@@ -946,9 +986,11 @@ class ChatHistoryManager:
             
             return response
 
-    def searchChatHistory(self, text: str, limit: int=1) -> list:
+    def searchChatHistory(self, text: str, limit: int | None = None) -> list:
         logger.info(f"Searching chat history records.")
         embedding = getEmbeddings(text)
+        if limit is None:
+            limit = ConfigManager().runtimeInt("retrieval.chat_history_default_limit", 1)
         
         connection = None
         response = None
@@ -963,7 +1005,7 @@ class ChatHistoryManager:
             ON ch.history_id = che.history_id
             ORDER BY distance
             LIMIT %s"""
-            cursor.execute(querySQL, (embedding, limit))
+            cursor.execute(querySQL, (embedding, max(1, int(limit))))
             results = cursor.fetchall()
             response = results
             # close the communication with the PostgreSQL
@@ -1174,7 +1216,7 @@ class CommunityScoreManager:
     _instance = None
 
     # Set community score rules
-    communityScoreRules = [
+    defaultCommunityScoreRules = [
         {
             "private" : {
                 "min" : 50
@@ -1240,6 +1282,11 @@ class CommunityScoreManager:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(CommunityScoreManager, cls).__new__(cls)
+            configuredRules = ConfigManager().runtimeValue("community.score_rules", cls.defaultCommunityScoreRules)
+            if isinstance(configuredRules, list) and len(configuredRules) > 0:
+                cls._instance.communityScoreRules = configuredRules
+            else:
+                cls._instance.communityScoreRules = cls.defaultCommunityScoreRules
 
             connection = None
             try:
@@ -1422,16 +1469,76 @@ class ConfigManager:
             return default
         return value.strip().lower() in {"1", "true", "yes", "on"}
 
+    @staticmethod
+    def _as_non_empty_string(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text if text else None
+
+    @staticmethod
+    def _hydrate_inference_config(
+        inferenceConfig: dict | None,
+        runtimeSettings: dict[str, Any],
+    ) -> dict[str, dict[str, str]]:
+        inferenceConfig = inferenceConfig if isinstance(inferenceConfig, dict) else {}
+        defaultHost = ConfigManager._as_non_empty_string(
+            get_runtime_setting(runtimeSettings, "inference.default_ollama_host", "http://127.0.0.1:11434")
+        ) or "http://127.0.0.1:11434"
+        modelDefaults = {
+            "embedding": ConfigManager._as_non_empty_string(
+                get_runtime_setting(runtimeSettings, "inference.default_embedding_model", "nomic-embed-text:latest")
+            ) or "nomic-embed-text:latest",
+            "generate": ConfigManager._as_non_empty_string(
+                get_runtime_setting(runtimeSettings, "inference.default_generate_model", "llama3.2:latest")
+            ) or "llama3.2:latest",
+            "chat": ConfigManager._as_non_empty_string(
+                get_runtime_setting(runtimeSettings, "inference.default_chat_model", "llama3.2:latest")
+            ) or "llama3.2:latest",
+            "tool": ConfigManager._as_non_empty_string(
+                get_runtime_setting(runtimeSettings, "inference.default_tool_model", "llama3.2:latest")
+            ) or "llama3.2:latest",
+            "multimodal": ConfigManager._as_non_empty_string(
+                get_runtime_setting(runtimeSettings, "inference.default_multimodal_model", "llama3.2-vision:latest")
+            ) or "llama3.2-vision:latest",
+        }
+
+        hydrated: dict[str, dict[str, str]] = {}
+        for key, modelDefault in modelDefaults.items():
+            section = inferenceConfig.get(key)
+            if not isinstance(section, dict):
+                section = {}
+            hostValue = ConfigManager._as_non_empty_string(section.get("url")) or defaultHost
+            modelValue = ConfigManager._as_non_empty_string(section.get("model")) or modelDefault
+            hydrated[key] = {
+                "url": hostValue.rstrip("/"),
+                "model": modelValue,
+            }
+        return hydrated
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(ConfigManager, cls).__new__(cls)
+            load_dotenv_file(".env", override=False)
+            configPath = os.getenv("RYO_CONFIG_PATH", "config.json")
             # Open the config file
-            with open("config.json", "r", encoding="utf-8") as f:
+            with open(configPath, "r", encoding="utf-8") as f:
                 config_json = json.load(f)
+            runtimeSettings = build_runtime_settings(config_json)
 
             database = config_json.get("database")
             if database is None:
                 database = cls._env_db("POSTGRES_")
+            if not isinstance(database, dict):
+                database = {}
+            if not database.get("host"):
+                database["host"] = cls._as_non_empty_string(
+                    get_runtime_setting(runtimeSettings, "database.default_primary_host", "127.0.0.1")
+                ) or "127.0.0.1"
+            if not database.get("port"):
+                database["port"] = cls._as_non_empty_string(
+                    get_runtime_setting(runtimeSettings, "database.default_primary_port", "5432")
+                ) or "5432"
 
             databaseFallback = config_json.get("database_fallback")
             if databaseFallback is None:
@@ -1440,15 +1547,31 @@ class ConfigManager:
                     envFallback["enabled"] = cls._env_bool("POSTGRES_FALLBACK_ENABLED", default=False)
                     envFallback["mode"] = os.getenv("POSTGRES_FALLBACK_MODE", "local")
                     databaseFallback = envFallback
+            if not isinstance(databaseFallback, dict):
+                databaseFallback = {}
+            if not databaseFallback.get("host"):
+                databaseFallback["host"] = cls._as_non_empty_string(
+                    get_runtime_setting(runtimeSettings, "database.default_fallback_host", "127.0.0.1")
+                ) or "127.0.0.1"
+            if not databaseFallback.get("port"):
+                databaseFallback["port"] = cls._as_non_empty_string(
+                    get_runtime_setting(runtimeSettings, "database.default_fallback_port", "5433")
+                ) or "5433"
 
             fallbackEnabled = None
             if isinstance(databaseFallback, dict) and "enabled" in databaseFallback:
                 fallbackEnabled = bool(databaseFallback.get("enabled"))
+            connectTimeout = get_runtime_setting(runtimeSettings, "database.connect_timeout_seconds", 2)
+            try:
+                connectTimeoutInt = int(connectTimeout)
+            except (TypeError, ValueError):
+                connectTimeoutInt = 2
 
             dbRouter = DatabaseRouter(
                 primary_database=database,
                 fallback_database=databaseFallback,
                 fallback_enabled=fallbackEnabled,
+                connect_timeout=connectTimeoutInt,
             )
             dbRoute = dbRouter.resolve()
             connectionString = (
@@ -1457,22 +1580,40 @@ class ConfigManager:
                 or dbRoute.fallback_conninfo
                 or ""
             )
+            defaults = config_json.get("defaults")
+            if not isinstance(defaults, dict):
+                defaults = {}
+
+            inference = cls._hydrate_inference_config(config_json.get("inference"), runtimeSettings)
+            apiKeys = config_json.get("api_keys")
+            if not isinstance(apiKeys, dict):
+                apiKeys = {}
+            twitterKeys = config_json.get("twitter_keys")
+            if not isinstance(twitterKeys, dict):
+                twitterKeys = {}
+            rolesList = config_json.get("roles_list")
+            if not isinstance(rolesList, list):
+                rolesList = ["user", "tester", "marketing", "admin", "owner"]
 
             cls._instance.bot_name = config_json.get("bot_name")
             cls._instance.bot_id = config_json.get("bot_id")
             cls._instance.bot_token = config_json.get("bot_token")
             cls._instance.web_ui_url = config_json.get("web_ui_url")
             cls._instance.owner_info = config_json.get("owner_info")
+            cls._instance.config_path = configPath
+            cls._instance.config_json = config_json
+            cls._instance.config = config_json
+            cls._instance.runtime_settings = runtimeSettings
             cls._instance.database = database
             cls._instance.database_fallback = databaseFallback
             cls._instance.knowledge_domains = None if config_json.get("knowledge") is None else config_json.get("knowledge").get("domains")
-            cls._instance.roles_list = config_json.get("roles_list")
+            cls._instance.roles_list = rolesList
             cls._instance.db_conninfo = connectionString
             cls._instance.database_route = dbRoute.to_dict()
-            cls._instance.defaults = config_json.get("defaults")
-            cls._instance.inference = config_json.get("inference")
-            cls._instance.twitter_keys = config_json.get("twitter_keys")
-            cls._instance.brave_keys = config_json["api_keys"].get("brave_search")
+            cls._instance.defaults = defaults
+            cls._instance.inference = inference
+            cls._instance.twitter_keys = twitterKeys
+            cls._instance.brave_keys = apiKeys.get("brave_search", os.getenv("BRAVE_SEARCH_API_KEY"))
 
             if cls._instance.database_route["status"] == "fallback":
                 logger.warning(
@@ -1531,6 +1672,31 @@ class ConfigManager:
     def isTelegramConfigValid(self, require_owner: bool = True, require_web_ui_url: bool = True) -> bool:
         return len(self.getTelegramConfigIssues(require_owner=require_owner, require_web_ui_url=require_web_ui_url)) == 0
 
+    def runtimeValue(self, path: str, default: Any = None) -> Any:
+        return get_runtime_setting(self._instance.runtime_settings, path, default)
+
+    def runtimeInt(self, path: str, default: int) -> int:
+        value = self.runtimeValue(path, default)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(default)
+
+    def runtimeFloat(self, path: str, default: float) -> float:
+        value = self.runtimeValue(path, default)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def runtimeBool(self, path: str, default: bool) -> bool:
+        value = self.runtimeValue(path, default)
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
     def updateConfig(self, key, value):
         self.config[key] = value
         # Save new config changes to JSON file
@@ -1556,6 +1722,10 @@ class ConfigManager:
     def databaseRoute(self) -> dict:
         return self._instance.database_route
 
+    @property
+    def runtimeSettings(self) -> dict:
+        return self._instance.runtime_settings
+
 
 class KnowledgeManager:
     _instance = None
@@ -1570,16 +1740,17 @@ class KnowledgeManager:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                 cursor = connection.cursor()
                 logger.debug(f"PostgreSQL connection established.")
+                vectorDimensions = max(1, ConfigManager().runtimeInt("vectors.embedding_dimensions", 768))
                 
                 # Create the knowledge table if it does not exist
-                createKnowledgeSQL = """CREATE TABLE IF NOT EXISTS knowledge (
+                createKnowledgeSQL = f"""CREATE TABLE IF NOT EXISTS knowledge (
                     knowledge_id SERIAL PRIMARY KEY,
                     domains TEXT[],
                     roles TEXT[],
                     categories TEXT[],
                     knowledge_document TEXT,
                     document_metadata JSON,
-                    embeddings vector(768),
+                    embeddings vector({vectorDimensions}),
                     record_timestamp TIMESTAMP,
                     record_metadata JSON
                 );"""
@@ -1686,10 +1857,11 @@ class KnowledgeManager:
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
 
+            queryLimit = max(1, ConfigManager().runtimeInt("retrieval.knowledge_list_limit", 10))
             querySQL = """SELECT knowledge_id, domains, roles, categories, knowledge_document, document_metadata, record_timestamp, record_metadata
             FROM knowledge
-            LIMIT 10"""
-            cursor.execute(querySQL)
+            LIMIT %s"""
+            cursor.execute(querySQL, (queryLimit,))
             results = cursor.fetchall()
 
             response = results
@@ -1704,9 +1876,11 @@ class KnowledgeManager:
             
             return response
 
-    def searchKnowledge(self, text: str, limit: int=1) -> list:
+    def searchKnowledge(self, text: str, limit: int | None = None) -> list:
         logger.info(f"Searching knowledge documents.")
         embedding = getEmbeddings(text)
+        if limit is None:
+            limit = ConfigManager().runtimeInt("retrieval.knowledge_search_default_limit", 1)
 
         connection = None
         response = None
@@ -1719,7 +1893,7 @@ class KnowledgeManager:
             FROM knowledge
             ORDER BY distance
             LIMIT %s"""
-            cursor.execute(querySQL, (embedding, limit))
+            cursor.execute(querySQL, (embedding, max(1, int(limit))))
             results = cursor.fetchall()
 
             response = results
@@ -1855,12 +2029,13 @@ class SpamManager:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                 cursor = connection.cursor()
                 logger.debug(f"PostgreSQL connection established.")
+                vectorDimensions = max(1, ConfigManager().runtimeInt("vectors.embedding_dimensions", 768))
                 
                 # Create the knowledge table if it does not exist
-                createSpamSQL = """CREATE TABLE IF NOT EXISTS spam (
+                createSpamSQL = f"""CREATE TABLE IF NOT EXISTS spam (
                     spam_id SERIAL PRIMARY KEY,
                     spam_text TEXT,
-                    embeddings vector(768),
+                    embeddings vector({vectorDimensions}),
                     record_timestamp TIMESTAMP,
                     added_by INT,
                     CONSTRAINT member_link
@@ -1924,10 +2099,11 @@ class SpamManager:
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
 
+            queryLimit = max(1, ConfigManager().runtimeInt("retrieval.spam_list_limit", 10))
             querySQL = """SELECT spam_id, spam_text, record_timestamp, added_by
             FROM spam
-            LIMIT 10"""
-            cursor.execute(querySQL)
+            LIMIT %s"""
+            cursor.execute(querySQL, (queryLimit,))
             results = cursor.fetchall()
 
             response = results
@@ -1942,9 +2118,11 @@ class SpamManager:
             
             return response
 
-    def searchSpam(self, text: str, limit: int=1) -> list:
+    def searchSpam(self, text: str, limit: int | None = None) -> list:
         logger.info(f"Searching spam messages.")
         embedding = getEmbeddings(text)
+        if limit is None:
+            limit = ConfigManager().runtimeInt("retrieval.spam_search_default_limit", 1)
 
         connection = None
         response = None
@@ -1957,7 +2135,7 @@ class SpamManager:
             FROM spam
             ORDER BY distance
             LIMIT %s"""
-            cursor.execute(querySQL, (embedding, limit))
+            cursor.execute(querySQL, (embedding, max(1, int(limit))))
             results = cursor.fetchall()
 
             response = results
@@ -2086,9 +2264,14 @@ class UsageManager:
 def getEmbeddings(text: str) -> list:
     logger.info("Getting embeddings.")
     try:
-        embeddingConfig = ConfigManager().inference.get("embedding", {})
-        host = embeddingConfig.get("url") if embeddingConfig.get("url") else "http://127.0.0.1:11434"
-        model = embeddingConfig.get("model")
+        configManager = ConfigManager()
+        embeddingConfig = configManager.inference.get("embedding", {})
+        host = embeddingConfig.get("url") if embeddingConfig.get("url") else configManager.runtimeValue(
+            "inference.default_ollama_host", "http://127.0.0.1:11434"
+        )
+        model = embeddingConfig.get("model") or configManager.runtimeValue(
+            "inference.default_embedding_model", "nomic-embed-text:latest"
+        )
         if not model:
             logger.error("Embedding model is missing from config inference settings.")
             return None

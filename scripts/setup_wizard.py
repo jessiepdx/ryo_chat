@@ -22,6 +22,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from hypermindlabs.runtime_settings import (
+    DEFAULT_RUNTIME_SETTINGS,
+    build_runtime_settings,
+    get_runtime_setting,
+    load_dotenv_file,
+)
+
 try:
     import curses
 except Exception:  # noqa: BLE001
@@ -33,15 +40,17 @@ except Exception:  # noqa: BLE001
     Client = None
 
 
-DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_HOST = str(
+    DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_ollama_host", "http://127.0.0.1:11434")
+)
 DEFAULT_STATE_PATH = ".setup_wizard_state.json"
 INFERENCE_KEYS = ("embedding", "generate", "chat", "tool", "multimodal")
 DEFAULT_MODELS = {
-    "embedding": "nomic-embed-text:latest",
-    "generate": "llama3.2:latest",
-    "chat": "llama3.2:latest",
-    "tool": "llama3.2:latest",
-    "multimodal": "llama3.2-vision:latest",
+    "embedding": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_embedding_model", "nomic-embed-text:latest")),
+    "generate": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_generate_model", "llama3.2:latest")),
+    "chat": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_chat_model", "llama3.2:latest")),
+    "tool": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_tool_model", "llama3.2:latest")),
+    "multimodal": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_multimodal_model", "llama3.2-vision:latest")),
 }
 
 
@@ -156,6 +165,17 @@ def infer_existing_host(config_data: dict) -> str | None:
     return None
 
 
+def runtime_settings_for_config(config_data: dict) -> dict[str, Any]:
+    return build_runtime_settings(config_data=config_data)
+
+
+def runtime_string(config_data: dict, path: str, fallback: str) -> str:
+    settings = runtime_settings_for_config(config_data)
+    value = get_runtime_setting(settings, path, fallback)
+    text = str(value).strip() if value is not None else ""
+    return text if text else fallback
+
+
 def choose_ollama_host(args: argparse.Namespace, existing_host: str | None) -> str:
     if args.ollama_host:
         if not is_valid_http_url(args.ollama_host):
@@ -172,7 +192,7 @@ def choose_ollama_host(args: argparse.Namespace, existing_host: str | None) -> s
         selected = suggested if entry == "" else entry
         if is_valid_http_url(selected):
             return selected.rstrip("/")
-        print("Endpoint must be a valid http(s) URL, for example: http://127.0.0.1:11434")
+        print(f"Endpoint must be a valid http(s) URL, for example: {DEFAULT_OLLAMA_HOST}")
 
 
 def probe_ollama_models(host: str) -> tuple[list[str], str | None]:
@@ -254,6 +274,12 @@ def _set_if_value(target: dict, key: str, value: str | None) -> None:
 
 
 def set_database_settings(config_data: dict, args: argparse.Namespace) -> dict:
+    runtimeSettings = runtime_settings_for_config(config_data)
+    defaultPrimaryHost = str(get_runtime_setting(runtimeSettings, "database.default_primary_host", "127.0.0.1"))
+    defaultPrimaryPort = str(get_runtime_setting(runtimeSettings, "database.default_primary_port", "5432"))
+    defaultFallbackHost = str(get_runtime_setting(runtimeSettings, "database.default_fallback_host", "127.0.0.1"))
+    defaultFallbackPort = str(get_runtime_setting(runtimeSettings, "database.default_fallback_port", "5433"))
+
     database = config_data.setdefault("database", {})
     if not isinstance(database, dict):
         database = {}
@@ -264,6 +290,10 @@ def set_database_settings(config_data: dict, args: argparse.Namespace) -> dict:
     _set_if_value(database, "password", args.db_password)
     _set_if_value(database, "host", args.db_host)
     _set_if_value(database, "port", args.db_port)
+    if not database.get("host"):
+        database["host"] = defaultPrimaryHost
+    if not database.get("port"):
+        database["port"] = defaultPrimaryPort
 
     fallback = config_data.get("database_fallback")
     if not isinstance(fallback, dict):
@@ -306,9 +336,9 @@ def set_database_settings(config_data: dict, args: argparse.Namespace) -> dict:
         if not fallback.get("password") and database.get("password"):
             fallback["password"] = database.get("password")
         if not fallback.get("host"):
-            fallback["host"] = "127.0.0.1"
+            fallback["host"] = defaultFallbackHost
         if not fallback.get("port"):
-            fallback["port"] = "5433"
+            fallback["port"] = defaultFallbackPort
         if not fallback.get("mode"):
             fallback["mode"] = "local"
 
@@ -698,6 +728,12 @@ def state_to_env_updates(state: dict, telegram_only: bool = False) -> dict[str, 
         "OLLAMA_CHAT_MODEL": state["model_map"]["chat"],
         "OLLAMA_TOOL_MODEL": state["model_map"]["tool"],
         "OLLAMA_MULTIMODAL_MODEL": state["model_map"]["multimodal"],
+        "RYO_DEFAULT_OLLAMA_HOST": state["ollama_host"],
+        "RYO_DEFAULT_EMBEDDING_MODEL": state["model_map"]["embedding"],
+        "RYO_DEFAULT_GENERATE_MODEL": state["model_map"]["generate"],
+        "RYO_DEFAULT_CHAT_MODEL": state["model_map"]["chat"],
+        "RYO_DEFAULT_TOOL_MODEL": state["model_map"]["tool"],
+        "RYO_DEFAULT_MULTIMODAL_MODEL": state["model_map"]["multimodal"],
         "POSTGRES_DB": state["db_name"],
         "POSTGRES_USER": state["db_user"],
         "POSTGRES_PASSWORD": state["db_password"],
@@ -722,6 +758,7 @@ def state_to_env_updates(state: dict, telegram_only: bool = False) -> dict[str, 
 
 def build_state_non_interactive(args: argparse.Namespace, config_data: dict) -> dict:
     config_data = ensure_defaults(config_data)
+    runtimeSettings = runtime_settings_for_config(config_data)
     existing_host = infer_existing_host(config_data)
     selected_host = choose_ollama_host(args, existing_host)
     models, _ = probe_ollama_models(selected_host)
@@ -739,6 +776,10 @@ def build_state_non_interactive(args: argparse.Namespace, config_data: dict) -> 
     fallback = config_data.get("database_fallback", {})
     twitter = config_data.get("twitter_keys", {})
     api_keys = config_data.get("api_keys", {})
+    defaultPrimaryHost = str(get_runtime_setting(runtimeSettings, "database.default_primary_host", "127.0.0.1"))
+    defaultPrimaryPort = str(get_runtime_setting(runtimeSettings, "database.default_primary_port", "5432"))
+    defaultFallbackHost = str(get_runtime_setting(runtimeSettings, "database.default_fallback_host", "127.0.0.1"))
+    defaultFallbackPort = str(get_runtime_setting(runtimeSettings, "database.default_fallback_port", "5433"))
 
     fallback_enabled = args.fallback_enabled or (bool(fallback.get("enabled")) and not args.fallback_disabled)
     state = {
@@ -755,15 +796,15 @@ def build_state_non_interactive(args: argparse.Namespace, config_data: dict) -> 
         "db_name": args.db_name or database.get("db_name", ""),
         "db_user": args.db_user or database.get("user", ""),
         "db_password": args.db_password or database.get("password", ""),
-        "db_host": args.db_host or database.get("host", ""),
-        "db_port": args.db_port or database.get("port", ""),
+        "db_host": args.db_host or database.get("host", defaultPrimaryHost),
+        "db_port": args.db_port or database.get("port", defaultPrimaryPort),
         "fallback_enabled": fallback_enabled,
         "fallback_mode": args.fallback_mode or fallback.get("mode", "local"),
         "fallback_db_name": args.fallback_db_name or fallback.get("db_name", ""),
         "fallback_db_user": args.fallback_db_user or fallback.get("user", ""),
         "fallback_db_password": args.fallback_db_password or fallback.get("password", ""),
-        "fallback_db_host": args.fallback_db_host or fallback.get("host", ""),
-        "fallback_db_port": args.fallback_db_port or fallback.get("port", ""),
+        "fallback_db_host": args.fallback_db_host or fallback.get("host", defaultFallbackHost),
+        "fallback_db_port": args.fallback_db_port or fallback.get("port", defaultFallbackPort),
         "brave_search_key": args.brave_search_key if args.brave_search_key is not None else api_keys.get("brave_search", ""),
         "twitter_consumer_key": args.twitter_consumer_key if args.twitter_consumer_key is not None else twitter.get("consumer_key", ""),
         "twitter_consumer_secret": args.twitter_consumer_secret if args.twitter_consumer_secret is not None else twitter.get("consumer_secret", ""),
@@ -804,6 +845,10 @@ def build_state_plain_interactive(
     api_keys = config_data.get("api_keys", {})
     seeded_model_map = _seeded_models(seed_state)
     state: dict[str, Any] = dict(seed_state or {})
+    runtimeSettings = runtime_settings_for_config(config_data)
+    defaultPrimaryPort = str(get_runtime_setting(runtimeSettings, "database.default_primary_port", "5432"))
+    defaultFallbackHost = str(get_runtime_setting(runtimeSettings, "database.default_fallback_host", "127.0.0.1"))
+    defaultFallbackPort = str(get_runtime_setting(runtimeSettings, "database.default_fallback_port", "5433"))
 
     try:
         existing_host = _seeded_str(seed_state, "ollama_host", infer_existing_host(config_data) or "")
@@ -885,7 +930,7 @@ def build_state_plain_interactive(
         )
         state["db_port"] = _prompt_plain(
             "Primary DB port",
-            default=_seeded_str(seed_state, "db_port", str(database.get("port", "5432"))),
+            default=_seeded_str(seed_state, "db_port", str(database.get("port", defaultPrimaryPort))),
             required=True,
         )
 
@@ -923,12 +968,12 @@ def build_state_plain_interactive(
             )
             state["fallback_db_host"] = _prompt_plain(
                 "Fallback DB host",
-                default=_seeded_str(seed_state, "fallback_db_host", str(fallback.get("host", "127.0.0.1"))),
+                default=_seeded_str(seed_state, "fallback_db_host", str(fallback.get("host", defaultFallbackHost))),
                 required=True,
             )
             state["fallback_db_port"] = _prompt_plain(
                 "Fallback DB port",
-                default=_seeded_str(seed_state, "fallback_db_port", str(fallback.get("port", "5433"))),
+                default=_seeded_str(seed_state, "fallback_db_port", str(fallback.get("port", defaultFallbackPort))),
                 required=True,
             )
 
@@ -1062,6 +1107,10 @@ def build_state_curses(
     api_keys = config_data.get("api_keys", {})
     seeded_model_map = _seeded_models(seed_state)
     state: dict[str, Any] = dict(seed_state or {})
+    runtimeSettings = runtime_settings_for_config(config_data)
+    defaultPrimaryPort = str(get_runtime_setting(runtimeSettings, "database.default_primary_port", "5432"))
+    defaultFallbackHost = str(get_runtime_setting(runtimeSettings, "database.default_fallback_host", "127.0.0.1"))
+    defaultFallbackPort = str(get_runtime_setting(runtimeSettings, "database.default_fallback_port", "5433"))
 
     def _runner(stdscr):
         ui = CursesUI(stdscr)
@@ -1175,7 +1224,7 @@ def build_state_curses(
         state["db_port"] = ui.prompt_text(
             "Primary database",
             "DB port:",
-            default=_seeded_str(seed_state, "db_port", str(database.get("port", "5432"))),
+            default=_seeded_str(seed_state, "db_port", str(database.get("port", defaultPrimaryPort))),
             required=True,
         )
 
@@ -1219,13 +1268,13 @@ def build_state_curses(
             state["fallback_db_host"] = ui.prompt_text(
                 "Fallback database",
                 "Fallback DB host:",
-                default=_seeded_str(seed_state, "fallback_db_host", str(fallback.get("host", "127.0.0.1"))),
+                default=_seeded_str(seed_state, "fallback_db_host", str(fallback.get("host", defaultFallbackHost))),
                 required=True,
             )
             state["fallback_db_port"] = ui.prompt_text(
                 "Fallback database",
                 "Fallback DB port:",
-                default=_seeded_str(seed_state, "fallback_db_port", str(fallback.get("port", "5433"))),
+                default=_seeded_str(seed_state, "fallback_db_port", str(fallback.get("port", defaultFallbackPort))),
                 required=True,
             )
 
@@ -1487,6 +1536,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    load_dotenv_file(Path(args.env_path), override=False)
 
     if args.fallback_enabled and args.fallback_disabled:
         raise ValueError("Use either --fallback-enabled or --fallback-disabled, not both.")

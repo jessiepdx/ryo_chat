@@ -68,6 +68,18 @@ logger = logging.getLogger(__name__)
 timezone(-timedelta(hours=7), "Pacific")
 
 
+def _runtime_int(path: str, default: int) -> int:
+    return config.runtimeInt(path, default)
+
+
+def _runtime_float(path: str, default: float) -> float:
+    return config.runtimeFloat(path, default)
+
+
+def _runtime_value(path: str, default: Any = None) -> Any:
+    return config.runtimeValue(path, default)
+
+
 def _fallback_stream(message_text: str) -> AsyncIterator[Any]:
     async def _stream():
         yield SimpleNamespace(
@@ -130,7 +142,14 @@ class ConversationOrchestrator:
         availablePlatforms = ["cli", "telegram"]
         availableChatTypes = ["member", "community"]
         if self._platform in availablePlatforms and self._chatType in availableChatTypes:
-            shortHistory = chatHistory.getChatHistory(self._chatHostID, self._chatType, self._platform, self._topicID, limit=20)
+            shortHistoryLimit = _runtime_int("retrieval.conversation_short_history_limit", 20)
+            shortHistory = chatHistory.getChatHistory(
+                self._chatHostID,
+                self._chatType,
+                self._platform,
+                self._topicID,
+                limit=shortHistoryLimit,
+            )
             for historyMessage in shortHistory:
                 role = "assistant" if historyMessage.get("member_id") is None else "user"
                 content = historyMessage.get("message_text")
@@ -437,8 +456,14 @@ class ToolCallingAgent():
             except (TypeError, ValueError):
                 return default
 
-        defaultTimeout = _float_value(toolRuntimePolicy.get("default_timeout_seconds"), 8.0)
-        defaultRetries = _int_value(toolRuntimePolicy.get("default_max_retries"), 1)
+        defaultTimeout = _float_value(
+            toolRuntimePolicy.get("default_timeout_seconds"),
+            _runtime_float("tool_runtime.default_timeout_seconds", 8.0),
+        )
+        defaultRetries = _int_value(
+            toolRuntimePolicy.get("default_max_retries"),
+            _runtime_int("tool_runtime.default_max_retries", 1),
+        )
         rejectUnknownArgs = bool(toolRuntimePolicy.get("reject_unknown_args", False))
         unknownToolBehavior = str(toolRuntimePolicy.get("unknown_tool_behavior", "structured_error")).strip().lower()
         if unknownToolBehavior not in {"structured_error", "ignore"}:
@@ -813,9 +838,12 @@ class ConversationalAgent():
         # Search the vectorDB if there is a knowledge db and add to contextJson
         message = self.messageData.get("message_text")
         wordCount = 0 if message is None else len(message.split(" "))
-        if wordCount > 6:
+        if wordCount > _runtime_int("conversation.knowledge_lookup_word_threshold", 6):
             # Add the documents to the agent instance so the UI can access them and store retrieval records
-            self._documents = knowledge.searchKnowledge(message, limit=2)
+            self._documents = knowledge.searchKnowledge(
+                message,
+                limit=_runtime_int("conversation.knowledge_lookup_result_limit", 2),
+            )
             knowledgeDocuments = list()
             for doc in self._documents:
                 knowledgeDocuments.append(doc.get("knowledge_document"))
@@ -840,7 +868,7 @@ class ConversationalAgent():
 
         # Set additional Ollama options
         ollamaOptions = {
-            "num_ctx" : 4096
+            "num_ctx" : _runtime_int("inference.model_context_window", 4096)
         }
         
         # Call the Ollama CHAT API
@@ -1014,8 +1042,11 @@ DO NOT put quotes around the tweet."""
         prompt = self.messageData.get("tweet_prompt")
         wordCount = 0 if prompt is None else len(prompt.split(" "))
 
-        if wordCount > 6:
-            documents = knowledge.searchKnowledge(prompt, limit=2)
+        if wordCount > _runtime_int("conversation.knowledge_lookup_word_threshold", 6):
+            documents = knowledge.searchKnowledge(
+                prompt,
+                limit=_runtime_int("conversation.knowledge_lookup_result_limit", 2),
+            )
             knowledgeDocuments = list()
             for doc in documents:
                 knowledgeDocuments.append(doc.get("knowledge_document"))
@@ -1044,7 +1075,7 @@ DO NOT put quotes around the tweet."""
         
         # Set additional Ollama options
         ollamaOptions = {
-            "num_ctx" : 4096
+            "num_ctx" : _runtime_int("inference.model_context_window", 4096)
         }
 
         output = await AsyncClient(host=config.inference["chat"]["url"]).chat(
@@ -1153,7 +1184,7 @@ def resolveAllowedModels(policyName: str, policy: dict) -> list[str]:
     if models:
         return models
 
-    return ["llama3.2:latest"]
+    return [str(_runtime_value("inference.default_chat_model", "llama3.2:latest"))]
 
 
 def loadAgentPolicy(policyName: str, endpointOverride: str | None = None) -> dict:

@@ -56,6 +56,140 @@
       "model": "llama3.2-vision:latest"
     }
   },
+  "runtime": {
+    "inference": {
+      "default_ollama_host": "http://127.0.0.1:11434",
+      "default_embedding_model": "nomic-embed-text:latest",
+      "default_generate_model": "llama3.2:latest",
+      "default_chat_model": "llama3.2:latest",
+      "default_tool_model": "llama3.2:latest",
+      "default_multimodal_model": "llama3.2-vision:latest",
+      "model_context_window": 4096,
+      "probe_timeout_seconds": 3.0
+    },
+    "database": {
+      "default_primary_host": "127.0.0.1",
+      "default_primary_port": "5432",
+      "default_fallback_host": "127.0.0.1",
+      "default_fallback_port": "5433",
+      "connect_timeout_seconds": 2,
+      "bootstrap_connect_retries": 15,
+      "bootstrap_retry_delay_seconds": 1.0,
+      "bootstrap_port_scan_limit": 100
+    },
+    "tool_runtime": {
+      "default_timeout_seconds": 8.0,
+      "default_max_retries": 1,
+      "brave_timeout_seconds": 10.0,
+      "chat_history_timeout_seconds": 6.0,
+      "knowledge_timeout_seconds": 6.0,
+      "skip_tools_timeout_seconds": 2.0
+    },
+    "telegram": {
+      "minimum_community_score_private_chat": 50,
+      "minimum_community_score_private_image": 70,
+      "minimum_community_score_group_image": 20,
+      "minimum_community_score_other_group": 20,
+      "minimum_community_score_link": 20,
+      "minimum_community_score_forward": 20,
+      "get_updates_write_timeout": 500
+    },
+    "security": {
+      "password_min_length": 12
+    },
+    "vectors": {
+      "embedding_dimensions": 768
+    },
+    "retrieval": {
+      "conversation_short_history_limit": 20,
+      "chat_history_window_hours": 12,
+      "chat_history_default_limit": 1,
+      "chat_history_sender_window_hours": 12,
+      "chat_history_sender_default_limit": 0,
+      "knowledge_list_limit": 10,
+      "knowledge_search_default_limit": 1,
+      "spam_list_limit": 10,
+      "spam_search_default_limit": 1
+    },
+    "conversation": {
+      "knowledge_lookup_word_threshold": 6,
+      "knowledge_lookup_result_limit": 2,
+      "community_score_message_word_threshold": 20,
+      "spam_distance_threshold": 10,
+      "new_member_grace_period_seconds": 60
+    },
+    "community": {
+      "score_rules": [
+        {
+          "private": {
+            "min": 50
+          },
+          "community": {
+            "min": 0
+          },
+          "message_per_hour": 2,
+          "image_per_hour": 0
+        },
+        {
+          "private": {
+            "min": 55
+          },
+          "community": {
+            "min": 5
+          },
+          "message_per_hour": 4,
+          "image_per_hour": 0
+        },
+        {
+          "private": {
+            "min": 60
+          },
+          "community": {
+            "min": 10
+          },
+          "message_per_hour": 6,
+          "image_per_hour": 0
+        },
+        {
+          "private": {
+            "min": 65
+          },
+          "community": {
+            "min": 15
+          },
+          "message_per_hour": 8,
+          "image_per_hour": 0
+        },
+        {
+          "private": {
+            "min": 70
+          },
+          "community": {
+            "min": 20
+          },
+          "message_per_hour": 10,
+          "image_per_hour": 1
+        },
+        {
+          "private": {
+            "min": 75
+          },
+          "community": {
+            "min": 25
+          },
+          "message_per_hour": 12,
+          "image_per_hour": 1
+        }
+      ]
+    },
+    "watchdog": {
+      "restart_window_seconds": 60,
+      "max_restarts_per_window": 5,
+      "terminate_timeout_seconds": 8,
+      "kill_timeout_seconds": 4,
+      "thread_join_timeout_seconds": 2
+    }
+  },
   "twitter_keys": {
     "consumer_key": "",
     "consumer_secret": "",

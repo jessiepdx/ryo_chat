@@ -152,6 +152,125 @@ class TestPgBootstrap(unittest.TestCase):
 
         self.assertEqual(exit_code, 2)
 
+    def test_resolve_docker_host_port_increments_when_initial_port_occupied(self):
+        target = bootstrap_postgres.BootstrapTarget(
+            label="primary",
+            db_name="db",
+            user="u",
+            password="p",
+            host="127.0.0.1",
+            port="5432",
+        )
+        with (
+            mock.patch.object(bootstrap_postgres, "_can_bind_host_port", side_effect=[False, True]),
+            mock.patch.object(
+                bootstrap_postgres,
+                "_verify_instance_identity",
+                return_value=(False, "occupied by non-matching service"),
+            ),
+        ):
+            selected_port, reused_existing, reason = bootstrap_postgres._resolve_docker_host_port(
+                target,
+                scan_limit=3,
+                retries=0,
+                retry_delay=0.0,
+            )
+
+        self.assertEqual(selected_port, "5433")
+        self.assertFalse(reused_existing)
+        self.assertIn("selected free local port", reason)
+
+    def test_resolve_docker_host_port_reuses_matching_existing_service(self):
+        target = bootstrap_postgres.BootstrapTarget(
+            label="primary",
+            db_name="db",
+            user="u",
+            password="p",
+            host="127.0.0.1",
+            port="5432",
+        )
+        with (
+            mock.patch.object(bootstrap_postgres, "_can_bind_host_port", return_value=False),
+            mock.patch.object(
+                bootstrap_postgres,
+                "_verify_instance_identity",
+                return_value=(True, "auth and db checks passed"),
+            ),
+        ):
+            selected_port, reused_existing, reason = bootstrap_postgres._resolve_docker_host_port(
+                target,
+                scan_limit=0,
+                retries=0,
+                retry_delay=0.0,
+            )
+
+        self.assertEqual(selected_port, "5432")
+        self.assertTrue(reused_existing)
+        self.assertIn("instance identity/auth checks passed", reason)
+
+    def test_ensure_docker_container_uses_mapped_port_for_existing_container(self):
+        target = bootstrap_postgres.BootstrapTarget(
+            label="primary",
+            db_name="db",
+            user="u",
+            password="p",
+            host="127.0.0.1",
+            port="5432",
+        )
+        with (
+            mock.patch.object(bootstrap_postgres.shutil, "which", return_value="/usr/bin/docker"),
+            mock.patch.object(
+                bootstrap_postgres,
+                "_resolve_docker_host_port",
+                return_value=("5432", False, "selected free local port"),
+            ),
+            mock.patch.object(bootstrap_postgres, "_docker_container_exists", return_value=True),
+            mock.patch.object(bootstrap_postgres, "_docker_container_running", return_value=True),
+            mock.patch.object(bootstrap_postgres, "_docker_container_host_port", return_value="5544"),
+        ):
+            managed = bootstrap_postgres._ensure_docker_container(
+                target=target,
+                image="pgvector/pgvector:pg16",
+                container_name="ryo-pg-primary",
+                recreate=False,
+                volume=None,
+                scan_limit=10,
+                retries=0,
+                retry_delay=0.0,
+            )
+
+        self.assertTrue(managed)
+        self.assertEqual(target.port, "5544")
+
+    def test_persist_target_port_in_config_updates_section(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "database": {
+                            "host": "127.0.0.1",
+                            "port": "5432",
+                        },
+                        "database_fallback": {
+                            "host": "127.0.0.1",
+                            "port": "5433",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            bootstrap_postgres._persist_target_port_in_config(
+                config_path,
+                label="fallback",
+                host="127.0.0.1",
+                port="5543",
+            )
+
+            persisted = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["database_fallback"]["port"], "5543")
+
 
 if __name__ == "__main__":
     unittest.main()

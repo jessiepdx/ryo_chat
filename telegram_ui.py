@@ -122,6 +122,26 @@ usage = UsageManager()
 logger.info(f"Database route status: {config.databaseRoute}")
 
 
+def _runtime_int(path: str, default: int) -> int:
+    return config.runtimeInt(path, default)
+
+
+def _runtime_float(path: str, default: float) -> float:
+    return config.runtimeFloat(path, default)
+
+
+def _message_word_threshold() -> int:
+    return _runtime_int("conversation.community_score_message_word_threshold", 20)
+
+
+def _new_member_grace_delta() -> timedelta:
+    return timedelta(seconds=_runtime_int("conversation.new_member_grace_period_seconds", 60))
+
+
+def _password_min_length() -> int:
+    return max(8, _runtime_int("security.password_min_length", 12))
+
+
 
 ###########################
 # DEFINE COMMAND HANDLERS #
@@ -157,8 +177,9 @@ async def startBot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         
             # TODO get official community chat links from config and insert into the welcome message
+            minimumCommunityScore = _runtime_int("telegram.minimum_community_score_private_chat", 50)
             welcomeMessage = f"""Welcome {user.name}, I am the {config.botName} chatbot. 
-You will need to have a minimum community score of 50 to chat with me in private. 
+You will need to have a minimum community score of {minimumCommunityScore} to chat with me in private. 
 Engage with the community in one of our group chats to increase your community score. 
             
 Use the /help command for more information."""
@@ -1876,8 +1897,8 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Error is critical to the remaining functionality, exit
         return
 
-    # Score the message if the message is greater than 20 words
-    if len(message.text.split(" ")) > 20:
+    # Score the message if the message is greater than the configured threshold
+    if len(message.text.split(" ")) > _message_word_threshold():
         communityScore.scoreMessage(conversation.promptHistoryID)
 
     # Add the response to the chat history
@@ -1911,7 +1932,7 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = update.effective_user
 
-    minimumCommunityScore = 50
+    minimumCommunityScore = _runtime_int("telegram.minimum_community_score_private_chat", 50)
 
     # Get account information
     member = members.getMemberByTelegramID(user.id)
@@ -1984,8 +2005,8 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Error is critical to the remaining functionality, exit
         return
     
-    # Score the message if the message is greater than 20 words
-    if len(message.text.split(" ")) > 20:
+    # Score the message if the message is greater than the configured threshold
+    if len(message.text.split(" ")) > _message_word_threshold():
         communityScore.scoreMessage(conversation.promptHistoryID)
 
     conversation.storeResponse(responseMessage.message_id)
@@ -2021,7 +2042,7 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
             userJoined = context.chat_data.get(user.id)
             if userJoined is not None:
                 # compare the timestamps
-                if userJoined > (datetime.now() - timedelta(seconds=60)):
+                if userJoined > (datetime.now() - _new_member_grace_delta()):
                     logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
                     await chat.ban_member(user.id)
                     return
@@ -2038,7 +2059,11 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     
     memberID = member.get("member_id")
-    minimumCommunityScore = 70 if chat.type == "private" else 20
+    minimumCommunityScore = (
+        _runtime_int("telegram.minimum_community_score_private_image", 70)
+        if chat.type == "private"
+        else _runtime_int("telegram.minimum_community_score_group_image", 20)
+    )
     # Set the allowed roles
     allowedRoles = ["tester", "marketing", "admin", "owner"]
     
@@ -2149,8 +2174,8 @@ async def otherGroupChat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     score = 0 if member is None else member.get("community_score")
     userJoined = context.chat_data.get(user.id)
 
-    minimumCommunityScore = 20
-    spamDistanceThreshold = 10
+    minimumCommunityScore = _runtime_int("telegram.minimum_community_score_other_group", 20)
+    spamDistanceThreshold = _runtime_float("conversation.spam_distance_threshold", 10.0)
     # Set the allowed roles
     allowedRoles = ["tester", "marketing", "admin", "owner"]
     rolesAvailable = list() if member is None else member.get("roles")
@@ -2169,7 +2194,7 @@ async def otherGroupChat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     # Check how long the user has been in the chat
                     if userJoined is not None:
-                        if userJoined > (datetime.now() - timedelta(seconds=60)):
+                        if userJoined > (datetime.now() - _new_member_grace_delta()):
                             logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
                             await chat.ban_member(user.id)
                             return
@@ -2198,8 +2223,8 @@ async def otherGroupChat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timestamp=datetime.now()
         )
 
-        # Score the message if the user account exist and the message is greater than 20 words
-        if len(message.text.split(" ")) > 20:
+        # Score the message if the user account exists and the message is above threshold
+        if len(message.text.split(" ")) > _message_word_threshold():
             communityScore.scoreMessage(messageHistoryID)
 
 
@@ -2317,8 +2342,8 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Critical to the remaining functionality, exit
         return
 
-    # Score the message if the message is greater than 20 words
-    if len(message.text.split(" ")) > 20:
+    # Score the message if the message is greater than the configured threshold
+    if len(message.text.split(" ")) > _message_word_threshold():
         communityScore.scoreMessage(conversation.promptHistoryID)
 
     conversation.storeResponse(responseMessage.message_id)
@@ -2451,7 +2476,7 @@ async def linkHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             # Ban user if they sent image within 60 seconds of joining the group chat
             userJoined = context.chat_data.get(user.id)
             if userJoined is not None:
-                if userJoined > (datetime.now() - timedelta(seconds=60)):
+                if userJoined > (datetime.now() - _new_member_grace_delta()):
                     logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
                     await chat.ban_member(user.id)
                     return
@@ -2469,7 +2494,7 @@ async def linkHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         
     #memberID = member.get("member_id")
-    minimumCommunityScore = 20
+    minimumCommunityScore = _runtime_int("telegram.minimum_community_score_link", 20)
     # Set the allowed roles
     allowedRoles = ["tester", "marketing", "admin", "owner"]
 
@@ -2524,14 +2549,23 @@ async def setPassword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if len(context.args) == 1:
             password = context.args[0]
             # Do regular expression
-            pattern = re.compile(r"(?=.*\d)(?=.*[a-z])(?=.*[A-Z])(?=.*[-+_!@#$%^&*.,?]).{12,}")
+            minPasswordLength = _password_min_length()
+            pattern = re.compile(
+                r"(?=.*\d)(?=.*[a-z])(?=.*[A-Z])(?=.*[-+_!@#$%^&*.,?]).{"
+                + str(minPasswordLength)
+                + r",}"
+            )
             validPassword = pattern.search(password)
             if validPassword:
                 #password = accounts.setPassword(user.id, password=password)
                 password = members.setPassword(memberID, password)
                 response = f"Your password {password} has been stored"
             else:
-                response = "You must enter a valid password.\nHint:  passwords must by a minimum of 12 characters, contain at least one lowercase, uppercase, digit, and symbol."
+                response = (
+                    "You must enter a valid password.\n"
+                    f"Hint: passwords must be at least {minPasswordLength} characters, "
+                    "contain at least one lowercase, uppercase, digit, and symbol."
+                )
 
         else:
             # Generate a random password
@@ -2641,7 +2675,7 @@ async def handleForwardedMessage(update: Update, context: ContextTypes.DEFAULT_T
             userJoined = context.chat_data.get(user.id)
             if userJoined is not None:
                 # compare the timestamps
-                if userJoined > (datetime.now() - timedelta(seconds=60)):
+                if userJoined > (datetime.now() - _new_member_grace_delta()):
                     logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
                     await chat.ban_member(user.id)
                     return
@@ -2656,7 +2690,7 @@ async def handleForwardedMessage(update: Update, context: ContextTypes.DEFAULT_T
         finally:
             return
     
-    minimumCommunityScore = 20
+    minimumCommunityScore = _runtime_int("telegram.minimum_community_score_forward", 20)
     # Set the allowed roles
     allowedRoles = ["tester", "marketing", "admin", "owner"]
 
@@ -2713,7 +2747,13 @@ def main() -> None:
     # Run the bot
     # Create the Application and pass it your bot's token.
     # .get_updates_write_timeout(100)
-    application = Application.builder().token(config.bot_token).concurrent_updates(True).get_updates_write_timeout(500).build()
+    application = (
+        Application.builder()
+        .token(config.bot_token)
+        .concurrent_updates(True)
+        .get_updates_write_timeout(_runtime_int("telegram.get_updates_write_timeout", 500))
+        .build()
+    )
 
     # Generate command chain
     generateHandler = ConversationHandler(

@@ -12,6 +12,16 @@ from dataclasses import dataclass, field
 import json
 from typing import Any, Callable
 
+from hypermindlabs.runtime_settings import DEFAULT_RUNTIME_SETTINGS
+
+
+DEFAULT_TOOL_TIMEOUT_SECONDS = float(
+    DEFAULT_RUNTIME_SETTINGS.get("tool_runtime", {}).get("default_timeout_seconds", 8.0)
+)
+DEFAULT_TOOL_MAX_RETRIES = int(
+    DEFAULT_RUNTIME_SETTINGS.get("tool_runtime", {}).get("default_max_retries", 1)
+)
+
 
 @dataclass
 class ToolDefinition:
@@ -22,8 +32,8 @@ class ToolDefinition:
     arg_coercers: dict[str, Callable[[Any], Any]] = field(default_factory=dict)
     reject_unknown_args: bool = False
     required_api_key: str | None = None
-    timeout_seconds: float = 8.0
-    max_retries: int = 1
+    timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS
+    max_retries: int = DEFAULT_TOOL_MAX_RETRIES
 
 
 class ToolRuntime:
