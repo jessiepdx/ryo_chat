@@ -73,6 +73,7 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "minimum_community_score_forward": 20,
         "get_updates_write_timeout": 500,
         "show_stage_progress": True,
+        "show_stage_json_details": True,
     },
     "temporal": {
         "enabled": True,
@@ -216,6 +217,7 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "telegram.minimum_community_score_forward": (("RYO_TELEGRAM_MIN_SCORE_FORWARD",), "int"),
     "telegram.get_updates_write_timeout": (("RYO_TELEGRAM_GET_UPDATES_WRITE_TIMEOUT",), "int"),
     "telegram.show_stage_progress": (("RYO_TELEGRAM_SHOW_STAGE_PROGRESS",), "bool"),
+    "telegram.show_stage_json_details": (("RYO_TELEGRAM_SHOW_STAGE_JSON_DETAILS",), "bool"),
     "temporal.enabled": (("RYO_TEMPORAL_CONTEXT_ENABLED",), "bool"),
     "temporal.default_timezone": (("RYO_TEMPORAL_DEFAULT_TIMEZONE",), "str"),
     "temporal.history_limit": (("RYO_TEMPORAL_HISTORY_LIMIT",), "int"),

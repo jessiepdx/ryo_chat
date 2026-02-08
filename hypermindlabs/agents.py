@@ -862,6 +862,11 @@ class ConversationOrchestrator:
                 "memory_circuit": memoryCircuit,
             }
         }
+        await self._emit_stage(
+            "context.built",
+            "Known context assembled for downstream stages.",
+            json=knownContext.get("tool_results"),
+        )
         self._messages.append(Message(role="tool", content=json.dumps(knownContext)))
         analysisMessages = list(self._messages)
         await self._emit_stage("analysis.start", "Running message analysis policy and model selection.")
@@ -889,6 +894,10 @@ class ConversationOrchestrator:
             "analysis.complete",
             "Analysis stage complete.",
             model=getattr(self._analysisAgent, "_model", None),
+            selected_model=_coerce_dict(getattr(self._analysisAgent, "routing", {})).get("selected_model"),
+            json={
+                "routing": _coerce_dict(getattr(self._analysisAgent, "routing", {})),
+            },
         )
 
         normalizedAnalysis = _normalize_analysis_payload(
@@ -899,6 +908,11 @@ class ConversationOrchestrator:
             "tool_name": "Message Analysis",
             "tool_results": normalizedAnalysis,
         }
+        await self._emit_stage(
+            "analysis.payload",
+            "Normalized analysis payload produced.",
+            json=normalizedAnalysis,
+        )
 
         #print(ConsoleColors["default"])
 
@@ -926,10 +940,24 @@ class ConversationOrchestrator:
         toolOptions["tool_runtime_context"] = toolRuntimeContext
         self._toolsAgent = ToolCallingAgent(toolStageMessages, options=toolOptions)
         toolResponses = await self._toolsAgent.generateResponse()
+        toolSummary = _coerce_dict(getattr(self._toolsAgent, "execution_summary", {}))
+        toolsRouting = _coerce_dict(getattr(self._toolsAgent, "routing", {}))
+        requestedToolCalls = toolSummary.get("requested_tool_calls")
+        executedToolCalls = toolSummary.get("executed_tool_calls")
+        if not isinstance(executedToolCalls, int):
+            executedToolCalls = len(toolResponses)
         await self._emit_stage(
             "tools.complete",
             "Tool execution stage complete.",
             tool_calls=len(toolResponses),
+            requested_tool_calls=requestedToolCalls if isinstance(requestedToolCalls, int) else len(toolResponses),
+            executed_tool_calls=executedToolCalls,
+            selected_model=toolsRouting.get("selected_model"),
+            json={
+                "routing": toolsRouting,
+                "summary": toolSummary,
+                "tool_results": toolResponses,
+            },
         )
         self._messages.append(Message(role="tool", content=json.dumps(analysisMessagePayload)))
 
@@ -984,7 +1012,18 @@ class ConversationOrchestrator:
         assistantMessage = Message(role="assistant", content=sanitizedResponseMessage)
         # Add the final response to the overall chat history (role ASSISTANT)
         self._messages.append(assistantMessage)
-        await self._emit_stage("orchestrator.complete", "Completed end-to-end orchestration.")
+        await self._emit_stage(
+            "orchestrator.complete",
+            "Completed end-to-end orchestration.",
+            selected_model=_coerce_dict(getattr(self._chatConversationAgent, "routing", {})).get("selected_model"),
+            json={
+                "chat_routing": _coerce_dict(getattr(self._chatConversationAgent, "routing", {})),
+                "response": {
+                    "chars": len(sanitizedResponseMessage),
+                    "sanitized": bool(sanitizedResponseMessage != responseMessage),
+                },
+            },
+        )
 
         return sanitizedResponseMessage
 
@@ -1189,6 +1228,15 @@ class ToolCallingAgent():
         self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
         self._allowed_models = resolveAllowedModels(agentName, policy)
         self._model = self._allowed_models[0]
+        self._routing: dict[str, Any] = {}
+        self._executionSummary: dict[str, Any] = {
+            "requested_tool_calls": 0,
+            "requested_tools": [],
+            "executed_tool_calls": 0,
+            "executed_tools": [],
+            "tool_errors": [],
+            "model_output_excerpt": "",
+        }
 
         toolRuntimePolicy = policy.get("tool_runtime", {})
         if not isinstance(toolRuntimePolicy, dict):
@@ -1438,9 +1486,32 @@ class ToolCallingAgent():
 
         logger.info(f"Tool calling route metadata:\n{self._routing}")
         toolResults = list()
+        requestedTools: list[dict[str, Any]] = []
+        responseMessage = getattr(self._response, "message", None)
+        rawToolCalls = list(getattr(responseMessage, "tool_calls", []) or [])
+        for toolCall in rawToolCalls:
+            toolName = None
+            toolArgs = {}
+            if hasattr(toolCall, "function"):
+                toolName = getattr(toolCall.function, "name", None)
+                toolArgs = getattr(toolCall.function, "arguments", {}) or {}
+            elif isinstance(toolCall, dict):
+                functionData = toolCall.get("function")
+                if isinstance(functionData, dict):
+                    toolName = functionData.get("name")
+                    toolArgs = functionData.get("arguments", {}) or {}
+                else:
+                    toolName = toolCall.get("name")
+                    toolArgs = toolCall.get("arguments", {}) or {}
+            requestedTools.append(
+                {
+                    "name": str(toolName or "unknown"),
+                    "arguments": toolArgs,
+                }
+            )
         
-        if self._response.message.tool_calls:
-            for tool in self._response.message.tool_calls:
+        if rawToolCalls:
+            for tool in rawToolCalls:
                 toolName = None
                 toolArgs = None
                 if hasattr(tool, "function"):
@@ -1483,12 +1554,61 @@ class ToolCallingAgent():
                         f"Tool: {toolResult.get('tool_name')}\n"
                         f"Error: {toolResult.get('error')}"
                     )
-        
+        modelOutputText = _as_text(getattr(responseMessage, "content", ""))
+        if modelOutputText and len(modelOutputText) > 280:
+            modelOutputText = modelOutputText[:277].rstrip() + "..."
+        toolErrors = [
+            {
+                "tool_name": str(result.get("tool_name") or "unknown"),
+                "error": _coerce_dict(result.get("error")),
+            }
+            for result in toolResults
+            if str(result.get("status") or "") == "error"
+        ]
+        self._executionSummary = {
+            "requested_tool_calls": len(requestedTools),
+            "requested_tools": requestedTools,
+            "executed_tool_calls": len(toolResults),
+            "executed_tools": [str(result.get("tool_name") or "unknown") for result in toolResults],
+            "tool_errors": toolErrors,
+            "model_output_excerpt": modelOutputText,
+        }
+
+        detail = (
+            f"Model returned {len(requestedTools)} tool call(s); executed {len(toolResults)}."
+            if requestedTools
+            else "Model returned no tool calls."
+        )
+        await self._emit_tool_runtime_event(
+            {
+                "stage": "tools.model_output",
+                "status": "info",
+                "detail": detail,
+                "meta": {
+                    "requested_tool_calls": len(requestedTools),
+                    "executed_tool_calls": len(toolResults),
+                    "selected_model": self._routing.get("selected_model"),
+                    "json": {
+                        "execution_summary": self._executionSummary,
+                        "routing": self._routing,
+                    },
+                },
+            }
+        )
+
         return toolResults
     
     @property
     def messages(self):
         return self._messages
+
+    @property
+    def routing(self) -> dict[str, Any]:
+        return dict(self._routing)
+
+    @property
+    def execution_summary(self) -> dict[str, Any]:
+        return dict(self._executionSummary)
 
 
 class MessageAnalysisAgent():
@@ -1550,6 +1670,10 @@ class MessageAnalysisAgent():
     @property
     def messages(self):
         return self._messages
+
+    @property
+    def routing(self) -> dict[str, Any]:
+        return dict(getattr(self, "_routing", {}) or {})
 
 
 class DevTestAgent():
@@ -1613,6 +1737,10 @@ class DevTestAgent():
     def messages(self):
         return self._messages
 
+    @property
+    def routing(self) -> dict[str, Any]:
+        return dict(getattr(self, "_routing", {}) or {})
+
 
 class ChatConversationAgent():
     def __init__(self, messages: list, options: dict=None):
@@ -1674,6 +1802,10 @@ class ChatConversationAgent():
     @property
     def messages(self):
         return self._messages
+
+    @property
+    def routing(self) -> dict[str, Any]:
+        return dict(getattr(self, "_routing", {}) or {})
 
 
 
@@ -2068,6 +2200,33 @@ def _policyManager(endpointOverride: str | None = None) -> PolicyManager:
     )
 
 
+_POLICY_TO_INFERENCE_KEY = {
+    "message_analysis": "tool",
+    "tool_calling": "tool",
+    "chat_conversation": "chat",
+    "dev_test": "chat",
+}
+
+
+def _preferred_runtime_model_for_policy(policyName: str) -> str:
+    inferenceKey = _POLICY_TO_INFERENCE_KEY.get(policyName, "chat")
+    inferenceConfig = config._instance.inference if hasattr(config, "_instance") else {}
+    section = inferenceConfig.get(inferenceKey) if isinstance(inferenceConfig, dict) else None
+    if isinstance(section, dict):
+        configuredModel = section.get("model")
+        if isinstance(configuredModel, str) and configuredModel.strip():
+            return configuredModel.strip()
+
+    runtimeKey = {
+        "tool": "inference.default_tool_model",
+        "chat": "inference.default_chat_model",
+        "embedding": "inference.default_embedding_model",
+        "generate": "inference.default_generate_model",
+        "multimodal": "inference.default_multimodal_model",
+    }.get(inferenceKey, "inference.default_chat_model")
+    return str(_runtime_value(runtimeKey, _runtime_value("inference.default_chat_model", "llama3.2:latest")))
+
+
 def resolveAllowedModels(policyName: str, policy: dict) -> list[str]:
     allowed = policy.get("allowed_models")
     models: list[str] = []
@@ -2077,6 +2236,12 @@ def resolveAllowedModels(policyName: str, policy: dict) -> list[str]:
                 cleaned = modelName.strip()
                 if cleaned and cleaned not in models:
                     models.append(cleaned)
+
+    preferred = _preferred_runtime_model_for_policy(policyName).strip()
+    if preferred:
+        if preferred in models:
+            models = [name for name in models if name != preferred]
+        models.insert(0, preferred)
 
     if models:
         return models

@@ -202,9 +202,12 @@ def _database_unavailable_message() -> str:
 
 _ORCHESTRATION_STAGE_LABELS = {
     "orchestrator.start": "Accepted request",
+    "context.built": "Context built",
     "analysis.start": "Analyzing message",
     "analysis.complete": "Analysis complete",
+    "analysis.payload": "Analysis payload",
     "tools.start": "Evaluating tools",
+    "tools.model_output": "Tool model output",
     "tools.complete": "Tools complete",
     "response.start": "Generating response",
     "response.complete": "Response generated",
@@ -222,14 +225,20 @@ class TelegramStageStatus:
         thread_id: int | None = None,
         reply_message=None,
         enabled: bool = True,
+        show_json_details: bool = True,
         history_limit: int = 8,
+        json_char_limit: int = 1400,
+        message_char_limit: int = 3800,
     ):
         self._context = context
         self._chat_id = chat_id
         self._thread_id = thread_id
         self._reply_message = reply_message
         self._enabled = bool(enabled)
+        self._show_json_details = bool(show_json_details)
         self._history_limit = max(3, int(history_limit))
+        self._json_char_limit = max(200, int(json_char_limit))
+        self._message_char_limit = max(800, int(message_char_limit))
         self._message = None
         self._lines: list[str] = []
         self._last_text: str = ""
@@ -238,7 +247,34 @@ class TelegramStageStatus:
         if not self._lines:
             return "Processing your request..."
         visible = self._lines[-self._history_limit:]
-        return "Processing your request...\n\n" + "\n".join(visible)
+        rendered = "Processing your request...\n\n" + "\n\n".join(visible)
+        if len(rendered) <= self._message_char_limit:
+            return rendered
+
+        clipped = list(visible)
+        while len(clipped) > 1 and len("Processing your request...\n\n" + "\n\n".join(clipped)) > self._message_char_limit:
+            clipped.pop(0)
+
+        rendered = "Processing your request...\n\n" + "\n\n".join(clipped)
+        if len(rendered) <= self._message_char_limit:
+            return rendered
+
+        overflow = len(rendered) - self._message_char_limit
+        tail = clipped[-1] if clipped else ""
+        keep = max(120, len(tail) - overflow - 18)
+        if clipped:
+            clipped[-1] = tail[:keep].rstrip() + "\n...(truncated)"
+        return "Processing your request...\n\n" + "\n\n".join(clipped)
+
+    def _render_json_block(self, payload) -> str:
+        try:
+            json_text = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+        except TypeError:
+            json_text = json.dumps(str(payload), ensure_ascii=False)
+        if len(json_text) > self._json_char_limit:
+            suffix = "\n... (truncated)"
+            json_text = json_text[: self._json_char_limit - len(suffix)].rstrip() + suffix
+        return f"```json\n{json_text}\n```"
 
     async def _safe_edit(self, text: str) -> None:
         if self._message is None:
@@ -283,13 +319,25 @@ class TelegramStageStatus:
         line = f"• {label}"
         if detail:
             line = f"{line} — {detail}"
-        tool_calls = meta.get("tool_calls")
-        if isinstance(tool_calls, int):
-            line = f"{line} (tool calls: {tool_calls})"
 
-        if self._lines and self._lines[-1] == line:
+        requested_tool_calls = meta.get("requested_tool_calls")
+        executed_tool_calls = meta.get("executed_tool_calls")
+        if isinstance(requested_tool_calls, int) and isinstance(executed_tool_calls, int):
+            line = f"{line} (requested: {requested_tool_calls}, executed: {executed_tool_calls})"
+        tool_calls = meta.get("tool_calls")
+        if isinstance(tool_calls, int) and not (isinstance(requested_tool_calls, int) and isinstance(executed_tool_calls, int)):
+            line = f"{line} (tool calls: {tool_calls})"
+        selected_model = str(meta.get("selected_model") or "").strip()
+        if selected_model:
+            line = f"{line} [model: {selected_model}]"
+
+        entry = line
+        if self._show_json_details and "json" in meta:
+            entry = f"{line}\n{self._render_json_block(meta.get('json'))}"
+
+        if self._lines and self._lines[-1] == entry:
             return
-        self._lines.append(line)
+        self._lines.append(entry)
         await self._safe_edit(self._render())
 
     async def finalize(self, final_text: str):
@@ -2130,6 +2178,7 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         thread_id=topicID,
         reply_message=None,
         enabled=_runtime_bool("telegram.show_stage_progress", True),
+        show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
     )
     await stageStatus.start()
 
@@ -2274,6 +2323,7 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         thread_id=None,
         reply_message=message,
         enabled=_runtime_bool("telegram.show_stage_progress", True),
+        show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
     )
     await stageStatus.start()
 
@@ -2630,6 +2680,7 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         thread_id=topicID,
         reply_message=None,
         enabled=_runtime_bool("telegram.show_stage_progress", True),
+        show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
     )
     await stageStatus.start()
 
