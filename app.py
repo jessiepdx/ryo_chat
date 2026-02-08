@@ -25,6 +25,7 @@ import re
 import shlex
 import select
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1278,6 +1279,7 @@ class RouteState:
     last_event: str = "idle"
     last_event_epoch: float | None = None
     started_epoch: float | None = None
+    external_pid: int | None = None
 
 
 @dataclass
@@ -2117,6 +2119,7 @@ class InterfaceWatchdog:
     def _cleanup_process(self, state: RouteState, *, close_handle: bool = True) -> None:
         state.process = None
         state.started_epoch = None
+        state.external_pid = None
         if close_handle and state.log_handle is not None:
             try:
                 state.log_handle.close()
@@ -2145,9 +2148,17 @@ class InterfaceWatchdog:
             if key in {"cli", "x"} and not bool(state.spec.restart_on_exit):
                 self._cleanup_process(state)
                 opened, message = _launch_script_in_transient_terminal(key, state.spec.script)
-                state.desired = False
+                state.desired = bool(opened)
                 state.last_exit_code = None if opened else 1
-                self._set_event(state, message if opened else f"launch failed: {message}")
+                if opened:
+                    detected_pid = _wait_for_external_route_pid(state.spec.script, timeout_seconds=2.0)
+                    state.external_pid = detected_pid
+                    if detected_pid is not None:
+                        self._set_event(state, f"running external pid={detected_pid}")
+                    else:
+                        self._set_event(state, message)
+                else:
+                    self._set_event(state, f"launch failed: {message}")
                 return opened
 
             state.desired = True
@@ -2171,6 +2182,40 @@ class InterfaceWatchdog:
                 return False
             state.desired = False
             process = state.process
+            if process is None and not bool(state.spec.restart_on_exit):
+                pids = _discover_external_route_pids(state.spec.script)
+                if not pids:
+                    self._cleanup_process(state)
+                    self._set_event(state, "already stopped")
+                    return True
+
+                terminated: list[int] = []
+                failed: list[int] = []
+                for pid in pids:
+                    if _terminate_external_pid(
+                        pid,
+                        terminate_timeout_seconds=self._terminate_timeout_seconds,
+                        kill_timeout_seconds=self._kill_timeout_seconds,
+                    ):
+                        terminated.append(pid)
+                    else:
+                        failed.append(pid)
+
+                if terminated:
+                    state.last_exit_code = 0
+                    state.external_pid = None
+                    self._set_event(
+                        state,
+                        "stopped external pid(s): " + ", ".join(str(pid) for pid in terminated[:3]),
+                    )
+                else:
+                    state.last_exit_code = 1
+                    self._set_event(
+                        state,
+                        "failed stopping external pid(s): " + ", ".join(str(pid) for pid in failed[:3]),
+                    )
+                return len(failed) == 0
+
             if process is None:
                 self._cleanup_process(state)
                 self._set_event(state, "already stopped")
@@ -2189,6 +2234,18 @@ class InterfaceWatchdog:
             return True
 
     def toggle(self, key: str) -> bool:
+        manual_script: str | None = None
+        with self._lock:
+            state = self._routes.get(key)
+            if state is None:
+                return False
+            if not bool(state.spec.restart_on_exit):
+                manual_script = state.spec.script
+        if manual_script is not None:
+            running_manual = bool(_discover_external_route_pids(manual_script))
+            if running_manual:
+                return self.stop(key)
+            return self.start(key)
         status = self.status()
         entry = status.get(key)
         if entry is None:
@@ -2216,9 +2273,26 @@ class InterfaceWatchdog:
             for key, state in self._routes.items():
                 running = state.process is not None and state.process.poll() is None
                 pid = state.process.pid if running else None
-                uptime_seconds = int(max(0.0, self._stamp_now() - state.started_epoch)) if running and state.started_epoch else None
+                uptime_seconds = (
+                    int(max(0.0, self._stamp_now() - state.started_epoch))
+                    if running and state.started_epoch
+                    else None
+                )
+                if (not running) and (not bool(state.spec.restart_on_exit)):
+                    external_pids = _discover_external_route_pids(state.spec.script)
+                    if external_pids:
+                        pid = external_pids[0]
+                        running = True
+                        state.external_pid = pid
+                        uptime_seconds = _pid_uptime_seconds(pid)
+                    else:
+                        state.external_pid = None
+
+                desired = state.desired
+                if not bool(state.spec.restart_on_exit):
+                    desired = running
                 output[key] = {
-                    "desired": state.desired,
+                    "desired": desired,
                     "running": running,
                     "pid": pid,
                     "process_user": _pid_username(pid if running else None),
@@ -2292,6 +2366,202 @@ def _format_duration(seconds: int | None) -> str:
     if hours > 0:
         return f"{hours:02d}:{minutes:02d}:{sec:02d}"
     return f"{minutes:02d}:{sec:02d}"
+
+
+def _proc_path_for_pid(pid: int, suffix: str) -> Path:
+    return Path("/proc") / str(int(pid)) / suffix
+
+
+def _pid_exists(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        return _proc_path_for_pid(int(pid), "").exists()
+    except (TypeError, ValueError):
+        return False
+
+
+def _pid_cmdline(pid: int) -> list[str]:
+    path = _proc_path_for_pid(pid, "cmdline")
+    try:
+        payload = path.read_bytes()
+    except OSError:
+        return []
+    if not payload:
+        return []
+    values = []
+    for raw in payload.split(b"\x00"):
+        if not raw:
+            continue
+        values.append(raw.decode("utf-8", errors="replace"))
+    return values
+
+
+def _pid_cwd(pid: int) -> Path | None:
+    path = _proc_path_for_pid(pid, "cwd")
+    try:
+        return path.resolve()
+    except OSError:
+        return None
+
+
+def _pid_uptime_seconds(pid: int) -> int | None:
+    stat_path = _proc_path_for_pid(pid, "stat")
+    try:
+        stat_line = stat_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    try:
+        close_idx = stat_line.rfind(")")
+        if close_idx < 0:
+            return None
+        fields = stat_line[close_idx + 2 :].split()
+        start_ticks = int(fields[19])
+        clk_tck = int(os.sysconf("SC_CLK_TCK"))
+        uptime_raw = Path("/proc/uptime").read_text(encoding="utf-8", errors="replace").split()[0]
+        uptime_total = float(uptime_raw)
+        return max(0, int(uptime_total - (start_ticks / float(clk_tck))))
+    except (IndexError, ValueError, OSError):
+        return None
+
+
+def _arg_matches_script(arg: str, script: str) -> bool:
+    script_name = Path(script).name
+    cleaned = str(arg or "").strip().strip("'\"")
+    if cleaned == "":
+        return False
+    candidate = Path(cleaned)
+    if candidate.name == script_name:
+        return True
+    if candidate.is_absolute():
+        try:
+            return candidate.resolve() == (PROJECT_ROOT / script_name).resolve()
+        except OSError:
+            return False
+    return False
+
+
+def _python_script_arg_from_argv(argv: list[str]) -> str | None:
+    if not argv:
+        return None
+    exe_name = Path(str(argv[0])).name.lower()
+    if "python" not in exe_name:
+        return None
+
+    for arg in argv[1:]:
+        token = str(arg or "").strip()
+        if token == "":
+            continue
+        if token in {"-c", "-m"}:
+            return None
+        if token.startswith("-"):
+            continue
+        return token
+    return None
+
+
+def _discover_external_route_pids(script: str) -> list[int]:
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return []
+    try:
+        project_root = PROJECT_ROOT.resolve()
+    except OSError:
+        project_root = PROJECT_ROOT
+    script_name = Path(script).name
+    script_abs = (PROJECT_ROOT / script_name).resolve()
+    this_pid = os.getpid()
+    matches: list[int] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            pid = int(entry.name)
+        except ValueError:
+            continue
+        if pid == this_pid:
+            continue
+        argv = _pid_cmdline(pid)
+        if len(argv) < 2:
+            continue
+        script_arg = _python_script_arg_from_argv(argv)
+        if script_arg is None:
+            continue
+        if not _arg_matches_script(script_arg, script_name):
+            continue
+
+        accepted = False
+        script_arg_path = Path(script_arg)
+        if script_arg_path.is_absolute():
+            try:
+                if script_arg_path.resolve() == script_abs:
+                    accepted = True
+            except OSError:
+                pass
+
+        if not accepted:
+            cwd = _pid_cwd(pid)
+            if cwd is not None:
+                try:
+                    cwd.relative_to(project_root)
+                    accepted = True
+                except ValueError:
+                    accepted = False
+
+        if not accepted:
+            try:
+                argv0_path = Path(argv[0]).resolve()
+                if argv0_path == (PROJECT_ROOT / ".venv" / "bin" / "python").resolve():
+                    accepted = True
+            except OSError:
+                accepted = False
+
+        if not accepted:
+            continue
+        matches.append(pid)
+    return sorted(matches, reverse=True)
+
+
+def _wait_for_external_route_pid(script: str, timeout_seconds: float = 2.0) -> int | None:
+    deadline = time.time() + max(0.2, float(timeout_seconds))
+    while time.time() <= deadline:
+        pids = _discover_external_route_pids(script)
+        if pids:
+            return pids[0]
+        time.sleep(0.05)
+    return None
+
+
+def _terminate_external_pid(pid: int, *, terminate_timeout_seconds: float, kill_timeout_seconds: float) -> bool:
+    if not _pid_exists(pid):
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+
+    deadline = time.time() + max(0.1, float(terminate_timeout_seconds))
+    while time.time() <= deadline:
+        if not _pid_exists(pid):
+            return True
+        time.sleep(0.05)
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+
+    kill_deadline = time.time() + max(0.1, float(kill_timeout_seconds))
+    while time.time() <= kill_deadline:
+        if not _pid_exists(pid):
+            return True
+        time.sleep(0.05)
+    return not _pid_exists(pid)
 
 
 def _pid_username(pid: int | None) -> str:
