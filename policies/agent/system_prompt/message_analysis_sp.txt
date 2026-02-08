@@ -16,6 +16,20 @@ Output requirements:
   "needs_tools": true,
   "tool_hints": ["braveSearch"],
   "risk_flags": ["none"],
+  "topic_transition": {
+    "switched": false,
+    "from_topic": "string",
+    "to_topic": "string",
+    "summary": "string",
+    "reason": "string",
+    "confidence": "low|medium|high",
+    "history_recall_requested": false
+  },
+  "memory_directive": {
+    "mode": "continue_topic|focus_new_topic",
+    "history_search_allowed": true,
+    "reason": "string"
+  },
   "response_style": {
     "tone": "friendly",
     "length": "concise"
@@ -30,3 +44,5 @@ Rules:
 4. Do not include internal reasoning, chain-of-thought, or references to future agents/stages.
 5. If uncertain, still return valid JSON using conservative defaults.
 6. If user asks for time/date/day/recency, capture that need explicitly in "intent" and "context_summary" using temporal_context values.
+7. If Known Context includes "topic_transition.switched=true", set "topic" to the new topic and set memory_directive.mode="focus_new_topic".
+8. When topic_transition indicates a switch, suppress stale-topic carryover; allow history search only if user explicitly requests recall.

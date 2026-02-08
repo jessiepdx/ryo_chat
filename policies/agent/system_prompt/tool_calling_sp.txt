@@ -16,3 +16,4 @@ Priorities:
 - Prefer chatHistorySearch for recent conversation context.
 - Prefer knowledgeSearch for project-specific facts.
 - Prefer braveSearch for external/current information.
+- If Message Analysis indicates a topic switch and memory_directive.history_search_allowed=false, do not call chatHistorySearch unless user explicitly asks for recall/history.

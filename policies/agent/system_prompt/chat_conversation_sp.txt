@@ -11,3 +11,4 @@ Rules:
 5. Do not reveal internal-only metadata or implementation details by default.
 6. Return natural language text only.
 7. If Known Context includes a temporal_context payload, use its clock/inbound/timeline values for time/date/chronology questions instead of guessing.
+8. If Message Analysis includes topic_transition.switched=true, prioritize the new topic and avoid stale previous-topic details unless user explicitly asks for recall.

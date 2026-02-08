@@ -143,6 +143,107 @@ _META_LEAK_PATTERNS = (
     r"\binternal (?:state|notes|thoughts|reasoning)\b",
     r"\bchain[- ]of[- ]thought\b",
 )
+_TOPIC_SHIFT_PATTERNS = (
+    r"\bnew topic\b",
+    r"\bchange (?:the )?topic\b",
+    r"\bswitch (?:the )?topic\b",
+    r"\bdifferent topic\b",
+    r"\blet'?s talk about\b",
+    r"\blet'?s discuss\b",
+    r"\bmove on\b",
+    r"\bchange subject\b",
+    r"\bstop talking about\b",
+)
+_HISTORY_RECALL_PATTERNS = (
+    r"\bremember\b",
+    r"\brecall\b",
+    r"\bearlier\b",
+    r"\bprevious(?:ly)?\b",
+    r"\blast time\b",
+    r"\bwhat did i (?:ask|say)\b",
+    r"\byou said\b",
+    r"\bwhen did i\b",
+    r"\bfrom before\b",
+)
+_SMALL_TALK_MARKERS = {
+    "ok",
+    "okay",
+    "k",
+    "thanks",
+    "thank",
+    "thx",
+    "cool",
+    "nice",
+    "great",
+    "awesome",
+    "yep",
+    "yes",
+    "no",
+    "nope",
+    "lol",
+    "lmao",
+    "haha",
+    "sup",
+    "hey",
+    "hi",
+    "hello",
+    "yo",
+    "gm",
+    "gn",
+}
+_TOPIC_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "into",
+    "about",
+    "what",
+    "when",
+    "where",
+    "which",
+    "would",
+    "could",
+    "should",
+    "have",
+    "been",
+    "were",
+    "your",
+    "you",
+    "please",
+    "just",
+    "really",
+    "very",
+    "then",
+    "than",
+    "them",
+    "they",
+    "their",
+    "there",
+    "here",
+    "more",
+    "some",
+    "want",
+    "need",
+    "tell",
+    "like",
+    "give",
+    "show",
+    "help",
+    "make",
+    "look",
+    "lets",
+    "let",
+    "talk",
+    "topic",
+    "change",
+    "switch",
+    "stop",
+    "new",
+}
 
 
 def _parse_json_like(text: str) -> dict[str, Any] | None:
@@ -205,6 +306,231 @@ def _coerce_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _history_recall_requested(text: str) -> bool:
+    lowered = _as_text(text).lower()
+    if not lowered:
+        return False
+    return any(re.search(pattern, lowered) for pattern in _HISTORY_RECALL_PATTERNS)
+
+
+def _tokenize_topic_text(text: str) -> list[str]:
+    lowered = _as_text(text).lower()
+    if not lowered:
+        return []
+    tokens: list[str] = []
+    for token in re.findall(r"[a-z0-9']+", lowered):
+        cleaned = token.strip("'")
+        if not cleaned:
+            continue
+        if cleaned in _TOPIC_STOPWORDS:
+            continue
+        if len(cleaned) < 3 and not cleaned.isdigit():
+            continue
+        tokens.append(cleaned)
+    return tokens
+
+
+def _topic_keywords(text: str, *, max_terms: int) -> list[str]:
+    if max_terms <= 0:
+        return []
+    tokens = _tokenize_topic_text(text)
+    if not tokens:
+        return []
+
+    counts: dict[str, int] = {}
+    first_index: dict[str, int] = {}
+    for idx, token in enumerate(tokens):
+        counts[token] = counts.get(token, 0) + 1
+        if token not in first_index:
+            first_index[token] = idx
+
+    ordered = sorted(
+        counts.keys(),
+        key=lambda token: (-counts[token], first_index.get(token, 10_000)),
+    )
+    return ordered[:max_terms]
+
+
+def _topic_label(text: str, *, max_terms: int, fallback: str = "general") -> str:
+    labels = _topic_keywords(text, max_terms=max(1, max_terms))
+    if not labels:
+        return fallback
+    return ", ".join(labels)
+
+
+def _is_small_talk_message(text: str) -> bool:
+    lowered = _as_text(text).lower()
+    if not lowered:
+        return True
+    tokens = [token.strip("'") for token in re.findall(r"[a-z0-9']+", lowered) if token.strip("'")]
+    if not tokens:
+        return True
+    if len(tokens) <= 3 and all(token in _SMALL_TALK_MARKERS for token in tokens):
+        return True
+    return False
+
+
+def _last_user_message_text(history_messages: list[dict[str, Any]] | None) -> str:
+    for record in reversed(history_messages or []):
+        if not isinstance(record, dict):
+            continue
+        if record.get("member_id") is None:
+            continue
+        message_text = _as_text(record.get("message_text"))
+        if message_text:
+            return message_text
+    return ""
+
+
+def _detect_topic_transition(
+    *,
+    current_message: str,
+    history_messages: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    if not _runtime_bool("topic_shift.enabled", True):
+        return {
+            "switched": False,
+            "from_topic": "general",
+            "to_topic": "general",
+            "summary": "Topic shift detection is disabled by runtime settings.",
+            "reason": "disabled",
+            "confidence": "low",
+            "jaccard_similarity": 1.0,
+            "history_recall_requested": _history_recall_requested(current_message),
+        }
+
+    keyword_terms = max(1, _runtime_int("topic_shift.keyword_terms", 4))
+    min_token_count = max(1, _runtime_int("topic_shift.min_token_count", 3))
+    jaccard_threshold = max(0.0, min(1.0, _runtime_float("topic_shift.jaccard_switch_threshold", 0.18)))
+
+    current_text = _as_text(current_message)
+    previous_text = _last_user_message_text(history_messages)
+    history_recall = _history_recall_requested(current_text)
+
+    current_tokens = set(_tokenize_topic_text(current_text))
+    previous_tokens = set(_tokenize_topic_text(previous_text))
+
+    if previous_tokens or current_tokens:
+        union_size = max(1, len(previous_tokens | current_tokens))
+        overlap_size = len(previous_tokens & current_tokens)
+        jaccard_similarity = float(overlap_size) / float(union_size)
+    else:
+        jaccard_similarity = 1.0
+
+    explicit_switch = any(re.search(pattern, current_text.lower()) for pattern in _TOPIC_SHIFT_PATTERNS)
+    lexical_switch = (
+        len(current_tokens) >= min_token_count
+        and len(previous_tokens) >= min_token_count
+        and jaccard_similarity <= jaccard_threshold
+        and not _is_small_talk_message(current_text)
+    )
+
+    from_topic = _topic_label(previous_text, max_terms=keyword_terms, fallback="general")
+    to_topic = _topic_label(current_text, max_terms=keyword_terms, fallback=from_topic or "general")
+    if not to_topic:
+        to_topic = "general"
+    if not from_topic:
+        from_topic = "general"
+
+    switched = False
+    reason = "no_signal"
+    confidence = "low"
+    if history_recall:
+        reason = "history_recall_requested"
+    elif not previous_text:
+        reason = "no_prior_user_message"
+    elif explicit_switch and to_topic != from_topic:
+        switched = True
+        reason = "explicit_switch_signal"
+        confidence = "high"
+    elif lexical_switch and to_topic != from_topic:
+        switched = True
+        reason = "lexical_divergence"
+        confidence = "medium"
+
+    if switched:
+        summary = (
+            f"The user has switched the topic from '{from_topic}' to '{to_topic}'. "
+            f"Prioritize '{to_topic}' as the point of attention unless they explicitly ask to recall '{from_topic}'."
+        )
+    else:
+        summary = (
+            f"Continue focus on topic '{to_topic}'"
+            if to_topic != "general"
+            else "No strong topic anchor detected in the latest user message."
+        )
+
+    return {
+        "switched": switched,
+        "from_topic": from_topic,
+        "to_topic": to_topic,
+        "summary": summary,
+        "reason": reason,
+        "confidence": confidence,
+        "jaccard_similarity": round(jaccard_similarity, 4),
+        "history_recall_requested": history_recall,
+    }
+
+
+def _build_memory_circuit(
+    *,
+    current_message: str,
+    history_messages: list[dict[str, Any]] | None,
+    topic_transition: dict[str, Any] | None,
+) -> dict[str, Any]:
+    transition = _coerce_dict(topic_transition)
+    keyword_terms = max(1, _runtime_int("topic_shift.keyword_terms", 4))
+    recent_user_messages_limit = max(1, _runtime_int("topic_shift.recent_user_messages", 6))
+    deweight_history_on_switch = _runtime_bool("topic_shift.deweight_history_search_on_switch", True)
+
+    recent_user_messages: list[str] = []
+    for record in reversed(history_messages or []):
+        if not isinstance(record, dict):
+            continue
+        if record.get("member_id") is None:
+            continue
+        excerpt = _as_text(record.get("message_text"))
+        if not excerpt:
+            continue
+        recent_user_messages.append(excerpt)
+        if len(recent_user_messages) >= recent_user_messages_limit:
+            break
+    recent_user_messages.reverse()
+
+    recent_user_topics: list[str] = []
+    for entry in recent_user_messages:
+        topic_label = _topic_label(entry, max_terms=keyword_terms, fallback="")
+        if topic_label and topic_label not in recent_user_topics:
+            recent_user_topics.append(topic_label)
+
+    active_topic = _as_text(transition.get("to_topic"))
+    if not active_topic or active_topic == "general":
+        active_topic = _topic_label(current_message, max_terms=keyword_terms, fallback="general")
+    if (not active_topic or active_topic == "general") and recent_user_topics:
+        active_topic = recent_user_topics[-1]
+
+    switched = _as_bool(transition.get("switched"), False)
+    history_recall_requested = _as_bool(transition.get("history_recall_requested"), False) or _history_recall_requested(current_message)
+    history_search_allowed = bool(history_recall_requested or not (switched and deweight_history_on_switch))
+
+    routing_note = (
+        f"Favor new topic '{active_topic}' and suppress semantic history search unless explicitly requested."
+        if switched and not history_search_allowed
+        else f"Memory can include recent context for topic '{active_topic}'."
+    )
+
+    return {
+        "schema": "ryo.memory_circuit.v1",
+        "strategy": "recency_topic_anchor_v1",
+        "active_topic": active_topic,
+        "recent_user_topics": recent_user_topics,
+        "topic_transition": transition,
+        "history_recall_requested": history_recall_requested,
+        "history_search_allowed": history_search_allowed,
+        "routing_note": routing_note,
+    }
+
+
 def _normalize_analysis_payload(raw_analysis_text: str, known_context: dict[str, Any] | None = None) -> dict[str, Any]:
     parsed = _parse_json_like(raw_analysis_text)
     payload = parsed if isinstance(parsed, dict) else {}
@@ -213,6 +539,40 @@ def _normalize_analysis_payload(raw_analysis_text: str, known_context: dict[str,
         payload = tool_results
 
     context_data = known_context if isinstance(known_context, dict) else {}
+    context_topic_transition = _coerce_dict(context_data.get("topic_transition"))
+    context_memory_circuit = _coerce_dict(context_data.get("memory_circuit"))
+    payload_topic_transition = _coerce_dict(payload.get("topic_transition"))
+    payload_memory_directive = _coerce_dict(payload.get("memory_directive"))
+
+    transition_switched = _as_bool(
+        payload_topic_transition.get("switched"),
+        fallback=_as_bool(context_topic_transition.get("switched"), False),
+    )
+    transition_from_topic = _as_text(
+        payload_topic_transition.get("from_topic"),
+        _as_text(context_topic_transition.get("from_topic"), "general"),
+    )
+    transition_to_topic = _as_text(
+        payload_topic_transition.get("to_topic"),
+        _as_text(context_topic_transition.get("to_topic"), _as_text(payload.get("topic"), "general")),
+    )
+    transition_reason = _as_text(
+        payload_topic_transition.get("reason"),
+        _as_text(context_topic_transition.get("reason"), "none"),
+    )
+    transition_confidence = _as_text(
+        payload_topic_transition.get("confidence"),
+        _as_text(context_topic_transition.get("confidence"), "low"),
+    )
+    transition_summary = _as_text(
+        payload_topic_transition.get("summary"),
+        _as_text(context_topic_transition.get("summary")),
+    )
+    transition_history_recall = _as_bool(
+        payload_topic_transition.get("history_recall_requested"),
+        fallback=_as_bool(context_topic_transition.get("history_recall_requested"), False),
+    )
+
     context_summary = _as_text(payload.get("context_summary"))
     if not context_summary:
         member_name = _as_text(context_data.get("member_first_name"), "member")
@@ -222,6 +582,8 @@ def _normalize_analysis_payload(raw_analysis_text: str, known_context: dict[str,
             f"Interface: {interface_name}; chat type: {chat_type}; "
             f"latest message from: {member_name}."
         )
+    if transition_switched and transition_summary:
+        context_summary = f"{transition_summary} {context_summary}".strip()
 
     style_raw = payload.get("response_style")
     style = style_raw if isinstance(style_raw, dict) else {}
@@ -235,9 +597,31 @@ def _normalize_analysis_payload(raw_analysis_text: str, known_context: dict[str,
         if hint in _ALLOWED_TOOL_HINTS and hint not in tool_hints:
             tool_hints.append(hint)
 
-    risk_flags = _as_string_list(payload.get("risk_flags"))
-    topic = _as_text(payload.get("topic"), "general")
+    history_search_allowed = _as_bool(
+        payload_memory_directive.get("history_search_allowed"),
+        fallback=_as_bool(context_memory_circuit.get("history_search_allowed"), True),
+    )
+    if transition_switched and not history_search_allowed:
+        tool_hints = [hint for hint in tool_hints if hint != "chatHistorySearch"]
+
+    risk_flags = _as_string_list(payload.get("risk_flags")) or ["none"]
+    topic = _as_text(payload.get("topic"), transition_to_topic or "general")
+    if transition_switched and transition_to_topic:
+        topic = transition_to_topic
     intent = _as_text(payload.get("intent"), "answer_user")
+
+    memory_mode = _as_text(
+        payload_memory_directive.get("mode"),
+        "focus_new_topic" if transition_switched else "continue_topic",
+    )
+    memory_reason = _as_text(
+        payload_memory_directive.get("reason"),
+        (
+            "Topic switch detected; de-prioritize stale topic memory unless user asks for recall."
+            if transition_switched and not history_search_allowed
+            else "No topic switch override; keep normal recency-weighted memory."
+        ),
+    )
 
     return {
         "topic": topic,
@@ -245,6 +629,20 @@ def _normalize_analysis_payload(raw_analysis_text: str, known_context: dict[str,
         "needs_tools": _as_bool(payload.get("needs_tools"), fallback=False),
         "tool_hints": tool_hints,
         "risk_flags": risk_flags,
+        "topic_transition": {
+            "switched": transition_switched,
+            "from_topic": transition_from_topic,
+            "to_topic": transition_to_topic,
+            "summary": transition_summary,
+            "reason": transition_reason,
+            "confidence": transition_confidence,
+            "history_recall_requested": transition_history_recall,
+        },
+        "memory_directive": {
+            "mode": memory_mode,
+            "history_search_allowed": history_search_allowed,
+            "reason": memory_reason,
+        },
         "response_style": {
             "tone": tone,
             "length": length,
@@ -433,6 +831,23 @@ class ConversationOrchestrator:
                 "clock": {"now_utc": utc_now_iso()},
             }
         )
+        topicTransition = _detect_topic_transition(
+            current_message=self._message,
+            history_messages=self._shortHistory,
+        )
+        memoryCircuit = _build_memory_circuit(
+            current_message=self._message,
+            history_messages=self._shortHistory,
+            topic_transition=topicTransition,
+        )
+        if _as_bool(topicTransition.get("switched"), False):
+            await self._emit_stage(
+                "context.topic_shift",
+                _as_text(topicTransition.get("summary")),
+                from_topic=topicTransition.get("from_topic"),
+                to_topic=topicTransition.get("to_topic"),
+                reason=topicTransition.get("reason"),
+            )
 
         knownContext = {
             "tool_name": "Known Context",
@@ -443,6 +858,8 @@ class ConversationOrchestrator:
                 "chat_type": self._chatType,
                 "timestamp_utc": temporalContext.get("clock", {}).get("now_utc", utc_now_iso()),
                 "temporal_context": temporalContext,
+                "topic_transition": topicTransition,
+                "memory_circuit": memoryCircuit,
             }
         }
         self._messages.append(Message(role="tool", content=json.dumps(knownContext)))
@@ -491,12 +908,19 @@ class ConversationOrchestrator:
         toolStageMessages.append(Message(role="tool", content=json.dumps(analysisMessagePayload)))
         toolOptions = dict(self._options)
         toolRuntimeContext = _coerce_dict(toolOptions.get("tool_runtime_context"))
+        knownContextResults = _coerce_dict(knownContext.get("tool_results"))
         toolRuntimeContext.update(
             {
                 "chat_host_id": self._chatHostID,
                 "chat_type": self._chatType,
                 "platform": self._platform,
                 "topic_id": self._topicID,
+                "topic_transition": _coerce_dict(knownContextResults.get("topic_transition")),
+                "memory_circuit": _coerce_dict(knownContextResults.get("memory_circuit")),
+                "history_search_allowed": _as_bool(
+                    _coerce_dict(knownContextResults.get("memory_circuit")).get("history_search_allowed"),
+                    True,
+                ),
             }
         )
         toolOptions["tool_runtime_context"] = toolRuntimeContext
@@ -668,6 +1092,16 @@ def chatHistorySearch(queryString: str, count: int = 2, runtime_context: dict | 
     """
 
     context = _coerce_dict(runtime_context)
+    if not _as_bool(context.get("history_search_allowed"), True):
+        logger.info("Skipping chatHistorySearch due to memory routing policy: history_search_allowed=false")
+        return []
+
+    transition = _coerce_dict(context.get("topic_transition"))
+    switched = _as_bool(transition.get("switched"), False)
+    history_recall_requested = _as_bool(transition.get("history_recall_requested"), False)
+    switch_window_hours = max(1, _runtime_int("topic_shift.history_window_hours_on_switch", 2))
+    scoped_time_window = switch_window_hours if (switched and not history_recall_requested) else None
+
     scopedSearch = bool(context.get("chat_host_id") is not None or context.get("chat_type") or context.get("platform"))
     results = chatHistory.searchChatHistory(
         text=queryString,
@@ -677,12 +1111,15 @@ def chatHistorySearch(queryString: str, count: int = 2, runtime_context: dict | 
         platform=context.get("platform"),
         topicID=context.get("topic_id"),
         scopeTopic=scopedSearch,
+        timeInHours=scoped_time_window,
     )
     scopeInfo = {
         "chat_host_id": context.get("chat_host_id"),
         "chat_type": context.get("chat_type"),
         "platform": context.get("platform"),
         "topic_id": context.get("topic_id"),
+        "scoped_time_window_hours": scoped_time_window,
+        "topic_switched": switched,
     }
     logger.debug(
         "Chat history tool results:\n"
