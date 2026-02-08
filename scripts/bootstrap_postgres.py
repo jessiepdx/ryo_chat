@@ -212,6 +212,31 @@ def _verify_instance_identity(
     )
 
 
+def _vector_extension_available_on_server(
+    target: BootstrapTarget,
+    *,
+    retries: int,
+    retry_delay: float,
+    connect_timeout: int = 1,
+) -> tuple[bool, str]:
+    maintenance_conn = _conninfo(target, db_name=target.maintenance_db)
+    try:
+        with _connect_with_retry(
+            maintenance_conn,
+            retries=retries,
+            retry_delay=retry_delay,
+            connect_timeout=connect_timeout,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT EXISTS(SELECT 1 FROM pg_available_extensions WHERE name = 'vector');")
+                available = bool(cursor.fetchone()[0])
+                if available:
+                    return True, "pgvector extension is available on server"
+                return False, "pgvector extension is unavailable on server"
+    except Exception as error:  # noqa: BLE001
+        return False, str(error)
+
+
 def _database_exists(conninfo: str, target_db: str, retries: int, retry_delay: float) -> bool:
     with _connect_with_retry(conninfo, retries, retry_delay) as connection:
         with connection.cursor() as cursor:
@@ -389,9 +414,21 @@ def _resolve_docker_host_port(
             connect_timeout=1,
         )
         if identity_ok:
+            vector_available, vector_message = _vector_extension_available_on_server(
+                probe_target,
+                retries=0,
+                retry_delay=retry_delay,
+                connect_timeout=1,
+            )
+            if not vector_available:
+                last_identity_error = (
+                    "matching identity/auth found but server cannot provide pgvector "
+                    f"({vector_message})"
+                )
+                continue
             return str(port), True, (
                 "reusing occupied local port because instance identity/auth checks passed "
-                f"({identity_message})"
+                f"({identity_message}; {vector_message})"
             )
         last_identity_error = identity_message
 

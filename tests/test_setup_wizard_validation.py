@@ -165,6 +165,119 @@ class TestSetupWizardValidation(unittest.TestCase):
         self.assertIn("both", called)
         self.assertIn("--docker", called)
 
+    def test_is_local_database_setup_true_for_local_hosts(self):
+        state = {
+            "db_host": "127.0.0.1",
+            "fallback_enabled": True,
+            "fallback_mode": "local",
+            "fallback_db_host": "localhost",
+        }
+        self.assertTrue(setup_wizard.is_local_database_setup(state))
+
+    def test_is_local_database_setup_false_for_remote_primary(self):
+        state = {
+            "db_host": "db.example.com",
+            "fallback_enabled": False,
+        }
+        self.assertFalse(setup_wizard.is_local_database_setup(state))
+
+    def test_build_state_non_interactive_enables_auto_local_bootstrap(self):
+        args = argparse.Namespace(
+            ollama_host=None,
+            non_interactive=True,
+            default_host=setup_wizard.DEFAULT_OLLAMA_HOST,
+            embedding_model=None,
+            generate_model=None,
+            chat_model=None,
+            tool_model=None,
+            multimodal_model=None,
+            bot_name=None,
+            bot_id=None,
+            bot_token=None,
+            web_ui_url=None,
+            owner_first_name=None,
+            owner_last_name=None,
+            owner_user_id=None,
+            owner_username=None,
+            db_name=None,
+            db_user=None,
+            db_password=None,
+            db_host=None,
+            db_port=None,
+            fallback_enabled=False,
+            fallback_disabled=False,
+            fallback_mode=None,
+            fallback_db_name=None,
+            fallback_db_user=None,
+            fallback_db_password=None,
+            fallback_db_host=None,
+            fallback_db_port=None,
+            brave_search_key=None,
+            twitter_consumer_key=None,
+            twitter_consumer_secret=None,
+            twitter_access_token=None,
+            twitter_access_token_secret=None,
+            bootstrap_postgres=False,
+            bootstrap_docker=False,
+        )
+        config_data = {
+            "bot_name": "ryo_bot",
+            "bot_id": 123,
+            "bot_token": "token",
+            "web_ui_url": "http://127.0.0.1:4747",
+            "owner_info": {
+                "first_name": "First",
+                "last_name": "Last",
+                "user_id": 456,
+                "username": "owner",
+            },
+            "database": {
+                "db_name": "ryo_chat",
+                "user": "postgres_user",
+                "password": "postgres_password",
+                "host": "127.0.0.1",
+                "port": "5432",
+            },
+            "database_fallback": {"enabled": False},
+            "twitter_keys": {},
+            "api_keys": {},
+        }
+        with mock.patch.object(setup_wizard, "probe_ollama_models", return_value=([], None)):
+            state = setup_wizard.build_state_non_interactive(args, config_data)
+        self.assertTrue(state["bootstrap_postgres"])
+        self.assertTrue(state["bootstrap_docker"])
+        self.assertTrue(state["write_env"])
+
+    def test_sync_db_state_from_config_prefers_persisted_ports(self):
+        state = {
+            "db_host": "127.0.0.1",
+            "db_port": "5432",
+            "fallback_enabled": True,
+            "fallback_db_host": "127.0.0.1",
+            "fallback_db_port": "5433",
+        }
+        config_data = {
+            "database": {
+                "db_name": "ryo_chat",
+                "user": "postgres_user",
+                "password": "postgres_password",
+                "host": "127.0.0.1",
+                "port": "5542",
+            },
+            "database_fallback": {
+                "enabled": True,
+                "mode": "local",
+                "db_name": "ryo_chat_fallback",
+                "user": "postgres_user",
+                "password": "postgres_password",
+                "host": "127.0.0.1",
+                "port": "5543",
+            },
+        }
+        synced = setup_wizard.sync_db_state_from_config(state, config_data)
+        self.assertEqual(synced["db_port"], "5542")
+        self.assertEqual(synced["fallback_db_port"], "5543")
+
 
 if __name__ == "__main__":
     unittest.main()

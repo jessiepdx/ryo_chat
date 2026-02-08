@@ -151,6 +151,60 @@ def is_valid_numeric_id(value: str | int | None) -> bool:
     return text.isdigit() and int(text) > 0
 
 
+def _is_local_db_host(value: str | None) -> bool:
+    host = str(value or "").strip().lower()
+    return host in {"127.0.0.1", "localhost", "0.0.0.0", "::1", "::"}
+
+
+def _is_local_db_mode(value: str | None) -> bool:
+    mode = str(value or "").strip().lower()
+    return mode in {"", "local", "docker", "container"}
+
+
+def is_local_database_setup(state: dict[str, Any]) -> bool:
+    if not _is_local_db_host(str(state.get("db_host", "")).strip()):
+        return False
+    if bool(state.get("fallback_enabled", False)):
+        if not _is_local_db_host(str(state.get("fallback_db_host", "")).strip()):
+            return False
+        if not _is_local_db_mode(str(state.get("fallback_mode", "")).strip()):
+            return False
+    return True
+
+
+def sync_db_state_from_config(state: dict[str, Any], config_data: dict[str, Any]) -> dict[str, Any]:
+    synced: dict[str, Any] = dict(state)
+    database = config_data.get("database")
+    if isinstance(database, dict):
+        if database.get("db_name") not in (None, ""):
+            synced["db_name"] = str(database.get("db_name"))
+        if database.get("user") not in (None, ""):
+            synced["db_user"] = str(database.get("user"))
+        if database.get("password") not in (None, ""):
+            synced["db_password"] = str(database.get("password"))
+        if database.get("host") not in (None, ""):
+            synced["db_host"] = str(database.get("host"))
+        if database.get("port") not in (None, ""):
+            synced["db_port"] = str(database.get("port"))
+
+    fallback = config_data.get("database_fallback")
+    if isinstance(fallback, dict):
+        synced["fallback_enabled"] = bool(fallback.get("enabled", synced.get("fallback_enabled", False)))
+        if fallback.get("mode") not in (None, ""):
+            synced["fallback_mode"] = str(fallback.get("mode"))
+        if fallback.get("db_name") not in (None, ""):
+            synced["fallback_db_name"] = str(fallback.get("db_name"))
+        if fallback.get("user") not in (None, ""):
+            synced["fallback_db_user"] = str(fallback.get("user"))
+        if fallback.get("password") not in (None, ""):
+            synced["fallback_db_password"] = str(fallback.get("password"))
+        if fallback.get("host") not in (None, ""):
+            synced["fallback_db_host"] = str(fallback.get("host"))
+        if fallback.get("port") not in (None, ""):
+            synced["fallback_db_port"] = str(fallback.get("port"))
+    return synced
+
+
 def infer_existing_host(config_data: dict) -> str | None:
     inference = config_data.get("inference")
     if not isinstance(inference, dict):
@@ -810,9 +864,13 @@ def build_state_non_interactive(args: argparse.Namespace, config_data: dict) -> 
         "twitter_consumer_secret": args.twitter_consumer_secret if args.twitter_consumer_secret is not None else twitter.get("consumer_secret", ""),
         "twitter_access_token": args.twitter_access_token if args.twitter_access_token is not None else twitter.get("access_token", ""),
         "twitter_access_token_secret": args.twitter_access_token_secret if args.twitter_access_token_secret is not None else twitter.get("access_token_secret", ""),
-        "bootstrap_postgres": bool(args.bootstrap_postgres),
-        "bootstrap_docker": bool(args.bootstrap_docker),
+        "bootstrap_postgres": False,
+        "bootstrap_docker": False,
+        "write_env": True,
     }
+    local_defaults_mode = is_local_database_setup(state)
+    state["bootstrap_postgres"] = bool(args.bootstrap_postgres) or local_defaults_mode
+    state["bootstrap_docker"] = bool(args.bootstrap_docker) or local_defaults_mode
     return state
 
 
@@ -1002,20 +1060,14 @@ def build_state_plain_interactive(
             default=_seeded_str(seed_state, "twitter_access_token_secret", str(twitter.get("access_token_secret", ""))),
             required=False,
         )
-        state["write_env"] = _bool_prompt_plain(
-            "Write/update .env from wizard values?",
-            default=_seeded_bool(seed_state, "write_env", args.write_env),
-        )
-        state["bootstrap_postgres"] = _bool_prompt_plain(
-            "Run PostgreSQL + pgvector bootstrap now?",
-            default=_seeded_bool(seed_state, "bootstrap_postgres", args.bootstrap_postgres),
-        )
-        state["bootstrap_docker"] = False
-        if state["bootstrap_postgres"]:
-            state["bootstrap_docker"] = _bool_prompt_plain(
-                "Use dockerized PostgreSQL provisioning?",
-                default=_seeded_bool(seed_state, "bootstrap_docker", args.bootstrap_docker),
-            )
+        local_defaults_mode = is_local_database_setup(state)
+        state["write_env"] = True
+        state["bootstrap_postgres"] = bool(args.bootstrap_postgres) or local_defaults_mode
+        state["bootstrap_docker"] = bool(args.bootstrap_docker) or local_defaults_mode
+        if state["bootstrap_postgres"] and state["bootstrap_docker"]:
+            print("Local/default DB mode detected: PostgreSQL bootstrap will run automatically via Docker.")
+        elif state["bootstrap_postgres"]:
+            print("PostgreSQL bootstrap requested in direct-host mode.")
     except KeyboardInterrupt as error:
         if state_path is not None:
             save_partial_state(state_path, state)
@@ -1309,30 +1361,17 @@ def build_state_curses(
             required=False,
         )
 
-        state["write_env"] = ui.prompt_yes_no(
-            "Environment file",
-            "Write/update .env from wizard values?",
-            default=_seeded_bool(seed_state, "write_env", args.write_env),
-        )
-
-        state["bootstrap_postgres"] = ui.prompt_yes_no(
-            "DB bootstrap",
-            "Run PostgreSQL + pgvector bootstrap after save?",
-            default=_seeded_bool(seed_state, "bootstrap_postgres", args.bootstrap_postgres),
-        )
-        state["bootstrap_docker"] = False
-        if state["bootstrap_postgres"]:
-            state["bootstrap_docker"] = ui.prompt_yes_no(
-                "DB bootstrap",
-                "Use dockerized PostgreSQL provisioning?",
-                default=_seeded_bool(seed_state, "bootstrap_docker", args.bootstrap_docker),
-            )
+        local_defaults_mode = is_local_database_setup(state)
+        state["write_env"] = True
+        state["bootstrap_postgres"] = bool(args.bootstrap_postgres) or local_defaults_mode
+        state["bootstrap_docker"] = bool(args.bootstrap_docker) or local_defaults_mode
 
         summary = (
             f"Endpoint: {state['ollama_host']}\n"
             f"Primary DB: {state['db_host']}:{state['db_port']}/{state['db_name']}\n"
             f"Fallback enabled: {state['fallback_enabled']}\n"
-            f"Run DB bootstrap: {state['bootstrap_postgres']}\n"
+            f"Run DB bootstrap: {state['bootstrap_postgres']} (docker={state['bootstrap_docker']})\n"
+            "Write/update .env: True\n"
             "Save changes to config file?"
         )
         confirmed = ui.prompt_yes_no("Confirm", summary, default=True)
@@ -1647,16 +1686,15 @@ def main() -> int:
     backup = backup_file(config_path)
     write_json(config_path, merged)
 
-    should_write_env = args.write_env or bool(state.get("write_env", False))
-    if should_write_env:
-        updates = state_to_env_updates(state, telegram_only=args.telegram_only)
-        write_env_with_updates(env_path, env_template, updates)
-        print(f"Wrote env values: {env_path}")
-
     bootstrap_requested = (
         (not args.telegram_only)
         and (args.bootstrap_postgres or bool(state.get("bootstrap_postgres", False)))
     )
+    if (not args.telegram_only) and not bootstrap_requested and is_local_database_setup(state):
+        bootstrap_requested = True
+        state["bootstrap_postgres"] = True
+        state["bootstrap_docker"] = True
+
     if bootstrap_requested:
         bootstrap_target = resolve_bootstrap_target(
             merged,
@@ -1679,6 +1717,17 @@ def main() -> int:
             print("PostgreSQL bootstrap failed; config was saved but bootstrap did not complete.")
             return 1
         print("PostgreSQL bootstrap completed successfully.")
+        state = sync_db_state_from_config(state, load_json(config_path))
+
+    should_write_env = (
+        (not args.telegram_only)
+        or args.write_env
+        or bool(state.get("write_env", False))
+    )
+    if should_write_env:
+        updates = state_to_env_updates(state, telegram_only=args.telegram_only)
+        write_env_with_updates(env_path, env_template, updates)
+        print(f"Wrote env values: {env_path}")
 
     if backup:
         print(f"Backed up existing config to: {backup}")

@@ -196,6 +196,11 @@ class TestPgBootstrap(unittest.TestCase):
                 "_verify_instance_identity",
                 return_value=(True, "auth and db checks passed"),
             ),
+            mock.patch.object(
+                bootstrap_postgres,
+                "_vector_extension_available_on_server",
+                return_value=(True, "pgvector extension is available on server"),
+            ),
         ):
             selected_port, reused_existing, reason = bootstrap_postgres._resolve_docker_host_port(
                 target,
@@ -207,6 +212,39 @@ class TestPgBootstrap(unittest.TestCase):
         self.assertEqual(selected_port, "5432")
         self.assertTrue(reused_existing)
         self.assertIn("instance identity/auth checks passed", reason)
+
+    def test_resolve_docker_host_port_skips_matching_service_without_pgvector(self):
+        target = bootstrap_postgres.BootstrapTarget(
+            label="primary",
+            db_name="db",
+            user="u",
+            password="p",
+            host="127.0.0.1",
+            port="5432",
+        )
+        with (
+            mock.patch.object(bootstrap_postgres, "_can_bind_host_port", side_effect=[False, True]),
+            mock.patch.object(
+                bootstrap_postgres,
+                "_verify_instance_identity",
+                return_value=(True, "auth and db checks passed"),
+            ),
+            mock.patch.object(
+                bootstrap_postgres,
+                "_vector_extension_available_on_server",
+                return_value=(False, "pgvector extension is unavailable on server"),
+            ),
+        ):
+            selected_port, reused_existing, reason = bootstrap_postgres._resolve_docker_host_port(
+                target,
+                scan_limit=1,
+                retries=0,
+                retry_delay=0.0,
+            )
+
+        self.assertEqual(selected_port, "5433")
+        self.assertFalse(reused_existing)
+        self.assertIn("selected free local port", reason)
 
     def test_ensure_docker_container_uses_mapped_port_for_existing_container(self):
         target = bootstrap_postgres.BootstrapTarget(
