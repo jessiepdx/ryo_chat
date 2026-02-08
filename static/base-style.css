@@ -27,7 +27,7 @@
     --med-rem: 3rem;
     --large-rem: 4rem;
     --right-panel-width: 300px;
-    --border-radius: 0.5rem;
+    --border-radius: 4px;
     --panel-bar-height-constraint: 999px;
     --panel-bar-height: clamp(2.95rem, 2.55rem + 0.7vw, 3.75rem);
     --panel-bar-min-height: var(--panel-bar-height);
@@ -80,7 +80,7 @@ button {
     font-size: var(--mini-rem);
     padding: var(--micro-rem);
     font-weight: bold;
-    border-radius: calc(0.5 * var(--border-radius));
+    border-radius: var(--border-radius);
     border: var(--border-width) solid var(--accent-primary);
     display: flex;
     color: var(--accent-dark);
@@ -298,7 +298,7 @@ select {
 .auth-message {
     font-size: var(--micro-rem);
     padding: var(--micro-rem);
-    border-radius: calc(0.5 * var(--border-radius));
+    border-radius: var(--border-radius);
     border: var(--border-width) solid var(--accent-midway);
 }
 
@@ -316,7 +316,7 @@ select {
     margin-top: var(--micro-rem);
     margin-bottom: var(--micro-rem);
     padding: var(--micro-rem);
-    border-radius: calc(0.5 * var(--border-radius));
+    border-radius: var(--border-radius);
     border: var(--border-width) dashed var(--accent-midway);
     color: var(--accent-midway);
     font-size: calc(var(--micro-rem) * 0.92);
@@ -367,7 +367,7 @@ select {
 #section-header {
     display: flex;
     overflow: hidden;
-    border-radius: var(--border-radius);
+    border-radius: 4px;
     container-type: inline-size;
     container-name: headerContainer;
 }
@@ -418,7 +418,6 @@ select {
     font-size: var(--small-rem);
     line-height: calc(var(--med-rem) - var(--nano-rem));
     padding-top: calc(0.75 * var(--nano-rem));
-    color: var(--accent-dark);
     pointer-events: none;
 }
 
@@ -638,7 +637,7 @@ select {
     background-color: var(--accent-primary);
     padding: var(--mini-rem);
     color: var(--accent-dark);
-    border-radius: calc(0.5 * var(--border-radius));
+    border-radius: var(--border-radius);
     cursor: pointer;
     font-weight: bold;
     font-size: var(--mini-micro-rem);
@@ -909,7 +908,7 @@ select {
     background-color: var(--accent-dark);
     gap: var(--micro-rem);
     border: var(--border-width) solid var(--accent-midway);
-    border-radius: calc(0.5 * var(--border-radius));
+    border-radius: var(--border-radius);
 }
 
 .profile-data-row button {
@@ -1395,7 +1394,7 @@ select {
     #icons nav {
         display: flex;
         justify-content: center;
-        border-radius: calc(0.5 * var(--border-radius));
+        border-radius: var(--border-radius);
         align-items: center;
         width: calc(var(--panel-bar-height));
     }
@@ -1454,7 +1453,7 @@ select {
    PANEL SYSTEM REFRESH (single source of truth)
    ==================================================== */
 :root {
-    --panel-shell-radius: 0.75rem;
+    --panel-shell-radius: 4px;
     --panel-rail-min-height: clamp(2.95rem, 2.55rem + 0.7vw, 3.75rem);
     --panel-rail-padding-inline: clamp(0.45rem, 0.35rem + 0.35vw, 0.85rem);
     --panel-rail-padding-block: clamp(0.28rem, 0.2rem + 0.22vw, 0.6rem);
@@ -1506,7 +1505,7 @@ select {
     height: 100%;
     min-height: 0;
     order: 0;
-    gap: var(--micro-rem);
+    gap: var(--panel-gap);
 }
 
 .panel-section-center {
@@ -1534,9 +1533,11 @@ select {
 #main-menu-top-panel,
 #right-top-panel {
     min-height: 0;
+    height: auto;
+    max-height: none;
     display: flex;
     flex-direction: column;
-    gap: var(--micro-rem);
+    gap: var(--panel-gap);
 }
 
 #account-top-panel,
@@ -1548,7 +1549,8 @@ select {
 #account-bottom-panel,
 #main-menu-bottom-panel,
 #right-bottom-panel {
-    flex: 0 0 clamp(180px, 32%, 300px);
+    flex: 0 1 auto;
+    min-height: fit-content;
 }
 
 .panel-header,
@@ -1569,6 +1571,8 @@ select {
 }
 
 .panel-footer {
+    flex-wrap: wrap;
+    row-gap: var(--panel-gap);
     border-top-left-radius: var(--nano-rem);
     border-top-right-radius: var(--nano-rem);
 }
@@ -1582,6 +1586,21 @@ select {
     align-items: stretch;
     height: fit-content;
     min-height: fit-content;
+}
+
+.panel-footer.footer-detached > * {
+    min-height: fit-content;
+    height: auto;
+}
+
+#left-panel:has(> .panel-content.ap-side-layout + .panel-footer.button-bar),
+#right-top-panel:has(> .panel-content.ap-side-layout + .panel-footer.button-bar),
+#right-bottom-panel:has(> .panel-content.ap-side-layout + .panel-footer.button-bar),
+#account-top-panel:has(> .panel-content.ap-side-layout + .panel-footer.button-bar),
+#account-bottom-panel:has(> .panel-content.ap-side-layout + .panel-footer.button-bar),
+#main-menu-top-panel:has(> .panel-content.ap-side-layout + .panel-footer.button-bar),
+#main-menu-bottom-panel:has(> .panel-content.ap-side-layout + .panel-footer.button-bar) {
+    --panel-shell-radius: 4px;
 }
 
 .panel-content {
@@ -1643,14 +1662,14 @@ select {
 
 #center-panel > .panel-content.header-detached.footer-detached {
     padding: var(--center-content-padding);
-    border-radius: calc(var(--panel-shell-radius) + 0.05rem);
+    border-radius: 4px;
     background-color: #242424;
 }
 
 #center-panel > .panel-footer.footer-detached {
     display: block;
     padding: var(--center-footer-padding);
-    border-radius: calc(var(--panel-shell-radius) + 0.05rem);
+    border-radius: 4px;
     background: linear-gradient(180deg, #2e2e2e 0%, #252525 100%);
     overflow: visible;
     align-items: unset;
@@ -1775,4 +1794,62 @@ select {
     #center-panel > .panel-footer.footer-detached {
         padding: 0.62rem;
     }
+}
+
+/* ====================================================
+   UNIFORM PANEL + BUTTON NORMALIZATION
+   ==================================================== */
+button,
+input[type='submit'],
+.button-bar,
+.menu-item,
+.auth-inline-launch,
+.auth-modal-close,
+.auth-tab,
+.auth-submit {
+    border-radius: 4px;
+}
+
+#panel-sections,
+.panel-section-center,
+.panel-section-left,
+.panel-section-right,
+#left-panel,
+#right-panel,
+#account-panel,
+#main-menu-panel,
+#account-bottom-panel,
+#main-menu-bottom-panel,
+#right-bottom-panel,
+#account-top-panel,
+#main-menu-top-panel,
+#right-top-panel,
+#center-panel {
+    gap: var(--panel-gap);
+}
+
+.panel-header,
+.panel-footer,
+.panel-content,
+.panel-content.header-detached,
+.panel-content.footer-detached,
+.panel-no-footer .panel-content,
+.panel-no-header .panel-content,
+#center-panel > .panel-content.header-detached.footer-detached,
+#center-panel > .panel-footer.footer-detached,
+#ap-toolbar,
+.ap-pane,
+.ap-pane-input,
+.ap-pane-select,
+.ap-chat-message,
+.ap-trace-row,
+.ap-card,
+.ap-details,
+#ap-input,
+#ap-schema-form,
+.ap-side-card,
+.ap-side-json,
+.ap-model-requested-row input,
+.ap-model-requested-row select {
+    border-radius: 4px;
 }

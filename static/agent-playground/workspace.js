@@ -172,6 +172,10 @@ class AgentPlaygroundApp {
             if (rawPrefs.collapsed && typeof rawPrefs.collapsed === "object" && key in rawPrefs.collapsed) {
                 normalized.collapsed[key] = Boolean(rawPrefs.collapsed[key]);
             }
+            // Collapse now means hidden from layout. Keep legacy prefs compatible.
+            if (normalized.collapsed[key]) {
+                normalized.visible[key] = false;
+            }
         }
 
         if (Object.values(normalized.visible).every((value) => !value)) {
@@ -227,9 +231,7 @@ class AgentPlaygroundApp {
             return;
         }
         this.workspacePrefs.visible[key] = !currentlyVisible;
-        if (!this.workspacePrefs.visible[key]) {
-            this.workspacePrefs.collapsed[key] = false;
-        }
+        this.workspacePrefs.collapsed[key] = false;
         this._applyWorkspacePrefs();
         this._saveWorkspacePrefs();
     }
@@ -239,10 +241,13 @@ class AgentPlaygroundApp {
         if (!this.panes.has(key)) {
             return;
         }
-        if (!this.workspacePrefs.visible[key]) {
+        const currentlyVisible = Boolean(this.workspacePrefs.visible[key]);
+        if (!currentlyVisible) {
             return;
         }
-        this.workspacePrefs.collapsed[key] = !Boolean(this.workspacePrefs.collapsed[key]);
+        // "Collapse" should remove the pane from layout so other panes can expand.
+        this.workspacePrefs.visible[key] = false;
+        this.workspacePrefs.collapsed[key] = true;
         this._applyWorkspacePrefs();
         this._saveWorkspacePrefs();
     }
@@ -309,8 +314,8 @@ class AgentPlaygroundApp {
 
             const collapseButton = pane.element.querySelector("[data-pane-collapse]");
             if (collapseButton) {
-                collapseButton.textContent = collapsed ? "Expand" : "Collapse";
-                collapseButton.setAttribute("aria-expanded", collapsed ? "false" : "true");
+                collapseButton.textContent = "Collapse";
+                collapseButton.setAttribute("aria-expanded", visible ? "true" : "false");
                 collapseButton.disabled = !visible;
             }
         }

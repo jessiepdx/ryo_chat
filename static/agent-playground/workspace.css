@@ -694,3 +694,41 @@
         grid-template-columns: 1fr;
     }
 }
+
+/* ====================================================
+   UNIFORM PANEL + BUTTON NORMALIZATION
+   ==================================================== */
+:root {
+    --ap-panel-radius: 4px;
+    --ap-panel-gap: var(--panel-gap, 0.75rem);
+}
+
+#ap-workspace,
+#ap-grid,
+#ap-toolbar,
+.ap-toolbar-group,
+.ap-pane-toolbar,
+.ap-pane-body,
+#ap-composer,
+#ap-composer-actions,
+.ap-side-layout {
+    gap: var(--ap-panel-gap);
+}
+
+#ap-workspace button,
+#ap-toolbar,
+.ap-pane,
+.ap-pane-input,
+.ap-pane-select,
+.ap-chat-message,
+.ap-trace-row,
+.ap-card,
+.ap-details,
+#ap-input,
+#ap-schema-form,
+.ap-side-card,
+.ap-model-requested-row input,
+.ap-model-requested-row select,
+.ap-side-json {
+    border-radius: var(--ap-panel-radius);
+}
