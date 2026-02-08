@@ -94,6 +94,10 @@ STARTUP_CORE_MIGRATIONS: tuple[str, ...] = (
     "050_proposals.sql",
     "051_proposal_disclosure.sql",
     "070_inference_usage.sql",
+    "080_runs.sql",
+    "081_run_events.sql",
+    "082_run_state_snapshots.sql",
+    "083_run_artifacts.sql",
 )
 STARTUP_VECTOR_MIGRATIONS: tuple[str, ...] = (
     "011_create_vector_extension.sql",

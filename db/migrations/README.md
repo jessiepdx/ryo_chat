@@ -23,3 +23,4 @@ The runtime managers in `hypermindlabs/utils.py` load migrations from this folde
 - spam table
 - inference usage table
 - pgvector extension enablement
+- run lifecycle tables (`runs`, `run_events`, `run_state_snapshots`, `run_artifacts`)

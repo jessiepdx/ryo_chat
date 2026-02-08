@@ -23,8 +23,26 @@ import os
 import re
 import secrets
 import socket
+import time
 from datetime import datetime
-from flask import Flask, request, abort, url_for, redirect, session, render_template, g, jsonify
+from typing import Any
+from flask import (
+    Flask,
+    Response,
+    abort,
+    g,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    stream_with_context,
+    url_for,
+)
+from hypermindlabs.capability_manifest import build_capability_manifest, find_capability
+from hypermindlabs.replay_manager import ReplayManager
+from hypermindlabs.run_manager import RunManager
+from hypermindlabs.run_mode_handlers import normalize_run_mode, run_modes_manifest
 from hypermindlabs.utils import ConfigManager, CustomFormatter, MemberManager, KnowledgeManager
 from urllib.parse import parse_qs
 
@@ -85,6 +103,8 @@ ConsoleColors = {
 
 config = ConfigManager()
 members = MemberManager()
+playgroundRuns = RunManager(enable_db=True)
+playgroundReplay = ReplayManager(playgroundRuns)
 
 logger.info(f"Database route status: {config.databaseRoute}")
 miniappConfigIssues = config.getTelegramConfigIssues(require_owner=False, require_web_ui_url=False)
@@ -174,6 +194,29 @@ def _normalize_username(value: str | None) -> str:
 
 def _username_is_valid(value: str) -> bool:
     return USERNAME_PATTERN.fullmatch(value) is not None
+
+
+def _api_auth_error(message: str = "Authentication required.") -> tuple[Response, int]:
+    return jsonify({"status": "error", "message": message}), 401
+
+
+def _require_member_api() -> dict | None:
+    if not g.memberData:
+        return None
+    return g.memberData
+
+
+def _request_json_dict() -> dict:
+    payload = request.get_json(silent=True)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _lineage_from_request(payload: dict) -> dict[str, Any]:
+    lineage = payload.get("lineage")
+    if isinstance(lineage, dict):
+        return lineage
+    return {}
+
 
 availableMenu = [
     {
@@ -516,6 +559,316 @@ def miniappLogin():
         session["member_id"] = memberID
 
     return redirect(url_for("index"))
+
+
+@app.get("/api/agent-playground/bootstrap")
+def playgroundBootstrapAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = member.get("roles") if isinstance(member.get("roles"), list) else []
+    manifest = build_capability_manifest(member_roles=roles)
+    response = {
+        "status": "ok",
+        "member": {
+            "member_id": memberID,
+            "username": member.get("username"),
+            "first_name": member.get("first_name"),
+            "last_name": member.get("last_name"),
+            "roles": roles,
+        },
+        "run_modes": run_modes_manifest(),
+        "manifest": manifest,
+        "runs": playgroundRuns.list_runs(limit=15, member_id=memberID),
+        "metrics": playgroundRuns.metrics_summary(),
+    }
+    return jsonify(response)
+
+
+@app.get("/api/agent-playground/capabilities")
+def playgroundCapabilitiesAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    roles = member.get("roles") if isinstance(member.get("roles"), list) else []
+    manifest = build_capability_manifest(member_roles=roles)
+    return jsonify({"status": "ok", "manifest": manifest})
+
+
+@app.get("/api/agent-playground/capabilities/<capability_id>")
+def playgroundCapabilityByIDAPI(capability_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    roles = member.get("roles") if isinstance(member.get("roles"), list) else []
+    manifest = build_capability_manifest(member_roles=roles)
+    capability = find_capability(manifest, capability_id)
+    if capability is None:
+        return jsonify({"status": "error", "message": "Capability not found."}), 404
+    return jsonify({"status": "ok", "capability": capability})
+
+
+@app.get("/api/agent-playground/runs")
+def playgroundRunsListAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    statusFilter = request.args.get("status")
+    try:
+        limit = int(request.args.get("limit", "30"))
+    except ValueError:
+        limit = 30
+    runs = playgroundRuns.list_runs(
+        limit=max(1, min(limit, 200)),
+        status=statusFilter if statusFilter else None,
+        member_id=memberID,
+    )
+    return jsonify({"status": "ok", "runs": runs})
+
+
+@app.post("/api/agent-playground/runs")
+def playgroundRunsCreateAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    payload = _request_json_dict()
+    mode = normalize_run_mode(payload.get("mode", "chat"))
+    message = str(payload.get("message") or payload.get("prompt") or "").strip()
+    batchInputs = payload.get("batch_inputs")
+    compareModels = payload.get("compare_models")
+
+    if mode in {"chat", "workflow", "compare"} and not message:
+        return jsonify({"status": "error", "message": "message is required for this mode."}), 400
+    if mode == "batch":
+        if not isinstance(batchInputs, list):
+            if message:
+                batchInputs = [line.strip() for line in message.splitlines() if line.strip()]
+            else:
+                batchInputs = []
+        if not batchInputs:
+            return jsonify({"status": "error", "message": "batch_inputs is required for batch mode."}), 400
+    if mode == "compare":
+        if not isinstance(compareModels, list) or len(compareModels) < 2:
+            return jsonify({"status": "error", "message": "compare_models requires at least two models."}), 400
+
+    memberID = int(member.get("member_id", 0))
+    contextPayload = payload.get("context")
+    if not isinstance(contextPayload, dict):
+        contextPayload = {}
+    contextPayload.setdefault("community_id", None)
+    contextPayload.setdefault("chat_host_id", memberID)
+    contextPayload.setdefault("platform", "web")
+    contextPayload.setdefault("topic_id", None)
+    contextPayload.setdefault("chat_type", "member")
+    contextPayload.setdefault("message_timestamp", datetime.now().isoformat(timespec="seconds"))
+
+    requestPayload = {
+        "mode": mode,
+        "message": message,
+        "prompt": message,
+        "context": contextPayload,
+        "options": payload.get("options") if isinstance(payload.get("options"), dict) else {},
+        "batch_inputs": batchInputs if isinstance(batchInputs, list) else [],
+        "compare_models": compareModels if isinstance(compareModels, list) else [],
+        "workflow_steps": payload.get("workflow_steps") if isinstance(payload.get("workflow_steps"), list) else [],
+        "source_run_id": payload.get("source_run_id"),
+        "replay_from_seq": payload.get("replay_from_seq"),
+        "state_overrides": payload.get("state_overrides") if isinstance(payload.get("state_overrides"), dict) else {},
+        "agent_definition": payload.get("agent_definition") if isinstance(payload.get("agent_definition"), dict) else {},
+    }
+
+    autoStart = bool(payload.get("auto_start", True))
+    run = playgroundRuns.create_run(
+        member_id=memberID,
+        mode=mode,
+        request_payload=requestPayload,
+        lineage=_lineage_from_request(payload),
+        auto_start=autoStart,
+    )
+    return jsonify({"status": "ok", "run": run}), 201
+
+
+@app.get("/api/agent-playground/runs/<run_id>")
+def playgroundRunDetailAPI(run_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    run = playgroundRuns.get_run(run_id)
+    if run is None:
+        return jsonify({"status": "error", "message": "Run not found."}), 404
+    if int(run.get("member_id", -1)) != int(member.get("member_id", 0)):
+        return jsonify({"status": "error", "message": "Access denied for this run."}), 403
+
+    return jsonify(
+        {
+            "status": "ok",
+            "run": run,
+            "events": playgroundRuns.get_events(run_id, after_seq=0, limit=500),
+            "snapshots": playgroundRuns.get_snapshots(run_id, limit=500),
+            "artifacts": playgroundRuns.get_artifacts(run_id, limit=500),
+        }
+    )
+
+
+@app.get("/api/agent-playground/runs/<run_id>/events")
+def playgroundRunEventsAPI(run_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    run = playgroundRuns.get_run(run_id)
+    if run is None:
+        return jsonify({"status": "error", "message": "Run not found."}), 404
+    if int(run.get("member_id", -1)) != int(member.get("member_id", 0)):
+        return jsonify({"status": "error", "message": "Access denied for this run."}), 403
+
+    try:
+        afterSeq = int(request.args.get("after_seq", "0"))
+    except ValueError:
+        afterSeq = 0
+    try:
+        limit = int(request.args.get("limit", "250"))
+    except ValueError:
+        limit = 250
+
+    events = playgroundRuns.get_events(run_id, after_seq=max(0, afterSeq), limit=max(1, min(limit, 1000)))
+    return jsonify({"status": "ok", "events": events})
+
+
+@app.get("/api/agent-playground/runs/<run_id>/stream")
+def playgroundRunEventsStreamAPI(run_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    run = playgroundRuns.get_run(run_id)
+    if run is None:
+        return jsonify({"status": "error", "message": "Run not found."}), 404
+    if int(run.get("member_id", -1)) != int(member.get("member_id", 0)):
+        return jsonify({"status": "error", "message": "Access denied for this run."}), 403
+
+    try:
+        afterSeq = int(request.args.get("after_seq", "0"))
+    except ValueError:
+        afterSeq = 0
+
+    @stream_with_context
+    def stream() -> Any:
+        cursorSeq = max(0, afterSeq)
+        idleCounter = 0
+        while True:
+            events = playgroundRuns.get_events(run_id, after_seq=cursorSeq, limit=300)
+            if events:
+                for event in events:
+                    cursorSeq = int(event.get("seq", cursorSeq))
+                    yield f"data: {json.dumps(event)}\\n\\n"
+                idleCounter = 0
+            else:
+                idleCounter += 1
+                if idleCounter % 8 == 0:
+                    yield ": keepalive\\n\\n"
+
+            latest = playgroundRuns.get_run(run_id)
+            if latest is None:
+                yield "event: done\\ndata: {\"status\":\"missing\"}\\n\\n"
+                break
+            if str(latest.get("status")) in {"completed", "failed", "cancelled"}:
+                terminalEvents = playgroundRuns.get_events(run_id, after_seq=cursorSeq, limit=100)
+                if terminalEvents:
+                    for event in terminalEvents:
+                        cursorSeq = int(event.get("seq", cursorSeq))
+                        yield f"data: {json.dumps(event)}\\n\\n"
+                yield f"event: done\\ndata: {json.dumps({'run_id': run_id, 'status': latest.get('status')})}\\n\\n"
+                break
+            time.sleep(0.35)
+
+    return Response(
+        stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/agent-playground/runs/<run_id>/cancel")
+def playgroundRunCancelAPI(run_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    run = playgroundRuns.get_run(run_id)
+    if run is None:
+        return jsonify({"status": "error", "message": "Run not found."}), 404
+    if int(run.get("member_id", -1)) != int(member.get("member_id", 0)):
+        return jsonify({"status": "error", "message": "Access denied for this run."}), 403
+
+    updated = playgroundRuns.cancel_run(run_id)
+    return jsonify({"status": "ok", "run": updated})
+
+
+@app.post("/api/agent-playground/runs/<run_id>/resume")
+def playgroundRunResumeAPI(run_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    run = playgroundRuns.get_run(run_id)
+    if run is None:
+        return jsonify({"status": "error", "message": "Run not found."}), 404
+    if int(run.get("member_id", -1)) != int(member.get("member_id", 0)):
+        return jsonify({"status": "error", "message": "Access denied for this run."}), 403
+
+    resumed = playgroundRuns.resume_run(run_id)
+    return jsonify({"status": "ok", "run": resumed})
+
+
+@app.post("/api/agent-playground/runs/<run_id>/replay")
+def playgroundRunReplayAPI(run_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    run = playgroundRuns.get_run(run_id)
+    if run is None:
+        return jsonify({"status": "error", "message": "Run not found."}), 404
+    if int(run.get("member_id", -1)) != int(member.get("member_id", 0)):
+        return jsonify({"status": "error", "message": "Access denied for this run."}), 403
+
+    payload = _request_json_dict()
+    replayFromSeq = payload.get("replay_from_seq")
+    if replayFromSeq is None:
+        replayFromSeq = payload.get("step_seq")
+    try:
+        replayFromSeq = int(replayFromSeq) if replayFromSeq is not None else None
+    except (TypeError, ValueError):
+        replayFromSeq = None
+    stateOverrides = payload.get("state_overrides") if isinstance(payload.get("state_overrides"), dict) else None
+
+    replayRun = playgroundReplay.replay_with_state(
+        run_id,
+        step_seq=replayFromSeq,
+        state_overrides=stateOverrides,
+        auto_start=bool(payload.get("auto_start", True)),
+    )
+    return jsonify({"status": "ok", "run": replayRun})
+
+
+@app.get("/api/agent-playground/metrics")
+def playgroundMetricsAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    return jsonify({"status": "ok", "metrics": playgroundRuns.metrics_summary()})
 
 
 
