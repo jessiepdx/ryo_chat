@@ -21,6 +21,7 @@ import json
 import logging
 import requests
 from hypermindlabs.model_router import ModelExecutionError, ModelRouter
+from hypermindlabs.tool_runtime import ToolDefinition, ToolRuntime
 from hypermindlabs.utils import (
     ChatHistoryManager, 
     ConfigManager, 
@@ -358,6 +359,14 @@ def knowledgeSearch(queryString: str, count: int = 2) -> list:
     return convertedResults
 
 
+def skipTools() -> dict:
+    """Tool response used when the model intentionally skips tool usage."""
+    return {
+        "skipped": True,
+        "message": "Tool usage skipped by model.",
+    }
+
+
 #########################
 # MANUALLY DEFINE TOOLS #
 #-----------------------#
@@ -401,15 +410,6 @@ skipTool = {
   }
 }
 
-# This is for validating the functions returned by tool calling agents exist
-available_functions = {
-  "braveSearch": braveSearch,
-  "chatHistorySearch": chatHistorySearch,
-  "knowledgeSearch": knowledgeSearch
-}
-
-
-
 ################
 # BEGIN AGENTS #
 ################
@@ -427,6 +427,35 @@ class ToolCallingAgent():
         self._allowed_models = policy.get("allowed_models")
         self._model = self._allowed_models[0]
 
+        toolRuntimePolicy = policy.get("tool_runtime", {})
+        if not isinstance(toolRuntimePolicy, dict):
+            toolRuntimePolicy = {}
+
+        toolPolicies = toolRuntimePolicy.get("tools", {})
+        if not isinstance(toolPolicies, dict):
+            toolPolicies = {}
+
+        def _float_value(value: Any, default: float) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _int_value(value: Any, default: int) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        defaultTimeout = _float_value(toolRuntimePolicy.get("default_timeout_seconds"), 8.0)
+        defaultRetries = _int_value(toolRuntimePolicy.get("default_max_retries"), 1)
+
+        def _tool_value(toolName: str, key: str, defaultValue: Any) -> Any:
+            toolConfig = toolPolicies.get(toolName, {})
+            if isinstance(toolConfig, dict) and key in toolConfig:
+                return toolConfig.get(key)
+            return defaultValue
+
         # Check for options passed and if policy allows for those options
         if options:
             modelRequested = options.get("model_requested")
@@ -437,6 +466,53 @@ class ToolCallingAgent():
         self._modelRouter = ModelRouter(
             inference_config=config._instance.inference,
             endpoint_override=endpointOverride,
+        )
+
+        self._toolRuntime = ToolRuntime(
+            api_keys={
+                "brave_search": config._instance.brave_keys,
+            }
+        )
+        self._toolRuntime.register_tool(
+            ToolDefinition(
+                name="braveSearch",
+                function=braveSearch,
+                required_args=("queryString",),
+                optional_args={"count": 5},
+                required_api_key=_tool_value("braveSearch", "required_api_key", "brave_search"),
+                timeout_seconds=_float_value(_tool_value("braveSearch", "timeout_seconds", 10.0), 10.0),
+                max_retries=_int_value(_tool_value("braveSearch", "max_retries", defaultRetries), defaultRetries),
+            )
+        )
+        self._toolRuntime.register_tool(
+            ToolDefinition(
+                name="chatHistorySearch",
+                function=chatHistorySearch,
+                required_args=("queryString",),
+                optional_args={"count": 2},
+                timeout_seconds=_float_value(_tool_value("chatHistorySearch", "timeout_seconds", defaultTimeout), defaultTimeout),
+                max_retries=_int_value(_tool_value("chatHistorySearch", "max_retries", defaultRetries), defaultRetries),
+            )
+        )
+        self._toolRuntime.register_tool(
+            ToolDefinition(
+                name="knowledgeSearch",
+                function=knowledgeSearch,
+                required_args=("queryString",),
+                optional_args={"count": 2},
+                timeout_seconds=_float_value(_tool_value("knowledgeSearch", "timeout_seconds", defaultTimeout), defaultTimeout),
+                max_retries=_int_value(_tool_value("knowledgeSearch", "max_retries", defaultRetries), defaultRetries),
+            )
+        )
+        self._toolRuntime.register_tool(
+            ToolDefinition(
+                name="skipTools",
+                function=skipTools,
+                required_args=(),
+                optional_args={},
+                timeout_seconds=_float_value(_tool_value("skipTools", "timeout_seconds", 2.0), 2.0),
+                max_retries=_int_value(_tool_value("skipTools", "max_retries", 0), 0),
+            )
         )
 
         self._messages = list()
@@ -471,22 +547,22 @@ class ToolCallingAgent():
         
         if self._response.message.tool_calls:
             for tool in self._response.message.tool_calls:
-                # TODO replace below with the following: toolCaller(function_to_call, args_to_call) once that function is built
-                # Ensure the function is available, and then call it
-                if function_to_call := available_functions.get(tool.function.name):
-                    logger.debug(f"Tool calling agent calling the following functions:\nCalling function:  {tool.function.name}\nArguments:  {tool.function.arguments}")
-                    #print('Calling function:', tool.function.name)
-                    #print('Arguments:', tool.function.arguments)
-                    toolArgs = tool.function.arguments if tool.function.arguments.get("properties") is None else tool.function.arguments.get("properties")
-                    
-                    output = function_to_call(**toolArgs)
-                    toolResult = {
-                        "tool_name": tool.function.name,
-                        "tool_results" : output
-                    }
-                    toolResults.append(toolResult)
-                else:
-                    logger.debug(f"Function {tool.function.name} not found")
+                logger.debug(
+                    "Tool calling agent execution request:\n"
+                    f"Tool: {tool.function.name}\n"
+                    f"Arguments: {tool.function.arguments}"
+                )
+                toolResult = self._toolRuntime.execute(
+                    tool_name=tool.function.name,
+                    raw_args=tool.function.arguments,
+                )
+                toolResults.append(toolResult)
+                if toolResult.get("status") == "error":
+                    logger.warning(
+                        "Tool execution degraded gracefully.\n"
+                        f"Tool: {tool.function.name}\n"
+                        f"Error: {toolResult.get('error')}"
+                    )
         
         return toolResults
     

@@ -9,6 +9,8 @@ Multi-platform agent playground with:
 
 For the full engineering baseline and upgrade roadmap, see:
 - `docs/master-engineering.md`
+- `docs/CHANGELOG_ENGINEERING.md`
+- `docs/DOC_UPDATE_CHECKLIST.md`
 
 ## References
 - Ollama: https://ollama.com/
@@ -31,18 +33,31 @@ cp config.empty.json config.json
 cp .env.example .env
 ```
 
-3. Set or update Ollama endpoint defaults (custom or local default).
+3. Run the setup wizard (curses by default) to configure required fields, keys, DB routing, and model mapping.
 ```bash
 python3 scripts/setup_wizard.py
 ```
 
-4. Edit remaining `config.json` fields (required).
-5. Start one or more interfaces.
+4. Start one or more interfaces.
 ```bash
 python3 telegram_ui.py
 python3 web_ui.py
 python3 cli_ui.py
 ```
+
+Optional setup flags:
+```bash
+# fallback to plain prompts
+python3 scripts/setup_wizard.py --no-curses
+
+# non-interactive usage
+python3 scripts/setup_wizard.py --non-interactive --strict --ollama-host http://127.0.0.1:11434
+```
+
+Resume behavior:
+- If setup is cancelled/interrupted, partial progress is written to `.setup_wizard_state.json`.
+- Re-running the wizard will preload values from that state file.
+- State file is cleared automatically after a successful save.
 
 ## Required Configuration (`config.json`)
 `ConfigManager` currently reads only `config.json` at runtime.
@@ -111,6 +126,18 @@ To run non-interactive endpoint setup:
 python3 scripts/setup_wizard.py --non-interactive --ollama-host http://127.0.0.1:11434
 ```
 
+To override the partial-state file path:
+```bash
+python3 scripts/setup_wizard.py --state-path .ryo_setup_state.json
+```
+
+To set primary + fallback DB routing values without changing existing Ollama host:
+```bash
+python3 scripts/setup_wizard.py --non-interactive \
+  --db-name ryo_chat --db-user postgres_user --db-password postgres_password --db-host 127.0.0.1 --db-port 5432 \
+  --fallback-enabled --fallback-mode local --fallback-db-host 127.0.0.1 --fallback-db-port 5433
+```
+
 ## Policies
 Agent policies and system prompts live in:
 - `policies/agent/*.json`
@@ -119,8 +146,9 @@ Agent policies and system prompts live in:
 Current behavior:
 - Policies and prompts are loaded from disk at runtime.
 - Missing policy/prompt files are not yet gracefully handled; keep these files present.
+- `policies/agent/tool_calling_policy.json` supports optional `tool_runtime` timeout/retry settings per tool.
 
 ## Known Operational Prerequisites
 - `logs/` directory must exist before starting `telegram_ui.py`, `web_ui.py`, or `x_ui.py`.
 - Ollama endpoints in config must be reachable for embeddings/chat/generate/tool/multimodal flows.
-- Brave API key is required for `braveSearch` tool.
+- Brave API key is optional, but required for live `braveSearch` results. If missing, tool calls degrade gracefully and the conversation still continues.

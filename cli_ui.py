@@ -64,6 +64,8 @@ settings = {
     "model": "llama3.2:latest"
 }
 
+logger.info(f"Database route status: {config.databaseRoute}")
+
 
 
 ####################

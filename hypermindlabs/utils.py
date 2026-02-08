@@ -21,6 +21,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import psycopg
 import re
 import secrets
@@ -29,6 +30,7 @@ import textstat
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from hypermindlabs.database_router import DatabaseRouter
 from math import ceil
 from ollama import Client
 from psycopg.rows import dict_row
@@ -1363,17 +1365,70 @@ class CommunityScoreManager:
 class ConfigManager:
     _instance = None
 
+    @staticmethod
+    def _env_db(prefix: str) -> dict | None:
+        db_name = os.getenv(f"{prefix}DB")
+        user = os.getenv(f"{prefix}USER")
+        password = os.getenv(f"{prefix}PASSWORD")
+        host = os.getenv(f"{prefix}HOST")
+        port = os.getenv(f"{prefix}PORT")
+
+        required = (db_name, user, password, host)
+        if any(value is None or value == "" for value in required):
+            return None
+
+        output = {
+            "db_name": db_name,
+            "user": user,
+            "password": password,
+            "host": host,
+        }
+        if port:
+            output["port"] = port
+        return output
+
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(ConfigManager, cls).__new__(cls)
             # Open the config file
-            f = open("config.json", "r")
-            config_json = json.load(f)
+            with open("config.json", "r", encoding="utf-8") as f:
+                config_json = json.load(f)
+
             database = config_json.get("database")
-            # Create Database connection string
-            connectionString = f"dbname={database.get('db_name')} user={database.get('user')} password={database.get('password')} host={database.get('host')}"
-            if database.get("port") is not None:
-                connectionString = connectionString + f" port={database.get('port')}"
+            if database is None:
+                database = cls._env_db("POSTGRES_")
+
+            databaseFallback = config_json.get("database_fallback")
+            if databaseFallback is None:
+                envFallback = cls._env_db("POSTGRES_FALLBACK_")
+                if envFallback is not None:
+                    envFallback["enabled"] = cls._env_bool("POSTGRES_FALLBACK_ENABLED", default=False)
+                    envFallback["mode"] = os.getenv("POSTGRES_FALLBACK_MODE", "local")
+                    databaseFallback = envFallback
+
+            fallbackEnabled = None
+            if isinstance(databaseFallback, dict) and "enabled" in databaseFallback:
+                fallbackEnabled = bool(databaseFallback.get("enabled"))
+
+            dbRouter = DatabaseRouter(
+                primary_database=database,
+                fallback_database=databaseFallback,
+                fallback_enabled=fallbackEnabled,
+            )
+            dbRoute = dbRouter.resolve()
+            connectionString = (
+                dbRoute.active_conninfo
+                or dbRoute.primary_conninfo
+                or dbRoute.fallback_conninfo
+                or ""
+            )
 
             cls._instance.bot_name = config_json.get("bot_name")
             cls._instance.bot_id = config_json.get("bot_id")
@@ -1381,13 +1436,27 @@ class ConfigManager:
             cls._instance.web_ui_url = config_json.get("web_ui_url")
             cls._instance.owner_info = config_json.get("owner_info")
             cls._instance.database = database
+            cls._instance.database_fallback = databaseFallback
             cls._instance.knowledge_domains = None if config_json.get("knowledge") is None else config_json.get("knowledge").get("domains")
             cls._instance.roles_list = config_json.get("roles_list")
             cls._instance.db_conninfo = connectionString
+            cls._instance.database_route = dbRoute.to_dict()
             cls._instance.defaults = config_json.get("defaults")
             cls._instance.inference = config_json.get("inference")
             cls._instance.twitter_keys = config_json.get("twitter_keys")
             cls._instance.brave_keys = config_json["api_keys"].get("brave_search")
+
+            if cls._instance.database_route["status"] == "fallback":
+                logger.warning(
+                    "Database router selected fallback target. "
+                    f"Status={cls._instance.database_route['status']}, "
+                    f"Errors={cls._instance.database_route['errors']}"
+                )
+            elif cls._instance.database_route["status"] == "failed_all":
+                logger.error(
+                    "Database router failed to validate primary/fallback connections. "
+                    f"Errors={cls._instance.database_route['errors']}"
+                )
         
         return cls._instance
 
@@ -1411,6 +1480,10 @@ class ConfigManager:
     @property
     def webUIUrl(self) -> str:
         return self._instance.web_ui_url
+
+    @property
+    def databaseRoute(self) -> dict:
+        return self._instance.database_route
 
 
 class KnowledgeManager:

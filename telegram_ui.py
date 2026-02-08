@@ -119,6 +119,8 @@ proposals = ProposalManager()
 spam = SpamManager()
 usage = UsageManager()
 
+logger.info(f"Database route status: {config.databaseRoute}")
+
 
 
 ###########################

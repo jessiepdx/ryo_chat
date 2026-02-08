@@ -26,6 +26,18 @@ This document covers:
 9. Master engineering documentation and prerequisite explainer
 10. Automated pgvector + PostgreSQL setup
 
+### 2.1 Implementation Status Snapshot (February 8, 2026)
+1. Automatic model fallbacks: Partially implemented (`ModelRouter` integrated into core multi-agent chain; additional coverage and telemetry pending).
+2. Automatic PostgreSQL fallback generation with setup flow: Partially implemented (`DatabaseRouter` integrated; fallback config support and curses setup flow added; sync strategy and orchestration coverage pending).
+3. Complete documentation and master engineering documentation maintenance: Implemented in this cycle (checklist, changelog, and sync workflow artifacts added).
+4. Graceful degradation for tools with missing APIs: Implemented (structured tool runtime added with missing-key handling, arg validation, timeout/retry bounds, and error envelopes).
+5. Curses walkthrough for key ingress and model selection: Implemented (curses wizard with endpoint probing, model mapping, validation, optional `.env` updates, and resumable partial-state flow).
+6. Policy walkthrough and setup: Planned.
+7. Tool-calling stack review and improvements: Planned.
+8. Automatic ingress of Telegram keys: Planned.
+9. Master engineering documentation and prerequisite explainer: In progress.
+10. Automated pgvector + PostgreSQL setup: Partially implemented (bootstrap script exists; wider orchestration integration pending).
+
 ## 3. Current State Review
 
 ### 3.1 Runtime Components
@@ -242,6 +254,8 @@ On every major upgrade:
 2. Update `readme.md` setup sections second.
 3. Update templates (`config.empty.json`, `.env.example`) third.
 4. Run startup smoke checks before merge.
+5. Add an entry to `docs/CHANGELOG_ENGINEERING.md`.
+6. Run and complete `docs/DOC_UPDATE_CHECKLIST.md`.
 
 ## 10. External References
 - Ollama: https://ollama.com/

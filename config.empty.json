@@ -16,6 +16,15 @@
     "host": "127.0.0.1",
     "port": "5432"
   },
+  "database_fallback": {
+    "enabled": true,
+    "mode": "local",
+    "db_name": "ryo_chat_fallback",
+    "user": "postgres_user",
+    "password": "postgres_password",
+    "host": "127.0.0.1",
+    "port": "5433"
+  },
   "knowledge": {
     "domains": ["General", "Project", "Operations"]
   },

@@ -22,7 +22,7 @@ import logging
 import secrets
 from datetime import datetime
 from flask import Flask, request, abort, url_for, redirect, session, render_template, g, jsonify
-from hypermindlabs.utils import CustomFormatter, MemberManager, KnowledgeManager
+from hypermindlabs.utils import ConfigManager, CustomFormatter, MemberManager, KnowledgeManager
 from urllib.parse import parse_qs
 
 
@@ -80,7 +80,10 @@ ConsoleColors = {
 
 }
 
+config = ConfigManager()
 members = MemberManager()
+
+logger.info(f"Database route status: {config.databaseRoute}")
 
 availableMenu = [
     {
