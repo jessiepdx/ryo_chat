@@ -306,17 +306,6 @@ def _coerce_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
-def _clip_text(value: Any, max_chars: int = 140) -> str:
-    text = _as_text(value)
-    if max_chars <= 0:
-        return ""
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 3:
-        return text[:max_chars]
-    return text[: max_chars - 3].rstrip() + "..."
-
-
 def _known_context_stage_preview(tool_results: dict[str, Any] | None) -> dict[str, Any]:
     payload = _coerce_dict(tool_results)
     temporal = _coerce_dict(payload.get("temporal_context"))
@@ -330,7 +319,7 @@ def _known_context_stage_preview(tool_results: dict[str, Any] | None) -> dict[st
         if not isinstance(entry, dict):
             continue
         role = _as_text(entry.get("role")).lower()
-        excerpt = _clip_text(entry.get("excerpt"), 120)
+        excerpt = _as_text(entry.get("excerpt"))
         if not excerpt:
             continue
         if not latest_user_excerpt and role == "user":
@@ -370,6 +359,37 @@ def _known_context_stage_preview(tool_results: dict[str, Any] | None) -> dict[st
         },
     }
     return preview
+
+
+def _memory_selection_stage_preview(memory_selection: dict[str, Any] | None) -> dict[str, Any]:
+    selection = _coerce_dict(memory_selection)
+    selected_raw = selection.get("selected")
+    selected = selected_raw if isinstance(selected_raw, list) else []
+    selected_preview = []
+    for item in selected:
+        entry = _coerce_dict(item)
+        selected_preview.append(
+            {
+                "history_id": entry.get("history_id"),
+                "message_id": entry.get("message_id"),
+                "role": _as_text(entry.get("role"), "user"),
+                "timestamp_utc": entry.get("timestamp_utc"),
+                "score": entry.get("score"),
+                "signals": _coerce_dict(entry.get("signals")),
+                "message_text": _as_text(entry.get("message_text")),
+            }
+        )
+    return {
+        "schema": selection.get("schema", "ryo.memory_recall.v1"),
+        "mode": selection.get("mode"),
+        "recall_scope": selection.get("recall_scope"),
+        "history_search_allowed": selection.get("history_search_allowed"),
+        "decision_reason": selection.get("decision_reason"),
+        "selection_threshold": selection.get("selection_threshold"),
+        "candidates_considered": selection.get("candidates_considered"),
+        "selected_count": selection.get("selected_count", len(selected_preview)),
+        "selected": selected_preview,
+    }
 
 
 def _history_recall_requested(text: str) -> bool:
@@ -609,6 +629,235 @@ def _build_memory_circuit(
         "history_search_allowed": history_search_allowed,
         "small_talk_turn": small_talk_turn,
         "routing_note": routing_note,
+    }
+
+
+def _coerce_float(value: Any, fallback: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+
+
+def _history_record_role(record: dict[str, Any]) -> str:
+    return "assistant" if record.get("member_id") is None else "user"
+
+
+def _build_semantic_boost_map(
+    *,
+    query_text: str,
+    chat_host_id: Any,
+    chat_type: Any,
+    platform: Any,
+    topic_id: Any,
+    history_search_allowed: bool,
+) -> dict[Any, float]:
+    if not history_search_allowed:
+        return {}
+    if not _runtime_bool("retrieval.memory_use_semantic", True):
+        return {}
+
+    candidate_limit = max(1, _runtime_int("retrieval.memory_semantic_candidates", 4))
+    time_window = max(1, _runtime_int("retrieval.chat_history_window_hours", 12))
+    try:
+        semanticResults = chatHistory.searchChatHistory(
+            text=query_text,
+            limit=candidate_limit,
+            chatHostID=chat_host_id,
+            chatType=_as_text(chat_type),
+            platform=_as_text(platform),
+            topicID=topic_id,
+            scopeTopic=True,
+            timeInHours=time_window,
+        )
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"Semantic memory selector failed; falling back to lexical-only scoring: {error}")
+        return {}
+
+    boostMap: dict[Any, float] = {}
+    for result in semanticResults or []:
+        if not isinstance(result, dict):
+            continue
+        historyID = result.get("history_id")
+        distance = _coerce_float(result.get("distance"), 1.0)
+        boostMap[historyID] = max(0.0, 1.0 / (1.0 + max(0.0, distance)))
+    return boostMap
+
+
+def _select_memory_recall(
+    *,
+    current_message: str,
+    history_messages: list[dict[str, Any]] | None,
+    analysis_payload: dict[str, Any] | None,
+    topic_transition: dict[str, Any] | None,
+    memory_circuit: dict[str, Any] | None,
+    chat_host_id: Any,
+    chat_type: Any,
+    platform: Any,
+    topic_id: Any,
+) -> dict[str, Any]:
+    payload = _coerce_dict(analysis_payload)
+    transition = _coerce_dict(topic_transition)
+    circuit = _coerce_dict(memory_circuit)
+    directive = _coerce_dict(payload.get("memory_directive"))
+
+    mode = _as_text(directive.get("mode"), "continue_topic")
+    recall_scope = _as_text(directive.get("recall_scope"), "hybrid").lower()
+    if recall_scope not in {"none", "recent", "semantic", "hybrid"}:
+        recall_scope = "hybrid"
+    history_search_allowed = _as_bool(
+        directive.get("history_search_allowed"),
+        fallback=_as_bool(circuit.get("history_search_allowed"), True),
+    )
+    max_items = max(
+        0,
+        min(
+            12,
+            int(
+                directive.get(
+                    "max_items",
+                    _runtime_int("retrieval.memory_recall_limit", 4),
+                )
+            ),
+        ),
+    )
+    min_score = max(0.0, _coerce_float(directive.get("min_score"), _runtime_float("retrieval.memory_min_score", 0.65)))
+
+    records = history_messages if isinstance(history_messages, list) else []
+    candidates_considered = min(len(records), max(1, _runtime_int("retrieval.memory_candidate_limit", 30)))
+    records = records[-candidates_considered:]
+
+    history_recall_requested = _as_bool(circuit.get("history_recall_requested"), False)
+    small_talk_turn = _as_bool(circuit.get("small_talk_turn"), False)
+    switched = _as_bool(transition.get("switched"), False)
+
+    if max_items <= 0 or not records:
+        reason = "max_items_zero" if max_items <= 0 else "no_history_candidates"
+        return {
+            "schema": "ryo.memory_recall.v1",
+            "mode": mode,
+            "recall_scope": recall_scope,
+            "history_search_allowed": history_search_allowed,
+            "selected": [],
+            "selected_count": 0,
+            "candidates_considered": len(records),
+            "decision_reason": reason,
+            "topic_transition": transition,
+            "memory_circuit": {
+                "active_topic": circuit.get("active_topic"),
+                "routing_note": circuit.get("routing_note"),
+                "small_talk_turn": small_talk_turn,
+            },
+        }
+
+    if small_talk_turn and not history_recall_requested:
+        return {
+            "schema": "ryo.memory_recall.v1",
+            "mode": "lightweight_social",
+            "recall_scope": "none",
+            "history_search_allowed": False,
+            "selected": [],
+            "selected_count": 0,
+            "candidates_considered": len(records),
+            "decision_reason": "small_talk_turn_without_recall_request",
+            "topic_transition": transition,
+            "memory_circuit": {
+                "active_topic": circuit.get("active_topic"),
+                "routing_note": circuit.get("routing_note"),
+                "small_talk_turn": small_talk_turn,
+            },
+        }
+
+    if recall_scope == "none":
+        history_search_allowed = False
+
+    query_text = _as_text(current_message)
+    query_tokens = set(_tokenize_topic_text(query_text))
+    semantic_boost = {}
+    if recall_scope in {"semantic", "hybrid"}:
+        semantic_boost = _build_semantic_boost_map(
+            query_text=query_text,
+            chat_host_id=chat_host_id,
+            chat_type=chat_type,
+            platform=platform,
+            topic_id=topic_id,
+            history_search_allowed=history_search_allowed,
+        )
+
+    scored: list[dict[str, Any]] = []
+    now_utc = datetime.now(timezone.utc)
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        message_text = _as_text(record.get("message_text"))
+        if not message_text:
+            continue
+        role = _history_record_role(record)
+        candidate_tokens = set(_tokenize_topic_text(message_text))
+        lexical_overlap = 0.0
+        if query_tokens:
+            lexical_overlap = len(query_tokens & candidate_tokens) / max(1, len(query_tokens))
+        recency_seconds = 0
+        record_ts = coerce_datetime_utc(record.get("message_timestamp"), assume_tz=timezone.utc)
+        if record_ts is not None:
+            recency_seconds = max(0, int((now_utc - record_ts).total_seconds()))
+        recency_weight = 1.0 / (1.0 + (float(recency_seconds) / 3600.0))
+        semantic_weight = _coerce_float(semantic_boost.get(record.get("history_id"), 0.0), 0.0)
+
+        if recall_scope == "recent":
+            semantic_weight = 0.0
+        if recall_scope == "semantic":
+            lexical_overlap = lexical_overlap * 0.6
+
+        score = (lexical_overlap * 2.2) + (semantic_weight * 1.4) + (recency_weight * 0.5)
+        if role == "user":
+            score += 0.08
+        if switched and not history_recall_requested and lexical_overlap < 0.2:
+            score -= 0.35
+
+        scored.append(
+            {
+                "history_id": record.get("history_id"),
+                "message_id": record.get("message_id"),
+                "role": role,
+                "timestamp_utc": None if record_ts is None else record_ts.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                "message_text": message_text,
+                "score": round(score, 4),
+                "signals": {
+                    "lexical_overlap": round(lexical_overlap, 4),
+                    "semantic_weight": round(semantic_weight, 4),
+                    "recency_weight": round(recency_weight, 4),
+                    "recency_seconds": recency_seconds,
+                },
+            }
+        )
+
+    scored.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    if history_recall_requested:
+        selected = scored[:max_items]
+    else:
+        selected = [item for item in scored if _coerce_float(item.get("score"), 0.0) >= min_score][:max_items]
+
+    return {
+        "schema": "ryo.memory_recall.v1",
+        "mode": mode,
+        "recall_scope": recall_scope,
+        "history_search_allowed": history_search_allowed,
+        "selected": selected,
+        "selected_count": len(selected),
+        "candidates_considered": len(scored),
+        "decision_reason": (
+            "history_recall_requested"
+            if history_recall_requested
+            else "scored_selection"
+        ),
+        "selection_threshold": min_score,
+        "topic_transition": transition,
+        "memory_circuit": {
+            "active_topic": circuit.get("active_topic"),
+            "routing_note": circuit.get("routing_note"),
+            "small_talk_turn": small_talk_turn,
+        },
     }
 
 
