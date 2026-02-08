@@ -15,6 +15,7 @@ Responsibilities:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import copy
 import hashlib
 import json
@@ -63,6 +64,7 @@ ENV_TEMPLATE = PROJECT_ROOT / ".env.example"
 ENV_FILE = PROJECT_ROOT / ".env"
 LOGS_DIR = PROJECT_ROOT / "logs"
 WATCHDOG_LOG_DIR = LOGS_DIR / "watchdog"
+LIVE_LOG_BUFFER_LINE_LIMIT = 400
 
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 INFERENCE_KEYS = ("embedding", "generate", "chat", "tool", "multimodal")
@@ -1119,6 +1121,16 @@ class RouteState:
     started_epoch: float | None = None
 
 
+@dataclass
+class LiveLogTailState:
+    lines: deque[str] = field(default_factory=lambda: deque(maxlen=LIVE_LOG_BUFFER_LINE_LIMIT))
+    cursor: int = 0
+    inode: int | None = None
+    device: int | None = None
+    partial: str = ""
+    path: str = ""
+
+
 @dataclass(frozen=True)
 class RouteSettingSpec:
     id: str
@@ -1872,13 +1884,20 @@ class InterfaceWatchdog:
             self._prepare_web_env_overrides()
         env = os.environ.copy()
         env.update(self._route_env_overrides.get(key, {}))
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         return env
 
     def _spawn(self, state: RouteState) -> None:
         log_path = self._log_path(state.spec.key)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        state.log_handle = log_path.open("a", encoding="utf-8")
-        command = [self._python_exec, state.spec.script]
+        state.log_handle = log_path.open("a", encoding="utf-8", buffering=1)
+        command = [self._python_exec, "-u", state.spec.script]
+        launch_stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        state.log_handle.write(
+            f"\n[{launch_stamp}] [watchdog] launching route={state.spec.key} command={' '.join(command)}\n"
+        )
+        state.log_handle.flush()
         process_env = self._prepare_route_env(state.spec.key)
         state.process = subprocess.Popen(
             command,
@@ -2134,6 +2153,114 @@ def _tail_log_lines(log_path: Path, line_count: int = 40) -> list[str]:
     return lines[-max(1, int(line_count)) :]
 
 
+def _append_live_log_line(state: LiveLogTailState, line: str) -> None:
+    cleaned = str(line).replace("\t", "    ").strip("\r\n")
+    if cleaned == "":
+        return
+    state.lines.append(cleaned)
+
+
+def _update_live_log_tail(state: LiveLogTailState, log_path: Path) -> None:
+    state.path = str(log_path)
+    if not log_path.exists():
+        state.cursor = 0
+        state.inode = None
+        state.device = None
+        state.partial = ""
+        if not state.lines or not state.lines[-1].startswith("(log file not found:"):
+            state.lines.clear()
+            state.lines.append(f"(log file not found: {log_path})")
+        return
+
+    try:
+        stat = log_path.stat()
+    except OSError as error:
+        if not state.lines or not state.lines[-1].startswith("(failed reading log file:"):
+            state.lines.append(f"(failed reading log file: {error})")
+        return
+
+    current_inode = int(getattr(stat, "st_ino", 0) or 0)
+    current_device = int(getattr(stat, "st_dev", 0) or 0)
+
+    rotated = False
+    if state.inode is None or state.device is None:
+        state.inode = current_inode
+        state.device = current_device
+    elif state.inode != current_inode or state.device != current_device:
+        rotated = True
+    elif int(stat.st_size) < int(state.cursor):
+        rotated = True
+
+    if rotated:
+        state.cursor = 0
+        state.partial = ""
+        state.inode = current_inode
+        state.device = current_device
+        _append_live_log_line(state, "[watchdog] log rotated/truncated; tail restarted")
+
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(max(0, int(state.cursor)))
+            chunk = handle.read()
+            state.cursor = int(handle.tell())
+    except OSError as error:
+        if not state.lines or not state.lines[-1].startswith("(failed reading log file:"):
+            state.lines.append(f"(failed reading log file: {error})")
+        return
+
+    if not chunk:
+        return
+
+    text = f"{state.partial}{chunk}"
+    segments = text.splitlines(keepends=True)
+    state.partial = ""
+    for segment in segments:
+        if segment.endswith("\n") or segment.endswith("\r"):
+            _append_live_log_line(state, segment)
+        else:
+            state.partial = segment
+
+    if state.partial and len(state.partial) > 1200:
+        _append_live_log_line(state, _trim_text(state.partial, 1200))
+        state.partial = ""
+
+
+def _live_log_lines_for_display(state: LiveLogTailState, *, max_lines: int) -> list[str]:
+    lines = list(state.lines)
+    if state.partial.strip():
+        lines.append(_trim_text(state.partial.strip(), 1200) + " …")
+    if not lines:
+        lines = ["(no log output yet)"]
+    return lines[-max(1, int(max_lines)) :]
+
+
+def _infer_route_agent_state(entry: dict[str, Any], live_log_lines: list[str]) -> str:
+    if not entry.get("running"):
+        return _route_runtime_state(entry)
+
+    lowered = [str(line).lower() for line in live_log_lines]
+    for line in reversed(lowered):
+        if "orchestrator.complete" in line or "completed end-to-end orchestration" in line:
+            return "orchestrator complete"
+        if "response.complete" in line or "final response generated" in line:
+            return "response complete"
+        if "response.start" in line or "generating final response" in line:
+            return "response generation"
+        if "tools.complete" in line or "tool execution stage complete" in line:
+            return "tools complete"
+        if "tools.start" in line or "evaluating tool calls" in line:
+            return "tool execution"
+        if "analysis.complete" in line or "analysis stage complete" in line:
+            return "analysis complete"
+        if "analysis.start" in line or "running message analysis" in line:
+            return "analysis running"
+        if "context.built" in line or "known context assembled" in line:
+            return "context built"
+        if "orchestrator.start" in line or "accepted request and preparing context" in line:
+            return "request accepted"
+    return "running (no stage markers yet)"
+
+
 def _coerce_port(value: Any, default: int) -> int:
     try:
         port = int(str(value).strip())
@@ -2344,7 +2471,7 @@ def _launch_script_in_transient_terminal(route_key: str, script: str) -> tuple[b
     quoted_python = shlex.quote(str(sys.executable))
     quoted_script = shlex.quote(script)
     shell_command = (
-        f"cd {quoted_root} && {quoted_python} {quoted_script}; "
+        f"cd {quoted_root} && {quoted_python} -u {quoted_script}; "
         "status=$?; "
         "printf '\\n[launcher] process exited with code %s. Press Enter to close...' \"$status\"; "
         "read -r _"
@@ -3192,6 +3319,7 @@ def watchdog_dashboard_curses(
             last_status_text = "ready"
 
         selected_idx = 0
+        live_log_state: dict[str, LiveLogTailState] = {}
         while True:
             status = watchdog.status()
             keys = watchdog.route_keys()
@@ -3200,7 +3328,27 @@ def watchdog_dashboard_curses(
             else:
                 selected_idx = 0
 
+            for route_key in keys:
+                live_log_state.setdefault(route_key, LiveLogTailState())
+            for stale_key in [key for key in list(live_log_state.keys()) if key not in keys]:
+                live_log_state.pop(stale_key, None)
+
+            selected_key = keys[selected_idx] if keys else None
+            selected_entry = status.get(selected_key, {}) if selected_key else {}
+            selected_log_lines: list[str] = ["(no route selected)"]
+            selected_route_state = "idle"
+            if selected_key:
+                selected_log_state = live_log_state.setdefault(selected_key, LiveLogTailState())
+                selected_log_path = Path(str(selected_entry.get("log_file", "")))
+                _update_live_log_tail(selected_log_state, selected_log_path)
+                selected_log_lines = _live_log_lines_for_display(
+                    selected_log_state,
+                    max_lines=max(10, LIVE_LOG_BUFFER_LINE_LIMIT),
+                )
+                selected_route_state = _infer_route_agent_state(selected_entry, selected_log_lines)
+
             stdscr.erase()
+            height, width = stdscr.getmaxyx()
             _safe_addstr(stdscr, 0, 0, "RYO Launcher Dashboard", curses.A_BOLD if curses else 0)
             ollama_host = resolve_ollama_host(config_data, runtime_settings=runtime_settings)
             primary_pg_link, fallback_pg_link = _postgres_links(config_data)
@@ -3250,9 +3398,7 @@ def watchdog_dashboard_curses(
                 row += 1
 
             details_row = row + 1
-            if keys:
-                selected_key = keys[selected_idx]
-                selected_entry = status[selected_key]
+            if selected_key:
                 _safe_addstr(stdscr, details_row, 0, f"Selected route: {selected_key}", curses.A_BOLD if curses else 0)
                 _safe_addstr(stdscr, details_row + 1, 0, f"Script: {selected_entry.get('script')}")
                 _safe_addstr(stdscr, details_row + 2, 0, f"Log: {selected_entry.get('log_file')}")
@@ -3263,6 +3409,17 @@ def watchdog_dashboard_curses(
                     0,
                     f"Access: {_route_access_summary(selected_key, config_data, runtime_settings, entry=selected_entry)}",
                 )
+                _safe_addstr(stdscr, details_row + 5, 0, f"Agent state: {selected_route_state}")
+
+                live_title_row = details_row + 7
+                _safe_addstr(stdscr, live_title_row, 0, "Live Log (rolling buffer)", curses.A_BOLD if curses else 0)
+                _safe_addstr(stdscr, live_title_row + 1, 0, "-" * max(0, width - 1))
+                available_live_rows = max(3, height - (live_title_row + 3))
+                live_lines = selected_log_lines[-available_live_rows:]
+                live_row = live_title_row + 2
+                for line in live_lines:
+                    _safe_addstr(stdscr, live_row, 0, line)
+                    live_row += 1
 
             stdscr.refresh()
             key = stdscr.getch()

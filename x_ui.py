@@ -17,7 +17,7 @@
 # IMPORTS #
 ###########
 
-import datetime
+from datetime import datetime
 import logging
 import tweepy
 import tweepy.asynchronous

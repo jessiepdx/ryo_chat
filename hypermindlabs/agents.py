@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import requests
+import time
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
 from hypermindlabs.approval_manager import ApprovalManager
@@ -304,6 +305,32 @@ def _coerce_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
     return {}
+
+
+def _stream_log_snippet(value: Any, max_chars: int = 160) -> str:
+    text = str(value or "").replace("\n", "\\n").replace("\r", "\\r").strip()
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 3:
+        return text[:max_chars]
+    return text[: max_chars - 3] + "..."
+
+
+def _stage_meta_log_summary(meta: dict[str, Any] | None) -> dict[str, Any]:
+    payload = _coerce_dict(meta)
+    summary: dict[str, Any] = {}
+    for key in ("model", "selected_model", "tool_calls", "requested_tool_calls", "executed_tool_calls"):
+        if key in payload:
+            summary[key] = payload.get(key)
+
+    json_payload = payload.get("json")
+    if isinstance(json_payload, dict):
+        summary["json_keys"] = list(json_payload.keys())[:8]
+        if "selected_count" in json_payload:
+            summary["selected_count"] = json_payload.get("selected_count")
+    return summary
 
 
 def _known_context_stage_preview(tool_results: dict[str, Any] | None) -> dict[str, Any]:
@@ -1113,6 +1140,11 @@ class ConversationOrchestrator:
     
     async def _emit_stage(self, stage: str, detail: str = "", **meta: Any) -> None:
         if not callable(self._stage_callback):
+            meta_summary = _stage_meta_log_summary(meta if isinstance(meta, dict) else {})
+            if meta_summary:
+                logger.info(f"[orchestrator.stage] {stage} | {detail} | {meta_summary}")
+            else:
+                logger.info(f"[orchestrator.stage] {stage} | {detail}")
             return
         event = {
             "stage": str(stage),
@@ -1120,6 +1152,11 @@ class ConversationOrchestrator:
             "timestamp": utc_now_iso(),
             "meta": meta if isinstance(meta, dict) else {},
         }
+        meta_summary = _stage_meta_log_summary(meta if isinstance(meta, dict) else {})
+        if meta_summary:
+            logger.info(f"[orchestrator.stage] {stage} | {detail} | {meta_summary}")
+        else:
+            logger.info(f"[orchestrator.stage] {stage} | {detail}")
         try:
             maybeAwaitable = self._stage_callback(event)
             if inspect.isawaitable(maybeAwaitable):
@@ -1161,20 +1198,6 @@ class ConversationOrchestrator:
                 "clock": {"now_utc": utc_now_iso()},
             }
         )
-        if (
-            _runtime_bool("topic_shift.trim_temporal_history_on_small_talk", True)
-            and _is_small_talk_message(self._message)
-            and not _history_recall_requested(self._message)
-        ):
-            smallTalkHistoryLimit = max(0, _runtime_int("topic_shift.small_talk_history_limit", 2))
-            temporalMap = _coerce_dict(temporalContext)
-            timelineMap = _coerce_dict(temporalMap.get("timeline"))
-            recentEntries = timelineMap.get("recent")
-            if isinstance(recentEntries, list):
-                timelineMap["recent"] = recentEntries[-smallTalkHistoryLimit:] if smallTalkHistoryLimit > 0 else []
-                timelineMap["history_trimmed_for_small_talk"] = True
-                temporalMap["timeline"] = timelineMap
-                temporalContext = temporalMap
         topicTransition = _detect_topic_transition(
             current_message=self._message,
             history_messages=self._shortHistory,
@@ -1218,13 +1241,30 @@ class ConversationOrchestrator:
         self._analysisResponse = await self._analysisAgent.generateResponse()
 
         analysisResponseMessage = ""
+        analysisChunkCount = 0
+        analysisCharCount = 0
+        analysisLastProgressLog = time.monotonic()
         
         #print(f"{ConsoleColors["purple"]}Analysis Agent > ", end="")
         chunk: ChatResponse
         async for chunk in self._analysisResponse:
+            chunkContent = str(getattr(getattr(chunk, "message", None), "content", "") or "")
             # Call the streaming response method. This is intended to be over written by the UI for cutom handling
-            self.streamingResponse(streamingChunk=chunk.message.content)
-            analysisResponseMessage = analysisResponseMessage + chunk.message.content
+            self.streamingResponse(streamingChunk=chunkContent)
+            analysisResponseMessage = analysisResponseMessage + chunkContent
+            analysisChunkCount += 1
+            analysisCharCount += len(chunkContent)
+            now = time.monotonic()
+            if chunkContent and (
+                analysisChunkCount == 1
+                or (now - analysisLastProgressLog) >= 1.5
+                or bool(getattr(chunk, "done", False))
+            ):
+                logger.info(
+                    "[stream.analysis] "
+                    f"chunks={analysisChunkCount} chars={analysisCharCount} latest='{_stream_log_snippet(chunkContent)}'"
+                )
+                analysisLastProgressLog = now
             if chunk.done:
                 self._analysisStats = {
                     "total_duration": chunk.total_duration,
@@ -1234,6 +1274,10 @@ class ConversationOrchestrator:
                     "eval_count": chunk.eval_count,
                     "eval_duration": chunk.eval_duration,
                 }
+                logger.info(
+                    "[stream.analysis] "
+                    f"done chunks={analysisChunkCount} chars={analysisCharCount} eval_count={chunk.eval_count}"
+                )
         await self._emit_stage(
             "analysis.complete",
             "Analysis stage complete.",
@@ -1322,12 +1366,29 @@ class ConversationOrchestrator:
         response = await self._chatConversationAgent.generateResponse()
 
         responseMessage = ""
+        responseChunkCount = 0
+        responseCharCount = 0
+        responseLastProgressLog = time.monotonic()
         
         #print(f"{ConsoleColors["blue"]}Assistant > ", end="")
         chunk: ChatResponse
         async for chunk in response:
-            self.streamingResponse(streamingChunk=chunk.message.content)
-            responseMessage = responseMessage + chunk.message.content
+            chunkContent = str(getattr(getattr(chunk, "message", None), "content", "") or "")
+            self.streamingResponse(streamingChunk=chunkContent)
+            responseMessage = responseMessage + chunkContent
+            responseChunkCount += 1
+            responseCharCount += len(chunkContent)
+            now = time.monotonic()
+            if chunkContent and (
+                responseChunkCount == 1
+                or (now - responseLastProgressLog) >= 1.5
+                or bool(getattr(chunk, "done", False))
+            ):
+                logger.info(
+                    "[stream.response] "
+                    f"chunks={responseChunkCount} chars={responseCharCount} latest='{_stream_log_snippet(chunkContent)}'"
+                )
+                responseLastProgressLog = now
             if chunk.done:
                 self._devStats = {
                     "total_duration": chunk.total_duration,
@@ -1337,6 +1398,10 @@ class ConversationOrchestrator:
                     "eval_count": chunk.eval_count,
                     "eval_duration": chunk.eval_duration,
                 }
+                logger.info(
+                    "[stream.response] "
+                    f"done chunks={responseChunkCount} chars={responseCharCount} eval_count={chunk.eval_count}"
+                )
         await self._emit_stage("response.complete", "Final response generated.")
 
         allowDiagnostics = bool(self._options.get("allow_internal_diagnostics", False))
