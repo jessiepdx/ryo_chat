@@ -1942,12 +1942,18 @@ class UsageManager:
 def getEmbeddings(text: str) -> list:
     logger.info("Getting embeddings.")
     try:
-        results = Client(host=ConfigManager().inference["embedding"]["url"]).embeddings(
-            model=ConfigManager().inference["embedding"]["model"],
+        embeddingConfig = ConfigManager().inference.get("embedding", {})
+        host = embeddingConfig.get("url") if embeddingConfig.get("url") else "http://127.0.0.1:11434"
+        model = embeddingConfig.get("model")
+        if not model:
+            logger.error("Embedding model is missing from config inference settings.")
+            return None
+
+        results = Client(host=host).embeddings(
+            model=model,
             prompt=text
         )
         return results.embedding
     except Exception as error:
         logger.error(f"Exception while getting embeddings from Ollama:\n{error}")
         return None
-

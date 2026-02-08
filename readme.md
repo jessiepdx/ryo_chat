@@ -31,8 +31,13 @@ cp config.empty.json config.json
 cp .env.example .env
 ```
 
-3. Edit `config.json` (required).
-4. Start one or more interfaces.
+3. Set or update Ollama endpoint defaults (custom or local default).
+```bash
+python3 scripts/setup_wizard.py
+```
+
+4. Edit remaining `config.json` fields (required).
+5. Start one or more interfaces.
 ```bash
 python3 telegram_ui.py
 python3 web_ui.py
@@ -94,6 +99,17 @@ CREATE EXTENSION IF NOT EXISTS vector;
 Current runtime behavior:
 - Python runtime currently reads `config.json` directly.
 - `.env` values are primarily for operator workflows and planned bootstrap tooling.
+
+## Ollama Endpoint Selection
+Setup precedence for Ollama host is:
+1. Explicit user-provided host in setup (`--ollama-host` or prompt value)
+2. Existing host already present in `config.json` inference sections
+3. Default local host `http://127.0.0.1:11434`
+
+To run non-interactive endpoint setup:
+```bash
+python3 scripts/setup_wizard.py --non-interactive --ollama-host http://127.0.0.1:11434
+```
 
 ## Policies
 Agent policies and system prompts live in:

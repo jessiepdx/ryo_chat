@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 import requests
+from hypermindlabs.model_router import ModelExecutionError, ModelRouter
 from hypermindlabs.utils import (
     ChatHistoryManager, 
     ConfigManager, 
@@ -45,8 +46,6 @@ chatHistory = ChatHistoryManager()
 config = ConfigManager()
 knowledge = KnowledgeManager()
 members = MemberManager()
-toolInference = config._instance.inference.get("tool")
-chatInference = config._instance.inference.get("chat")
 usage = UsageManager()
 
 # Enable logging
@@ -144,7 +143,7 @@ class ConversationOrchestrator:
         }
         
         analysisMessages.append(Message(role="tool", content=json.dumps(knownContext)))
-        self._analysisAgent = MessageAnalysisAgent(analysisMessages)
+        self._analysisAgent = MessageAnalysisAgent(analysisMessages, options=self._options)
         self._analysisResponse = await self._analysisAgent.generateResponse()
 
         analysisResponseMessage = ""
@@ -168,7 +167,7 @@ class ConversationOrchestrator:
         #print(ConsoleColors["default"])
         
         # TODO Just send the last USER message to the tools followed by the thoughts from analysis agent
-        self._toolsAgent = ToolCallingAgent(self._messages)
+        self._toolsAgent = ToolCallingAgent(self._messages, options=self._options)
         toolResponses = await self._toolsAgent.generateResponse()
         # Non Streaming results
         # Waited to add the analysis agents response to chat history because it throws off the tool calling agent
@@ -183,7 +182,7 @@ class ConversationOrchestrator:
         # TODO Passes only the prompt to the response agent
         # Pass options=options to override the langauge model
 
-        self._chatConversationAgent = ChatConversationAgent(messages=self._messages)
+        self._chatConversationAgent = ChatConversationAgent(messages=self._messages, options=self._options)
         response = await self._chatConversationAgent.generateResponse()
 
         responseMessage = ""
@@ -416,9 +415,6 @@ available_functions = {
 ################
 
 class ToolCallingAgent():
-    # Defaults (in case of policy load failure)
-    _host = toolInference.get("url")
-
     def __init__(self, messages: list, options: dict=None):
         logger.info(f"New instance of the tool calling agent.")
         
@@ -437,7 +433,11 @@ class ToolCallingAgent():
             if modelRequested in self._allowed_models:
                 self._model = modelRequested
 
-        self._ollamaClient = AsyncClient(host=self._host)
+        endpointOverride = None if options is None else options.get("ollama_host")
+        self._modelRouter = ModelRouter(
+            inference_config=config._instance.inference,
+            endpoint_override=endpointOverride,
+        )
 
         self._messages = list()
         systemPrompt = Message(role="system", content=self._systemPrompt)
@@ -452,13 +452,21 @@ class ToolCallingAgent():
     async def generateResponse(self):
         logger.info(f"Generate a response for the tool calling agent.")
 
-        # TODO Wrap this in a try except block
-        self._response: ChatResponse = await self._ollamaClient.chat(
-            model=self._model, 
-            messages=self._messages,
-            stream=False,
-            tools=[braveSearch, chatHistorySearch, knowledgeSearch, skipTool]
-        )
+        try:
+            self._response, self._routing = await self._modelRouter.chat_with_fallback(
+                capability="tool",
+                requested_model=self._model,
+                allowed_models=self._allowed_models,
+                messages=self._messages,
+                stream=False,
+                tools=[braveSearch, chatHistorySearch, knowledgeSearch, skipTool],
+            )
+        except ModelExecutionError as error:
+            logger.error(f"Tool calling model execution failed:\n{error}")
+            logger.error(f"Routing metadata:\n{getattr(error, 'metadata', {})}")
+            return list()
+
+        logger.info(f"Tool calling route metadata:\n{self._routing}")
         toolResults = list()
         
         if self._response.message.tool_calls:
@@ -488,9 +496,6 @@ class ToolCallingAgent():
 
 
 class MessageAnalysisAgent():
-    # Defaults (in case of policy load failure)
-    _host = toolInference.get("url")
-
     def __init__(self, messages: list, options: dict=None):
         logger.info(f"New instance of the message analysis agent.")
         
@@ -509,7 +514,11 @@ class MessageAnalysisAgent():
             if modelRequested in self._allowed_models:
                 self._model = modelRequested
 
-        self._ollamaClient = AsyncClient(host=self._host)
+        endpointOverride = None if options is None else options.get("ollama_host")
+        self._modelRouter = ModelRouter(
+            inference_config=config._instance.inference,
+            endpoint_override=endpointOverride,
+        )
 
         self._messages = list()
         systemPrompt = Message(role="system", content=self._systemPrompt)
@@ -523,14 +532,15 @@ class MessageAnalysisAgent():
         
     async def generateResponse(self):
         logger.info(f"Generate a response for the message analysis agent.")
-        
-        self._response = await self._ollamaClient.chat(
-            model=self._model, 
+        self._response, self._routing = await self._modelRouter.chat_with_fallback(
+            capability="analysis",
+            requested_model=self._model,
+            allowed_models=self._allowed_models,
             messages=self._messages,
             stream=True,
-            format="json"
+            format="json",
         )
-        
+        logger.info(f"Message analysis route metadata:\n{self._routing}")
         return self._response
     
     @property
@@ -539,9 +549,6 @@ class MessageAnalysisAgent():
 
 
 class DevTestAgent():
-    # Defaults (in case of policy load failure)
-    _host = chatInference.get("url")
-
     def __init__(self, messages: list, options: dict=None):
         logger.info(f"New instance of the dev test agent.")
         
@@ -560,8 +567,11 @@ class DevTestAgent():
             if modelRequested in self._allowed_models:
                 self._model = modelRequested
 
-        # TODO Create the ollamaClient based on the policy
-        self._ollamaClient = AsyncClient(host=self._host)
+        endpointOverride = None if options is None else options.get("ollama_host")
+        self._modelRouter = ModelRouter(
+            inference_config=config._instance.inference,
+            endpoint_override=endpointOverride,
+        )
 
         # TODO Check to see if policy allows for system prompt overrides
 
@@ -577,13 +587,14 @@ class DevTestAgent():
         
     async def generateResponse(self):
         logger.info(f"Generate a response for the dev test agent.")
-        
-        self._response = await self._ollamaClient.chat(
-            model=self._model, 
+        self._response, self._routing = await self._modelRouter.chat_with_fallback(
+            capability="dev_test",
+            requested_model=self._model,
+            allowed_models=self._allowed_models,
             messages=self._messages,
-            stream=True
+            stream=True,
         )
-        
+        logger.info(f"Dev test route metadata:\n{self._routing}")
         return self._response
     
     @property
@@ -592,9 +603,6 @@ class DevTestAgent():
 
 
 class ChatConversationAgent():
-    # Defaults (in case of policy load failure)
-    _host = chatInference.get("url")
-
     def __init__(self, messages: list, options: dict=None):
         logger.info(f"New instance of the chat conversation agent.")
         
@@ -613,8 +621,11 @@ class ChatConversationAgent():
             if modelRequested in self._allowed_models:
                 self._model = modelRequested
 
-        # TODO Create the ollamaClient based on the policy
-        self._ollamaClient = AsyncClient(host=self._host)
+        endpointOverride = None if options is None else options.get("ollama_host")
+        self._modelRouter = ModelRouter(
+            inference_config=config._instance.inference,
+            endpoint_override=endpointOverride,
+        )
 
         # TODO Check to see if policy allows for system prompt overrides
 
@@ -630,13 +641,14 @@ class ChatConversationAgent():
         
     async def generateResponse(self):
         logger.info(f"Generate a response for the chat conversation agent.")
-        
-        self._response = await self._ollamaClient.chat(
-            model=self._model, 
+        self._response, self._routing = await self._modelRouter.chat_with_fallback(
+            capability="chat",
+            requested_model=self._model,
+            allowed_models=self._allowed_models,
             messages=self._messages,
-            stream=True
+            stream=True,
         )
-        
+        logger.info(f"Chat conversation route metadata:\n{self._routing}")
         return self._response
     
     @property
