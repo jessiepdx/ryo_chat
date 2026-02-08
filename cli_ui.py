@@ -20,6 +20,7 @@
 import asyncio
 import json
 import logging
+import sys
 import requests
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -93,15 +94,34 @@ def toggleStats():
     currentValue = settings.get("show_stats")
     settings["show_stats"] = not currentValue
     print("Show statistics:  " + str(settings.get("show_stats")))
+
+
+def prompt_input(prompt: str) -> str | None:
+    try:
+        return input(prompt)
+    except EOFError:
+        logger.info("CLI UI received EOF on stdin; shutting down cleanly.")
+        return None
+    except KeyboardInterrupt:
+        logger.info("CLI UI interrupted by user.")
+        return None
     
 
 
 async def main():
+    if not sys.stdin.isatty():
+        logger.info("CLI UI requires an interactive terminal. Launch via app.py dashboard 'open interface'.")
+        return
+
     # TODO Prompt user for host, then display list of models and prompt user to select a model
     while(True):
         # Get username
-        tg_username = input(f"{ConsoleColors['green']}Telegram Username > {ConsoleColors['default']}")
-        password = input(f"{ConsoleColors['green']}Password > {ConsoleColors['default']}")
+        tg_username = prompt_input(f"{ConsoleColors['green']}Telegram Username > {ConsoleColors['default']}")
+        if tg_username is None:
+            return
+        password = prompt_input(f"{ConsoleColors['green']}Password > {ConsoleColors['default']}")
+        if password is None:
+            return
 
         memberData = members.loginMember(tg_username, password)
         if memberData:
@@ -122,7 +142,9 @@ async def main():
             lastMessageID = historyMessage.get("message_id")
     
     while(True):
-        userInput = input(f"{ConsoleColors['dark_green']}User > {ConsoleColors['default']}")
+        userInput = prompt_input(f"{ConsoleColors['dark_green']}User > {ConsoleColors['default']}")
+        if userInput is None:
+            return
         # Check for and handle commands
         if (userInput[:1] == "/"):
             command = userInput.split(" ")[0]
@@ -150,7 +172,9 @@ async def main():
                         availableModelNames.append(model.model)
 
                     # Get the user's input for choosing a model
-                    modelRequested = input("Enter the model you wish to use:  ")
+                    modelRequested = prompt_input("Enter the model you wish to use:  ")
+                    if modelRequested is None:
+                        return
                     # Check the requested model against the model list
                     if modelRequested in availableModelNames:
                         settings["model"] = modelRequested
@@ -170,7 +194,9 @@ async def main():
 
                     continue
                 case "/search":
-                    query = input("Search query:  ")
+                    query = prompt_input("Search query:  ")
+                    if query is None:
+                        return
                     braveWebResults = braveSearch(queryString=query)
                     print(braveWebResults.get("results"))
                     continue
@@ -180,13 +206,17 @@ async def main():
                     match argument:
                         case "add":
                             logger.info("Adding new spam text.")
-                            query = input("Spam text to add:  ")
+                            query = prompt_input("Spam text to add:  ")
+                            if query is None:
+                                return
                             newRecord = spam.addSpamText(query, memberID)
                             print(newRecord)
                             continue
                         case "search":
                             logger.info("Searching the spam table.")
-                            query = input("Text to search spam:  ")
+                            query = prompt_input("Text to search spam:  ")
+                            if query is None:
+                                return
                             result = spam.searchSpam(query)
                             print(result)
                             continue

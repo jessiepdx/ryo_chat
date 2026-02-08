@@ -30,6 +30,10 @@ Output requirements:
     "history_search_allowed": true,
     "reason": "string"
   },
+  "brevity_directive": {
+    "mode": "standard|brief_social",
+    "reason": "string"
+  },
   "response_style": {
     "tone": "friendly",
     "length": "concise"
@@ -46,3 +50,5 @@ Rules:
 6. If user asks for time/date/day/recency, capture that need explicitly in "intent" and "context_summary" using temporal_context values.
 7. If Known Context includes "topic_transition.switched=true", set "topic" to the new topic and set memory_directive.mode="focus_new_topic".
 8. When topic_transition indicates a switch, suppress stale-topic carryover; allow history search only if user explicitly requests recall.
+9. Determine "brevity_directive.mode" via reasoning from the latest user turn and context.
+10. Use "brief_social" only when the message is a short social/ack turn that does not need tools or deep retrieval; otherwise use "standard".

@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import select
 import shutil
@@ -65,6 +66,7 @@ ENV_FILE = PROJECT_ROOT / ".env"
 LOGS_DIR = PROJECT_ROOT / "logs"
 WATCHDOG_LOG_DIR = LOGS_DIR / "watchdog"
 LIVE_LOG_BUFFER_LINE_LIMIT = 400
+ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 INFERENCE_KEYS = ("embedding", "generate", "chat", "tool", "multimodal")
@@ -1182,6 +1184,45 @@ ROUTE_CONFIG_SPECS: dict[str, RouteConfigSpec] = {
                         env_override_keys=("RYO_TELEGRAM_SHOW_STAGE_PROGRESS",),
                     ),
                     RouteSettingSpec(
+                        id="show_stage_json_details",
+                        label="Show Stage JSON Details",
+                        path="runtime.telegram.show_stage_json_details",
+                        value_type="bool",
+                        description="Include stage JSON payloads in transient Telegram status message.",
+                        default_runtime_path="telegram.show_stage_json_details",
+                        env_override_keys=("RYO_TELEGRAM_SHOW_STAGE_JSON_DETAILS",),
+                    ),
+                    RouteSettingSpec(
+                        id="stage_detail_level",
+                        label="Stage Detail Level",
+                        path="runtime.telegram.stage_detail_level",
+                        value_type="string",
+                        description="Telemetry verbosity for Telegram stage updates: minimal, normal, debug.",
+                        default_runtime_path="telegram.stage_detail_level",
+                        choices=("minimal", "normal", "debug"),
+                        env_override_keys=("RYO_TELEGRAM_STAGE_DETAIL_LEVEL",),
+                    ),
+                    RouteSettingSpec(
+                        id="fast_path_small_talk_enabled",
+                        label="Fast Path Brevity",
+                        path="runtime.orchestrator.fast_path_small_talk_enabled",
+                        value_type="bool",
+                        description="Allow analysis-reasoned brief turns to skip tool stage and reduce latency.",
+                        default_runtime_path="orchestrator.fast_path_small_talk_enabled",
+                        env_override_keys=("RYO_ORCHESTRATOR_FAST_PATH_BREVITY_ENABLED", "RYO_ORCHESTRATOR_FAST_PATH_SMALL_TALK_ENABLED"),
+                    ),
+                    RouteSettingSpec(
+                        id="fast_path_small_talk_max_chars",
+                        label="Fast Path Brevity Max Chars",
+                        path="runtime.orchestrator.fast_path_small_talk_max_chars",
+                        value_type="int",
+                        description="Max input length eligible for analysis-reasoned brevity fast-path.",
+                        default_runtime_path="orchestrator.fast_path_small_talk_max_chars",
+                        min_value=1,
+                        max_value=1000,
+                        env_override_keys=("RYO_ORCHESTRATOR_FAST_PATH_BREVITY_MAX_CHARS", "RYO_ORCHESTRATOR_FAST_PATH_SMALL_TALK_MAX_CHARS"),
+                    ),
+                    RouteSettingSpec(
                         id="get_updates_write_timeout",
                         label="Updates Write Timeout",
                         path="runtime.telegram.get_updates_write_timeout",
@@ -1886,6 +1927,10 @@ class InterfaceWatchdog:
         env.update(self._route_env_overrides.get(key, {}))
         env.setdefault("PYTHONUNBUFFERED", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("NO_COLOR", "1")
+        env.setdefault("PY_COLORS", "0")
+        env.setdefault("CLICOLOR", "0")
+        env.setdefault("CLICOLOR_FORCE", "0")
         return env
 
     def _spawn(self, state: RouteState) -> None:
@@ -1984,8 +2029,13 @@ class InterfaceWatchdog:
             return self.stop(key)
         return self.start(key)
 
-    def start_all(self) -> None:
+    def start_all(self, *, include_manual: bool = True) -> None:
         for key in self.route_keys():
+            state = self._routes.get(key)
+            if state is None:
+                continue
+            if not include_manual and not bool(state.spec.restart_on_exit):
+                continue
             self.start(key)
 
     def stop_all(self) -> None:
@@ -2150,11 +2200,16 @@ def _tail_log_lines(log_path: Path, line_count: int = 40) -> list[str]:
         return [f"(failed reading log file: {error})"]
     if not lines:
         return ["(log is empty)"]
-    return lines[-max(1, int(line_count)) :]
+    return [_strip_ansi(line) for line in lines[-max(1, int(line_count)) :]]
+
+
+def _strip_ansi(value: Any) -> str:
+    text = str(value if value is not None else "")
+    return ANSI_ESCAPE_RE.sub("", text)
 
 
 def _append_live_log_line(state: LiveLogTailState, line: str) -> None:
-    cleaned = str(line).replace("\t", "    ").strip("\r\n")
+    cleaned = _strip_ansi(line).replace("\t", "    ").strip("\r\n")
     if cleaned == "":
         return
     state.lines.append(cleaned)
@@ -3313,8 +3368,8 @@ def watchdog_dashboard_curses(
             )
         )
         if auto_start_routes:
-            watchdog.start_all()
-            last_status_text = "auto-started all routes"
+            watchdog.start_all(include_manual=False)
+            last_status_text = "auto-started auto routes (web/telegram)"
         else:
             last_status_text = "ready"
 
@@ -3684,8 +3739,8 @@ def main() -> int:
             )
         else:
             if bool(get_runtime_setting(runtime_settings, "watchdog.auto_start_routes", True)):
-                watchdog.start_all()
-                print("[launcher] Auto-started all managed routes.")
+                watchdog.start_all(include_manual=False)
+                print("[launcher] Auto-started auto routes (web/telegram).")
             route_menu(watchdog, config_data=config_data, runtime_settings=runtime_settings)
     except KeyboardInterrupt:
         print("\n[launcher] Shutdown requested.")

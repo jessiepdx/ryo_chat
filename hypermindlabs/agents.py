@@ -166,32 +166,6 @@ _HISTORY_RECALL_PATTERNS = (
     r"\bwhen did i\b",
     r"\bfrom before\b",
 )
-_SMALL_TALK_MARKERS = {
-    "ok",
-    "okay",
-    "k",
-    "thanks",
-    "thank",
-    "thx",
-    "cool",
-    "nice",
-    "great",
-    "awesome",
-    "yep",
-    "yes",
-    "no",
-    "nope",
-    "lol",
-    "lmao",
-    "haha",
-    "sup",
-    "hey",
-    "hi",
-    "hello",
-    "yo",
-    "gm",
-    "gn",
-}
 _TOPIC_STOPWORDS = {
     "the",
     "and",
@@ -316,6 +290,18 @@ def _stream_log_snippet(value: Any, max_chars: int = 160) -> str:
     if max_chars <= 3:
         return text[:max_chars]
     return text[: max_chars - 3] + "..."
+
+
+def _stream_human_preview(value: Any, max_chars: int = 220) -> str:
+    text = str(value or "").replace("\r", "\n")
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text or max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 3:
+        return text[-max_chars:]
+    return "..." + text[-(max_chars - 3) :]
 
 
 def _stage_meta_log_summary(meta: dict[str, Any] | None) -> dict[str, Any]:
@@ -472,13 +458,23 @@ def _topic_label(text: str, *, max_terms: int, fallback: str = "general") -> str
 
 
 def _is_small_talk_message(text: str) -> bool:
-    lowered = _as_text(text).lower()
-    if not lowered:
+    cleaned = _as_text(text)
+    if not cleaned:
         return True
-    tokens = [token.strip("'") for token in re.findall(r"[a-z0-9']+", lowered) if token.strip("'")]
-    if not tokens:
+    stripped = cleaned.strip()
+    if not stripped:
         return True
-    if len(tokens) <= 3 and all(token in _SMALL_TALK_MARKERS for token in tokens):
+
+    token_pattern = r"[A-Za-z0-9']+"
+    tokens = [token.strip("'") for token in re.findall(token_pattern, stripped) if token.strip("'")]
+    token_count = len(tokens)
+    char_count = len(stripped)
+    if token_count == 0:
+        return True
+    # Structural brevity fallback only (no phrase/keyword matching).
+    if char_count <= 24 and token_count <= 4:
+        return True
+    if char_count <= 48 and token_count <= 7 and ("\n" not in stripped):
         return True
     return False
 
@@ -664,6 +660,13 @@ def _coerce_float(value: Any, fallback: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(fallback)
+
+
+def _normalize_brevity_mode(value: Any, fallback: str = "standard") -> str:
+    mode = _as_text(value, fallback).strip().lower()
+    if mode in {"brief", "brief_social", "short_social", "social"}:
+        return "brief_social"
+    return "standard"
 
 
 def _history_record_role(record: dict[str, Any]) -> str:
@@ -888,7 +891,10 @@ def _select_memory_recall(
     }
 
 
-def _normalize_analysis_payload(raw_analysis_text: str, known_context: dict[str, Any] | None = None) -> dict[str, Any]:
+def _normalize_analysis_payload(
+    raw_analysis_text: str,
+    known_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     parsed = _parse_json_like(raw_analysis_text)
     payload = parsed if isinstance(parsed, dict) else {}
     tool_results = payload.get("tool_results")
@@ -979,6 +985,15 @@ def _normalize_analysis_payload(raw_analysis_text: str, known_context: dict[str,
             else "No topic switch override; keep normal recency-weighted memory."
         ),
     )
+    payload_brevity_directive = _coerce_dict(payload.get("brevity_directive"))
+    brevity_mode = _normalize_brevity_mode(
+        payload_brevity_directive.get("mode"),
+        "standard",
+    )
+    brevity_reason = _as_text(
+        payload_brevity_directive.get("reason"),
+        "analysis_reasoned_briefness" if brevity_mode == "brief_social" else "analysis_reasoned_standard",
+    )
 
     return {
         "topic": topic,
@@ -999,6 +1014,10 @@ def _normalize_analysis_payload(raw_analysis_text: str, known_context: dict[str,
             "mode": memory_mode,
             "history_search_allowed": history_search_allowed,
             "reason": memory_reason,
+        },
+        "brevity_directive": {
+            "mode": brevity_mode,
+            "reason": brevity_reason,
         },
         "response_style": {
             "tone": tone,
@@ -1244,6 +1263,8 @@ class ConversationOrchestrator:
         analysisChunkCount = 0
         analysisCharCount = 0
         analysisLastProgressLog = time.monotonic()
+        analysisLastProgressEmit = time.monotonic()
+        analysisLatestPreview = ""
         
         #print(f"{ConsoleColors["purple"]}Analysis Agent > ", end="")
         chunk: ChatResponse
@@ -1254,6 +1275,8 @@ class ConversationOrchestrator:
             analysisResponseMessage = analysisResponseMessage + chunkContent
             analysisChunkCount += 1
             analysisCharCount += len(chunkContent)
+            if chunkContent:
+                analysisLatestPreview = _stream_human_preview(analysisResponseMessage, 280)
             now = time.monotonic()
             if chunkContent and (
                 analysisChunkCount == 1
@@ -1265,6 +1288,18 @@ class ConversationOrchestrator:
                     f"chunks={analysisChunkCount} chars={analysisCharCount} latest='{_stream_log_snippet(chunkContent)}'"
                 )
                 analysisLastProgressLog = now
+            if chunkContent and (
+                analysisChunkCount == 1
+                or (now - analysisLastProgressEmit) >= 2.0
+            ):
+                await self._emit_stage(
+                    "analysis.progress",
+                    "Analysis model is reasoning.",
+                    snippet=analysisLatestPreview or _stream_log_snippet(chunkContent, 220),
+                    chunks=analysisChunkCount,
+                    chars=analysisCharCount,
+                )
+                analysisLastProgressEmit = now
             if chunk.done:
                 self._analysisStats = {
                     "total_duration": chunk.total_duration,
@@ -1304,53 +1339,78 @@ class ConversationOrchestrator:
 
         #print(ConsoleColors["default"])
 
-        # Feed only a sanitized analysis handoff to the tool stage.
-        await self._emit_stage("tools.start", "Evaluating tool calls.")
-        toolStageMessages = list(self._messages)
-        toolStageMessages.append(Message(role="tool", content=json.dumps(analysisMessagePayload)))
-        toolOptions = dict(self._options)
-        toolRuntimeContext = _coerce_dict(toolOptions.get("tool_runtime_context"))
-        knownContextResults = _coerce_dict(knownContext.get("tool_results"))
-        toolRuntimeContext.update(
-            {
-                "chat_host_id": self._chatHostID,
-                "chat_type": self._chatType,
-                "platform": self._platform,
-                "topic_id": self._topicID,
-                "topic_transition": _coerce_dict(knownContextResults.get("topic_transition")),
-                "memory_circuit": _coerce_dict(knownContextResults.get("memory_circuit")),
-                "history_search_allowed": _as_bool(
-                    _coerce_dict(knownContextResults.get("memory_circuit")).get("history_search_allowed"),
-                    True,
-                ),
-            }
-        )
-        toolOptions["tool_runtime_context"] = toolRuntimeContext
-        self._toolsAgent = ToolCallingAgent(toolStageMessages, options=toolOptions)
-        toolResponses = await self._toolsAgent.generateResponse()
-        toolSummary = _coerce_dict(getattr(self._toolsAgent, "execution_summary", {}))
-        toolsRouting = _coerce_dict(getattr(self._toolsAgent, "routing", {}))
-        requestedToolCalls = toolSummary.get("requested_tool_calls")
-        executedToolCalls = toolSummary.get("executed_tool_calls")
-        if not isinstance(executedToolCalls, int):
-            executedToolCalls = len(toolResponses)
-        await self._emit_stage(
-            "tools.complete",
-            "Tool execution stage complete.",
-            tool_calls=len(toolResponses),
-            requested_tool_calls=requestedToolCalls if isinstance(requestedToolCalls, int) else len(toolResponses),
-            executed_tool_calls=executedToolCalls,
-            selected_model=toolsRouting.get("selected_model"),
-            json={
-                "routing": toolsRouting,
-                "summary": toolSummary,
-                "tool_results": toolResponses,
-            },
-        )
         self._messages.append(Message(role="tool", content=json.dumps(analysisMessagePayload)))
 
-        for toolResponse in toolResponses:
-            self._messages.append(Message(role="tool", content=json.dumps(toolResponse)))
+        brevityDirective = _coerce_dict(normalizedAnalysis.get("brevity_directive"))
+        brevityMode = _normalize_brevity_mode(brevityDirective.get("mode"), "standard")
+        brevityReason = _as_text(brevityDirective.get("reason"), "analysis_reasoned_standard")
+        fastPathEnabled = _runtime_bool("orchestrator.fast_path_small_talk_enabled", True)
+        messageCharCount = len(_as_text(self._message))
+        analysisNeedsTools = _as_bool(normalizedAnalysis.get("needs_tools"), fallback=False)
+        fastPathActive = (
+            fastPathEnabled
+            and brevityMode == "brief_social"
+            and not analysisNeedsTools
+        )
+
+        toolResponses: list[dict[str, Any]] = []
+        if fastPathActive:
+            await self._emit_stage(
+                "orchestrator.fast_path",
+                "Analysis selected brevity fast-path; skipping tool stage.",
+                json={
+                    "mode": brevityMode,
+                    "reason": brevityReason,
+                    "needs_tools": analysisNeedsTools,
+                    "message_char_count": messageCharCount,
+                },
+            )
+        else:
+            # Feed only a sanitized analysis handoff to the tool stage.
+            await self._emit_stage("tools.start", "Evaluating tool calls.")
+            toolStageMessages = list(self._messages)
+            toolOptions = dict(self._options)
+            toolRuntimeContext = _coerce_dict(toolOptions.get("tool_runtime_context"))
+            knownContextResults = _coerce_dict(knownContext.get("tool_results"))
+            toolRuntimeContext.update(
+                {
+                    "chat_host_id": self._chatHostID,
+                    "chat_type": self._chatType,
+                    "platform": self._platform,
+                    "topic_id": self._topicID,
+                    "topic_transition": _coerce_dict(knownContextResults.get("topic_transition")),
+                    "memory_circuit": _coerce_dict(knownContextResults.get("memory_circuit")),
+                    "history_search_allowed": _as_bool(
+                        _coerce_dict(knownContextResults.get("memory_circuit")).get("history_search_allowed"),
+                        True,
+                    ),
+                }
+            )
+            toolOptions["tool_runtime_context"] = toolRuntimeContext
+            self._toolsAgent = ToolCallingAgent(toolStageMessages, options=toolOptions)
+            toolResponses = await self._toolsAgent.generateResponse()
+            toolSummary = _coerce_dict(getattr(self._toolsAgent, "execution_summary", {}))
+            toolsRouting = _coerce_dict(getattr(self._toolsAgent, "routing", {}))
+            requestedToolCalls = toolSummary.get("requested_tool_calls")
+            executedToolCalls = toolSummary.get("executed_tool_calls")
+            if not isinstance(executedToolCalls, int):
+                executedToolCalls = len(toolResponses)
+            await self._emit_stage(
+                "tools.complete",
+                "Tool execution stage complete.",
+                tool_calls=len(toolResponses),
+                requested_tool_calls=requestedToolCalls if isinstance(requestedToolCalls, int) else len(toolResponses),
+                executed_tool_calls=executedToolCalls,
+                selected_model=toolsRouting.get("selected_model"),
+                json={
+                    "routing": toolsRouting,
+                    "summary": toolSummary,
+                    "tool_results": toolResponses,
+                },
+            )
+
+            for toolResponse in toolResponses:
+                self._messages.append(Message(role="tool", content=json.dumps(toolResponse)))
         
         # TODO Tools to thoughts "thinking" agent next, will produce thoughts based analysis and tool responses, outputs thoughts followed by a prompt
         
@@ -1369,6 +1429,8 @@ class ConversationOrchestrator:
         responseChunkCount = 0
         responseCharCount = 0
         responseLastProgressLog = time.monotonic()
+        responseLastProgressEmit = time.monotonic()
+        responseLatestPreview = ""
         
         #print(f"{ConsoleColors["blue"]}Assistant > ", end="")
         chunk: ChatResponse
@@ -1378,6 +1440,8 @@ class ConversationOrchestrator:
             responseMessage = responseMessage + chunkContent
             responseChunkCount += 1
             responseCharCount += len(chunkContent)
+            if chunkContent:
+                responseLatestPreview = _stream_human_preview(responseMessage, 280)
             now = time.monotonic()
             if chunkContent and (
                 responseChunkCount == 1
@@ -1389,6 +1453,18 @@ class ConversationOrchestrator:
                     f"chunks={responseChunkCount} chars={responseCharCount} latest='{_stream_log_snippet(chunkContent)}'"
                 )
                 responseLastProgressLog = now
+            if chunkContent and (
+                responseChunkCount == 1
+                or (now - responseLastProgressEmit) >= 2.0
+            ):
+                await self._emit_stage(
+                    "response.progress",
+                    "Response model is drafting output.",
+                    snippet=responseLatestPreview or _stream_log_snippet(chunkContent, 220),
+                    chunks=responseChunkCount,
+                    chars=responseCharCount,
+                )
+                responseLastProgressEmit = now
             if chunk.done:
                 self._devStats = {
                     "total_duration": chunk.total_duration,

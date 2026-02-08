@@ -73,7 +73,12 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "minimum_community_score_forward": 20,
         "get_updates_write_timeout": 500,
         "show_stage_progress": True,
-        "show_stage_json_details": True,
+        "show_stage_json_details": False,
+        "stage_detail_level": "minimal",
+    },
+    "orchestrator": {
+        "fast_path_small_talk_enabled": True,
+        "fast_path_small_talk_max_chars": 96,
     },
     "temporal": {
         "enabled": True,
@@ -220,6 +225,15 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "telegram.get_updates_write_timeout": (("RYO_TELEGRAM_GET_UPDATES_WRITE_TIMEOUT",), "int"),
     "telegram.show_stage_progress": (("RYO_TELEGRAM_SHOW_STAGE_PROGRESS",), "bool"),
     "telegram.show_stage_json_details": (("RYO_TELEGRAM_SHOW_STAGE_JSON_DETAILS",), "bool"),
+    "telegram.stage_detail_level": (("RYO_TELEGRAM_STAGE_DETAIL_LEVEL",), "str"),
+    "orchestrator.fast_path_small_talk_enabled": (
+        ("RYO_ORCHESTRATOR_FAST_PATH_BREVITY_ENABLED", "RYO_ORCHESTRATOR_FAST_PATH_SMALL_TALK_ENABLED"),
+        "bool",
+    ),
+    "orchestrator.fast_path_small_talk_max_chars": (
+        ("RYO_ORCHESTRATOR_FAST_PATH_BREVITY_MAX_CHARS", "RYO_ORCHESTRATOR_FAST_PATH_SMALL_TALK_MAX_CHARS"),
+        "int",
+    ),
     "temporal.enabled": (("RYO_TEMPORAL_CONTEXT_ENABLED",), "bool"),
     "temporal.default_timezone": (("RYO_TEMPORAL_DEFAULT_TIMEZONE",), "str"),
     "temporal.history_limit": (("RYO_TEMPORAL_HISTORY_LIMIT",), "int"),

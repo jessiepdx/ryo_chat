@@ -25,6 +25,7 @@ import os
 import psycopg
 import re
 import secrets
+import sys
 import string
 import textstat
 import time
@@ -57,18 +58,37 @@ class CustomFormatter(logging.Formatter):
     red = "\x1b[31;20m"
     bold_red = "\x1b[31;1m"
     reset = "\x1b[0m"
-    format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"
+    base_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"
 
-    FORMATS = {
-        logging.DEBUG: grey + format + reset,
-        logging.INFO: grey + format + reset,
-        logging.WARNING: yellow + format + reset,
-        logging.ERROR: red + format + reset,
-        logging.CRITICAL: bold_red + format + reset
+    COLOR_FORMATS = {
+        logging.DEBUG: grey + base_format + reset,
+        logging.INFO: grey + base_format + reset,
+        logging.WARNING: yellow + base_format + reset,
+        logging.ERROR: red + base_format + reset,
+        logging.CRITICAL: bold_red + base_format + reset
     }
 
+    def __init__(self, *, use_color: bool | None = None, stream: Any | None = None):
+        super().__init__(self.base_format)
+        if use_color is None:
+            no_color = str(os.getenv("NO_COLOR", "")).strip()
+            ryo_color = str(os.getenv("RYO_LOG_COLOR", "")).strip().lower()
+            if no_color:
+                use_color = False
+            elif ryo_color in {"0", "false", "no", "off"}:
+                use_color = False
+            elif ryo_color in {"1", "true", "yes", "on"}:
+                use_color = True
+            else:
+                target_stream = stream if stream is not None else sys.stderr
+                use_color = bool(getattr(target_stream, "isatty", lambda: False)())
+        self._use_color = bool(use_color)
+
     def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno)
+        if not self._use_color:
+            formatter = logging.Formatter(self.base_format)
+            return formatter.format(record)
+        log_fmt = self.COLOR_FORMATS.get(record.levelno, self.base_format)
         formatter = logging.Formatter(log_fmt)
         return formatter.format(record)
 

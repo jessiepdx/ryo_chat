@@ -19,8 +19,10 @@
 
 import base64
 from datetime import datetime, timedelta, timezone
+import html
 import json
 import logging
+from typing import Any
 from ollama import AsyncClient
 import os
 import re
@@ -140,6 +142,12 @@ def _runtime_bool(path: str, default: bool) -> bool:
     return config.runtimeBool(path, default)
 
 
+def _runtime_str(path: str, default: str) -> str:
+    value = config.runtimeValue(path, default)
+    text = default if value is None else str(value).strip()
+    return text if text else default
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -202,17 +210,39 @@ def _database_unavailable_message() -> str:
 
 _ORCHESTRATION_STAGE_LABELS = {
     "orchestrator.start": "Accepted request",
+    "orchestrator.fast_path": "Fast path",
     "context.built": "Context built",
     "analysis.start": "Analyzing message",
+    "analysis.progress": "Analyzing message",
     "analysis.complete": "Analysis complete",
     "analysis.payload": "Analysis payload",
     "tools.start": "Evaluating tools",
     "tools.model_output": "Tool model output",
     "tools.complete": "Tools complete",
     "response.start": "Generating response",
+    "response.progress": "Generating response",
     "response.complete": "Response generated",
     "response.sanitized": "Sanitized response",
     "orchestrator.complete": "Wrapping up",
+}
+
+_TELEGRAM_STAGE_DETAIL_LEVELS = {"minimal", "normal", "debug"}
+_MINIMAL_VISIBLE_STAGES = {
+    "orchestrator.start",
+    "orchestrator.fast_path",
+    "analysis.start",
+    "analysis.progress",
+    "analysis.complete",
+    "tools.start",
+    "tools.model_output",
+    "tools.complete",
+    "response.start",
+    "response.progress",
+    "response.complete",
+}
+_NORMAL_HIDDEN_STAGES = {
+    "context.built",
+    "analysis.payload",
 }
 
 
@@ -226,6 +256,7 @@ class TelegramStageStatus:
         reply_message=None,
         enabled: bool = True,
         show_json_details: bool = True,
+        detail_level: str = "minimal",
         history_limit: int = 8,
         json_char_limit: int = 1400,
         message_char_limit: int = 3800,
@@ -236,6 +267,10 @@ class TelegramStageStatus:
         self._reply_message = reply_message
         self._enabled = bool(enabled)
         self._show_json_details = bool(show_json_details)
+        detail_level_clean = str(detail_level or "minimal").strip().lower()
+        if detail_level_clean not in _TELEGRAM_STAGE_DETAIL_LEVELS:
+            detail_level_clean = "minimal"
+        self._detail_level = detail_level_clean
         self._history_limit = max(3, int(history_limit))
         self._json_char_limit = max(200, int(json_char_limit))
         self._message_char_limit = max(800, int(message_char_limit))
@@ -243,28 +278,117 @@ class TelegramStageStatus:
         self._lines: list[str] = []
         self._last_text: str = ""
 
+    def _stage_visible(self, stage: str, meta: dict[str, Any]) -> bool:
+        if self._detail_level == "debug":
+            return True
+        if self._detail_level == "normal":
+            return stage not in _NORMAL_HIDDEN_STAGES
+        if stage not in _MINIMAL_VISIBLE_STAGES:
+            return False
+        return True
+
+    @staticmethod
+    def _truncate_text(value: str, max_chars: int) -> str:
+        text = str(value or "").strip()
+        if max_chars <= 0:
+            return ""
+        if len(text) <= max_chars:
+            return text
+        if max_chars <= 3:
+            return text[:max_chars]
+        return text[: max_chars - 3] + "..."
+
+    @staticmethod
+    def _extract_from_meta_json(meta: dict[str, Any], *path: str) -> Any:
+        cursor: Any = meta.get("json")
+        for key in path:
+            if not isinstance(cursor, dict):
+                return None
+            cursor = cursor.get(key)
+        return cursor
+
+    def _format_stage_timestamp(self, raw: Any) -> str:
+        raw_text = str(raw or "").strip()
+        if raw_text:
+            try:
+                parsed = datetime.fromisoformat(raw_text.replace("Z", "+00:00"))
+                return parsed.astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+            except ValueError:
+                return self._truncate_text(raw_text, 32)
+        return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+    def _human_readable_stage_message(self, stage: str, detail: str, meta: dict[str, Any]) -> str:
+        snippet = str(meta.get("snippet") or "").strip()
+        if snippet:
+            return self._truncate_text(snippet, 320)
+
+        if stage == "orchestrator.start":
+            return "Accepted request and preparing context."
+
+        if stage == "analysis.start":
+            return "Running message analysis and model routing."
+
+        if stage == "tools.model_output":
+            excerpt = self._extract_from_meta_json(meta, "execution_summary", "model_output_excerpt")
+            if isinstance(excerpt, str) and excerpt.strip():
+                return self._truncate_text(excerpt, 320)
+
+        if stage == "tools.start":
+            return "Determining whether tools are needed for this request."
+
+        if stage == "tools.complete":
+            executed = meta.get("executed_tool_calls")
+            if isinstance(executed, int):
+                tool_names = self._extract_from_meta_json(meta, "summary", "executed_tools")
+                if isinstance(tool_names, list) and tool_names:
+                    names = ", ".join(str(name) for name in tool_names[:4])
+                    return self._truncate_text(f"Executed {executed} tool call(s): {names}", 320)
+                return f"Executed {executed} tool call(s)."
+            return "No tool calls were executed for this request."
+
+        if stage == "analysis.complete":
+            selected_model = str(meta.get("selected_model") or "").strip()
+            if selected_model:
+                return f"Analysis model: {selected_model}"
+            return "Analysis complete."
+
+        if stage == "response.start":
+            return "Generating final response."
+
+        if stage == "response.progress":
+            chars = meta.get("chars")
+            if isinstance(chars, int):
+                return f"Drafting response ({chars} chars generated)."
+
+        cleaned_detail = str(detail or "").strip()
+        if cleaned_detail:
+            return self._truncate_text(cleaned_detail, 320)
+        return ""
+
+    def _build_stage_entry(
+        self,
+        *,
+        stage: str,
+        detail: str,
+        meta: dict[str, Any],
+        timestamp: Any,
+    ) -> str:
+        label = _ORCHESTRATION_STAGE_LABELS.get(stage, stage if stage else "Processing")
+
+        message = self._human_readable_stage_message(stage, detail, meta)
+        entry = f"<b>{html.escape(label)}</b>"
+        if message:
+            entry += f"\n<i>{html.escape(message)}</i>"
+        entry += f"\n<code>{html.escape(self._format_stage_timestamp(timestamp))}</code>"
+        return self._truncate_text(entry, self._message_char_limit)
+
     def _render(self) -> str:
         if not self._lines:
             return "Processing your request..."
-        visible = self._lines[-self._history_limit:]
-        rendered = "Processing your request...\n\n" + "\n\n".join(visible)
+        rendered = self._lines[-1]
         if len(rendered) <= self._message_char_limit:
             return rendered
-
-        clipped = list(visible)
-        while len(clipped) > 1 and len("Processing your request...\n\n" + "\n\n".join(clipped)) > self._message_char_limit:
-            clipped.pop(0)
-
-        rendered = "Processing your request...\n\n" + "\n\n".join(clipped)
-        if len(rendered) <= self._message_char_limit:
-            return rendered
-
-        overflow = len(rendered) - self._message_char_limit
-        tail = clipped[-1] if clipped else ""
-        keep = max(120, len(tail) - overflow - 18)
-        if clipped:
-            clipped[-1] = tail[:keep].rstrip() + "\n...(truncated)"
-        return "Processing your request...\n\n" + "\n\n".join(clipped)
+        return self._truncate_text(rendered, self._message_char_limit)
 
     def _render_json_block(self, payload) -> str:
         try:
@@ -276,13 +400,17 @@ class TelegramStageStatus:
             json_text = json_text[: self._json_char_limit - len(suffix)].rstrip() + suffix
         return f"```json\n{json_text}\n```"
 
-    async def _safe_edit(self, text: str) -> None:
+    async def _safe_edit(self, text: str, *, parse_html: bool = False) -> None:
         if self._message is None:
             return
         if text == self._last_text:
             return
         try:
-            await self._message.edit_text(text=text)
+            kwargs: dict[str, Any] = {}
+            if parse_html:
+                kwargs["parse_mode"] = constants.ParseMode.HTML
+                kwargs["disable_web_page_preview"] = True
+            await self._message.edit_text(text=text, **kwargs)
             self._last_text = text
         except Exception as error:  # noqa: BLE001
             logger.warning(f"Failed to update stage status message: {error}")
@@ -290,17 +418,28 @@ class TelegramStageStatus:
     async def start(self) -> None:
         if not self._enabled:
             return
-        initial_line = "• Accepted request"
+        initial_line = self._build_stage_entry(
+            stage="orchestrator.start",
+            detail="Accepted request.",
+            meta={},
+            timestamp=_utc_now().isoformat().replace("+00:00", "Z"),
+        )
         self._lines = [initial_line]
         text = self._render()
         try:
             if self._reply_message is not None:
-                self._message = await self._reply_message.reply_text(text=text)
+                self._message = await self._reply_message.reply_text(
+                    text=text,
+                    parse_mode=constants.ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
             else:
                 self._message = await self._context.bot.send_message(
                     chat_id=self._chat_id,
                     message_thread_id=self._thread_id,
                     text=text,
+                    parse_mode=constants.ParseMode.HTML,
+                    disable_web_page_preview=True,
                 )
             self._last_text = text
         except Exception as error:  # noqa: BLE001
@@ -314,35 +453,22 @@ class TelegramStageStatus:
         stage = str(payload.get("stage") or "").strip()
         detail = str(payload.get("detail") or "").strip()
         meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        timestamp = payload.get("timestamp")
+        if stage and not self._stage_visible(stage, meta):
+            return
 
-        label = _ORCHESTRATION_STAGE_LABELS.get(stage, stage if stage else "Processing")
-        line = f"• {label}"
-        if detail:
-            line = f"{line} — {detail}"
-
-        requested_tool_calls = meta.get("requested_tool_calls")
-        executed_tool_calls = meta.get("executed_tool_calls")
-        if isinstance(requested_tool_calls, int) and isinstance(executed_tool_calls, int):
-            line = f"{line} (requested: {requested_tool_calls}, executed: {executed_tool_calls})"
-        tool_calls = meta.get("tool_calls")
-        if isinstance(tool_calls, int) and not (isinstance(requested_tool_calls, int) and isinstance(executed_tool_calls, int)):
-            line = f"{line} (tool calls: {tool_calls})"
-        selected_model = str(meta.get("selected_model") or "").strip()
-        if selected_model:
-            line = f"{line} [model: {selected_model}]"
-
-        entry = line
-        if self._show_json_details and "json" in meta:
-            entry = f"{line}\n{self._render_json_block(meta.get('json'))}"
+        entry = self._build_stage_entry(stage=stage, detail=detail, meta=meta, timestamp=timestamp)
+        if self._show_json_details and self._detail_level == "debug" and "json" in meta:
+            entry = f"{entry}\n{self._render_json_block(meta.get('json'))}"
 
         if self._lines and self._lines[-1] == entry:
             return
-        self._lines.append(entry)
-        await self._safe_edit(self._render())
+        self._lines = [entry]
+        await self._safe_edit(self._render(), parse_html=True)
 
     async def finalize(self, final_text: str):
         if self._message is not None:
-            await self._safe_edit(final_text)
+            await self._safe_edit(final_text, parse_html=False)
             return self._message
 
         if self._reply_message is not None:
@@ -2179,6 +2305,7 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_message=None,
         enabled=_runtime_bool("telegram.show_stage_progress", True),
         show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
+        detail_level=_runtime_str("telegram.stage_detail_level", "minimal"),
     )
     await stageStatus.start()
 
@@ -2324,6 +2451,7 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_message=message,
         enabled=_runtime_bool("telegram.show_stage_progress", True),
         show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
+        detail_level=_runtime_str("telegram.stage_detail_level", "minimal"),
     )
     await stageStatus.start()
 
@@ -2681,6 +2809,7 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_message=None,
         enabled=_runtime_bool("telegram.show_stage_progress", True),
         show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
+        detail_level=_runtime_str("telegram.stage_detail_level", "minimal"),
     )
     await stageStatus.start()
 
