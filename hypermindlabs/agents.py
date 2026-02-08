@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 import inspect
 import json
 import logging
+import re
 import requests
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
@@ -105,16 +106,178 @@ def _routing_from_error(error: Exception) -> dict[str, Any]:
     return {"errors": [str(error)], "status": "failed_all_candidates"}
 
 
+_ALLOWED_TOOL_HINTS = {"braveSearch", "chatHistorySearch", "knowledgeSearch", "skipTools"}
+_DIAGNOSTIC_REQUEST_PATTERNS = (
+    r"\bdebug\b",
+    r"\btrace\b",
+    r"\binternal\b",
+    r"\borchestrat(?:e|ion)\b",
+    r"\bstage(?:s)?\b",
+    r"\btool call(?:s)?\b",
+    r"\bshow .*reasoning\b",
+)
+_META_LEAK_PATTERNS = (
+    r"\bone agent of many agents\b",
+    r"\bfuture agents?\b",
+    r"\bmessage analysis\b",
+    r"\bknown context\b",
+    r"\btool results?\b",
+    r"\binternal (?:state|notes|thoughts|reasoning)\b",
+    r"\bchain[- ]of[- ]thought\b",
+)
+
+
+def _parse_json_like(text: str) -> dict[str, Any] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _as_text(value: Any, fallback: str = "") -> str:
+    cleaned = str(value if value is not None else "").strip()
+    return cleaned if cleaned else fallback
+
+
+def _as_bool(value: Any, fallback: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return fallback
+
+
+def _as_string_list(value: Any) -> list[str]:
+    output: list[str] = []
+    if isinstance(value, list):
+        source = value
+    elif isinstance(value, str):
+        source = [value]
+    else:
+        return output
+    for item in source:
+        cleaned = _as_text(item)
+        if cleaned and cleaned not in output:
+            output.append(cleaned)
+    return output
+
+
+def _normalize_analysis_payload(raw_analysis_text: str, known_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    parsed = _parse_json_like(raw_analysis_text)
+    payload = parsed if isinstance(parsed, dict) else {}
+    tool_results = payload.get("tool_results")
+    if isinstance(tool_results, dict):
+        payload = tool_results
+
+    context_data = known_context if isinstance(known_context, dict) else {}
+    context_summary = _as_text(payload.get("context_summary"))
+    if not context_summary:
+        member_name = _as_text(context_data.get("member_first_name"), "member")
+        interface_name = _as_text(context_data.get("user_interface"), "unknown")
+        chat_type = _as_text(context_data.get("chat_type"), "member")
+        context_summary = (
+            f"Interface: {interface_name}; chat type: {chat_type}; "
+            f"latest message from: {member_name}."
+        )
+
+    style_raw = payload.get("response_style")
+    style = style_raw if isinstance(style_raw, dict) else {}
+    tone = _as_text(style.get("tone"), "friendly")
+    length = _as_text(style.get("length"), "concise")
+    if length not in {"very_short", "short", "concise", "medium", "detailed"}:
+        length = "concise"
+
+    tool_hints = []
+    for hint in _as_string_list(payload.get("tool_hints")):
+        if hint in _ALLOWED_TOOL_HINTS and hint not in tool_hints:
+            tool_hints.append(hint)
+
+    risk_flags = _as_string_list(payload.get("risk_flags"))
+    topic = _as_text(payload.get("topic"), "general")
+    intent = _as_text(payload.get("intent"), "answer_user")
+
+    return {
+        "topic": topic,
+        "intent": intent,
+        "needs_tools": _as_bool(payload.get("needs_tools"), fallback=False),
+        "tool_hints": tool_hints,
+        "risk_flags": risk_flags,
+        "response_style": {
+            "tone": tone,
+            "length": length,
+        },
+        "context_summary": context_summary,
+    }
+
+
+def _user_requested_diagnostics(message_text: str) -> bool:
+    text = _as_text(message_text).lower()
+    if not text:
+        return False
+    return any(re.search(pattern, text) for pattern in _DIAGNOSTIC_REQUEST_PATTERNS)
+
+
+def _line_has_meta_leak(text: str) -> bool:
+    lowered = _as_text(text).lower()
+    if not lowered:
+        return False
+    return any(re.search(pattern, lowered) for pattern in _META_LEAK_PATTERNS)
+
+
+def _sanitize_final_response(
+    text: str,
+    *,
+    user_message: str = "",
+    allow_internal_diagnostics: bool = False,
+) -> str:
+    raw = str(text or "")
+    if not raw.strip():
+        return raw
+    if allow_internal_diagnostics or _user_requested_diagnostics(user_message):
+        return raw.strip()
+
+    lines = [line for line in raw.splitlines() if line.strip()]
+    filtered = [line for line in lines if not _line_has_meta_leak(line)]
+    cleaned = "\n".join(filtered).strip()
+    if cleaned:
+        return cleaned
+
+    # If every line was meta/internal, return a safe user-facing fallback.
+    return "I can help with that. Could you restate what you want me to focus on?"
+
+
 
 ################
 # ORCHESTRATOR #
 ################
 
 class ConversationOrchestrator:
-    _messages = list()
-    
+
     def __init__(self, message: str, memberID: int, context: dict=None, messageID: int=None, options: dict=None):
-        
+        self._messages: list[Message] = []
+        self._analysisStats: dict[str, Any] = {}
+        self._devStats: dict[str, Any] = {}
+        self._chatResponseMessage = ""
+
         # Get member data to 
         ## A. Make sure they exist in the DB
         ## B. Use member information in context
@@ -243,21 +406,29 @@ class ConversationOrchestrator:
             model=getattr(self._analysisAgent, "_model", None),
         )
 
+        normalizedAnalysis = _normalize_analysis_payload(
+            analysisResponseMessage,
+            knownContext.get("tool_results"),
+        )
+        analysisMessagePayload = {
+            "tool_name": "Message Analysis",
+            "tool_results": normalizedAnalysis,
+        }
+
         #print(ConsoleColors["default"])
-        
-        # TODO Just send the last USER message to the tools followed by the thoughts from analysis agent
+
+        # Feed only a sanitized analysis handoff to the tool stage.
         await self._emit_stage("tools.start", "Evaluating tool calls.")
-        self._toolsAgent = ToolCallingAgent(self._messages, options=self._options)
+        toolStageMessages = list(self._messages)
+        toolStageMessages.append(Message(role="tool", content=json.dumps(analysisMessagePayload)))
+        self._toolsAgent = ToolCallingAgent(toolStageMessages, options=self._options)
         toolResponses = await self._toolsAgent.generateResponse()
         await self._emit_stage(
             "tools.complete",
             "Tool execution stage complete.",
             tool_calls=len(toolResponses),
         )
-        # Non Streaming results
-        # Waited to add the analysis agents response to chat history because it throws off the tool calling agent
-        analysisMessage = Message(role="tool",content=analysisResponseMessage)
-        self._messages.append(analysisMessage)
+        self._messages.append(Message(role="tool", content=json.dumps(analysisMessagePayload)))
 
         for toolResponse in toolResponses:
             self._messages.append(Message(role="tool", content=json.dumps(toolResponse)))
@@ -293,19 +464,26 @@ class ConversationOrchestrator:
                 }
         await self._emit_stage("response.complete", "Final response generated.")
 
-        self._chatResponseMessage = responseMessage
+        allowDiagnostics = bool(self._options.get("allow_internal_diagnostics", False))
+        sanitizedResponseMessage = _sanitize_final_response(
+            responseMessage,
+            user_message=self._message,
+            allow_internal_diagnostics=allowDiagnostics,
+        )
+        if sanitizedResponseMessage != responseMessage:
+            await self._emit_stage("response.sanitized", "Removed internal orchestration artifacts.")
+        self._chatResponseMessage = sanitizedResponseMessage
         #print(ConsoleColors["default"])
 
         if hasattr(self, "_responseID"):
-            print("autogen response ID, store message")
             self.storeResponse(self._responseID)
         
-        assistantMessage = Message(role="assistant", content=responseMessage)
+        assistantMessage = Message(role="assistant", content=sanitizedResponseMessage)
         # Add the final response to the overall chat history (role ASSISTANT)
         self._messages.append(assistantMessage)
         await self._emit_stage("orchestrator.complete", "Completed end-to-end orchestration.")
 
-        return responseMessage
+        return sanitizedResponseMessage
 
     def storeResponse(self, messageID: int=None):
         responseID = messageID if messageID is not None else self._messageID + 1
@@ -815,21 +993,21 @@ class ChatConversationAgent():
 ####################
 
 class ConversationalAgent():
-    _documents = list()
-
     def __init__(self, message_data: str, memberID: int):
         logger.info(f"New instance of the conversational agent.")
         self.messageData = message_data
         self.fromUser = MemberManager().getMemberByID(memberID)
+        self._documents = list()
 
     async def generateResponse(self):
         logger.info(f"Generate a response for the conversational agent via async Ollama call.")
         # This is passed to ollama for the messages array
         messageHistory = []
+        basePrompt = loadAgentSystemPrompt("chat_conversation")
         # First add the system messages to messageHistory
         messageHistory.append({
             "role" : "system",
-            "content" : config.defaults["system_prompt"] + config.defaults["chat_sys_prompt"]
+            "content" : basePrompt
         })
         # Get chat history from new DB
 
@@ -955,10 +1133,11 @@ class ImageAgent():
         logger.info(f"Generating a response for the image agent using Ollama async client.")
         # This is passed to ollama for the messages array
         messageHistory = []
+        basePrompt = loadAgentSystemPrompt("chat_conversation")
         # First add the system messages to messageHistory
         messageHistory.append({
             "role" : "system",
-            "content" : config.defaults["system_prompt"] + config.defaults["chat_sys_prompt"]
+            "content" : basePrompt
         })
 
         # Create new message entity
@@ -1034,14 +1213,13 @@ Foster curiosity and enthusiasm, encouraging interaction without cluttered visua
 DO NOT respond in JSON.
 DO NOT put quotes around the tweet."""
 
-    tweetText = None
-    messageHistory = []
-    
     def __init__(self, message_data: str, from_user: dict):
         logger.info(f"New instance of the tweet Agent.")
         self.messageData = message_data
         self.fromUser = from_user
         self.tweetPrompt = message_data.get("tweet_prompt")
+        self.tweetText = None
+        self.messageHistory = []
         
         # Start the message history with the system prompts
         self.messageHistory.append({

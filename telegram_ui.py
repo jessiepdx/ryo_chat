@@ -62,7 +62,13 @@ from hypermindlabs.utils import (
     SpamManager,
     UsageManager
 )
-from hypermindlabs.agents import ConversationOrchestrator, ConversationalAgent, ImageAgent, TweetAgent
+from hypermindlabs.agents import (
+    ConversationOrchestrator,
+    ConversationalAgent,
+    ImageAgent,
+    TweetAgent,
+    loadAgentSystemPrompt,
+)
 
 
 
@@ -134,6 +140,20 @@ def _runtime_bool(path: str, default: bool) -> bool:
     return config.runtimeBool(path, default)
 
 
+def _default_generate_system_prompt() -> str:
+    try:
+        prompt = str(loadAgentSystemPrompt("chat_conversation") or "").strip()
+        if prompt:
+            return prompt
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"Falling back to default generate prompt after policy load failure: {error}")
+
+    fallback = config.defaults.get("system_prompt")
+    if isinstance(fallback, str) and fallback.strip():
+        return fallback.strip()
+    return "You are a helpful AI assistant."
+
+
 def _message_word_threshold() -> int:
     return _runtime_int("conversation.community_score_message_word_threshold", 20)
 
@@ -167,6 +187,7 @@ _ORCHESTRATION_STAGE_LABELS = {
     "tools.complete": "Tools complete",
     "response.start": "Generating response",
     "response.complete": "Response generated",
+    "response.sanitized": "Sanitized response",
     "orchestrator.complete": "Wrapping up",
 }
 
@@ -622,7 +643,7 @@ async def skip_systemPrompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Store the system prompt
     gd = context.chat_data.get("generate_data")
-    gd["system_prompt"] = config.defaults["generate_sys_prompt"]
+    gd["system_prompt"] = ""
 
     try:
         # Get the prompt
@@ -646,7 +667,12 @@ async def setPrompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topicID = message.message_thread_id if message.is_topic_message else None
 
     gd = context.chat_data.get("generate_data")
-    systemPromptText = config.defaults["system_prompt"] + gd["system_prompt"]
+    userSystemPrompt = str(gd.get("system_prompt") or "").strip()
+    baseSystemPrompt = _default_generate_system_prompt()
+    if userSystemPrompt:
+        systemPromptText = f"{baseSystemPrompt}\n\nAdditional user instruction:\n{userSystemPrompt}"
+    else:
+        systemPromptText = baseSystemPrompt
     
     generateClient = AsyncClient(host=config.inference["generate"]["url"])
     
