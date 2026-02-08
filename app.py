@@ -533,10 +533,10 @@ def sync_agent_policies_from_runtime_models(
     unchanged = 0
     failures: list[str] = []
     for policy_name in policy_names:
-        policy_payload = manager.load_policy(policy_name=policy_name, strict=False, strict_model_check=False)
-        existing_allowed = _dedupe_models(
-            policy_payload.get("allowed_models") if isinstance(policy_payload.get("allowed_models"), list) else []
-        )
+        policy_payload = load_json(_policy_file_path(policy_name), fallback={})
+        if not isinstance(policy_payload, dict):
+            policy_payload = {}
+        existing_allowed = _policy_models_from_payload(policy_payload)
         generated_allowed = _generated_allowed_models_for_policy(
             policy_name,
             config_data=config_data,
