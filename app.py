@@ -2139,6 +2139,17 @@ class InterfaceWatchdog:
             state = self._routes.get(key)
             if state is None:
                 return False
+
+            # Manual interface routes should be launched in a transient terminal
+            # instead of a detached watchdog process with stdin=DEVNULL.
+            if key in {"cli", "x"} and not bool(state.spec.restart_on_exit):
+                self._cleanup_process(state)
+                opened, message = _launch_script_in_transient_terminal(key, state.spec.script)
+                state.desired = False
+                state.last_exit_code = None if opened else 1
+                self._set_event(state, message if opened else f"launch failed: {message}")
+                return opened
+
             state.desired = True
             if state.process is not None and state.process.poll() is None:
                 self._set_event(state, "already running")
@@ -2639,9 +2650,9 @@ def _route_access_summary(
             else "telegram link unavailable (set bot_token or bot_name in config.json)"
         )
     if route_key == "cli":
-        return "interactive terminal launch available (press r)"
+        return "interactive terminal launch available (press r or start)"
     if route_key == "x":
-        return "interactive terminal launch available (press r)"
+        return "interactive terminal launch available (press r or start)"
     return "no interface action available"
 
 
@@ -3910,7 +3921,7 @@ def watchdog_dashboard_curses(
                 stdscr,
                 7,
                 0,
-                "Controls: Up/Down select | Enter config | p policy editor | r open interface | Space toggle | s start | x stop | a/o auto-all | l logs | q quit",
+                "Controls: Up/Down select | Enter config | p policy editor | r open interface | Space toggle | s start (manual opens terminal) | x stop | a/o auto-all | l logs | q quit",
             )
             _safe_addstr(stdscr, 8, 0, f"Status: {last_status_text}")
             _safe_addstr(stdscr, 10, 0, "Route      Desired Running PID      User      Uptime   Restarts LastExit Policy  State")

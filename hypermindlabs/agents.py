@@ -281,6 +281,26 @@ def _coerce_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _coerce_message_list(value: Any) -> list[Message]:
+    output: list[Message] = []
+    if not isinstance(value, list):
+        return output
+
+    for item in value:
+        role = ""
+        content = ""
+        if isinstance(item, dict):
+            role = _as_text(item.get("role"))
+            content = _as_text(item.get("content"))
+        else:
+            role = _as_text(getattr(item, "role", ""))
+            content = _as_text(getattr(item, "content", ""))
+
+        if role and content:
+            output.append(Message(role=role, content=content))
+    return output
+
+
 def _stream_log_snippet(value: Any, max_chars: int = 160) -> str:
     text = str(value or "").replace("\n", "\\n").replace("\r", "\\r").strip()
     if max_chars <= 0:
@@ -1076,19 +1096,32 @@ class ConversationOrchestrator:
         self._devStats: dict[str, Any] = {}
         self._chatResponseMessage = ""
 
-        # Get member data to 
-        ## A. Make sure they exist in the DB
-        ## B. Use member information in context
-        self._memberData = members.getMemberByID(memberID)
         self._message = message
         self._messageID = messageID
-        #self._context = context
+        self._context = context if isinstance(context, dict) else {}
         self._options = options if isinstance(options, dict) else {}
         stageCallback = self._options.get("stage_callback")
         self._stage_callback = stageCallback if callable(stageCallback) else None
+        self._transientSession = _as_bool(
+            self._options.get("transient_session"),
+            fallback=_as_bool(self._context.get("guest_mode"), False),
+        )
+
+        # Resolve member context. Transient sessions avoid DB-backed identity lookup.
+        if self._transientSession:
+            self._memberData = {
+                "first_name": _as_text(self._context.get("member_first_name"), "Guest"),
+                "username": _as_text(self._context.get("telegram_username"), "guest"),
+            }
+        else:
+            resolvedMember = members.getMemberByID(memberID)
+            self._memberData = (
+                resolvedMember
+                if isinstance(resolvedMember, dict)
+                else {"first_name": "Member", "username": ""}
+            )
 
         # Check the context and get a short collection of recent chat history into the orchestrator's messages list
-        self._context = context if isinstance(context, dict) else {}
         self._chatHostID = self._context.get("chat_host_id")
         self._chatType = self._context.get("chat_type")
         self._communityID = self._context.get("community_id")
@@ -1107,8 +1140,19 @@ class ConversationOrchestrator:
         if self._messageTimestamp is None:
             self._messageTimestamp = self._messageReceivedTimestamp
         self._shortHistory: list[dict[str, Any]] = []
+        if self._transientSession:
+            seedMessages = _coerce_message_list(self._options.get("transient_messages"))
+            if seedMessages:
+                self._messages.extend(seedMessages)
+            if self._messageID is None:
+                transientMessageID = self._options.get("message_id")
+                try:
+                    self._messageID = int(transientMessageID) if transientMessageID is not None else 1
+                except (TypeError, ValueError):
+                    self._messageID = 1
+            self._responseID = int(self._messageID) + 1
 
-        if self._chatHostID is None:
+        if self._chatHostID is None and not self._transientSession:
             if self._communityID is None:
                 self._chatHostID = memberID
                 self._chatType = "member"
@@ -1119,7 +1163,7 @@ class ConversationOrchestrator:
         # Get the most recent chat history records for the given context
         availablePlatforms = ["cli", "telegram"]
         availableChatTypes = ["member", "community"]
-        if self._platform in availablePlatforms and self._chatType in availableChatTypes:
+        if (not self._transientSession) and self._platform in availablePlatforms and self._chatType in availableChatTypes:
             shortHistoryLimit = _runtime_int("retrieval.conversation_short_history_limit", 20)
             shortHistory = chatHistory.getChatHistory(
                 self._chatHostID,
@@ -1142,17 +1186,20 @@ class ConversationOrchestrator:
         # Add the newest message to local list and the database
         newMessage = Message(role="user", content=message)
         self._messages.append(newMessage)
-        # Need to update this to pass all the available context, such as community_id, topic_id... even if None
-        self._promptHistoryID = chatHistory.addChatHistory(
-            messageID=self._messageID, 
-            messageText=self._message, 
-            platform=self._platform, 
-            memberID=memberID, 
-            communityID=self._communityID,
-            chatHostID=self._chatHostID,
-            topicID=self._topicID,
-            timestamp=self._messageTimestamp,
-        )
+        if self._transientSession:
+            self._promptHistoryID = None
+        else:
+            # Need to update this to pass all the available context, such as community_id, topic_id... even if None
+            self._promptHistoryID = chatHistory.addChatHistory(
+                messageID=self._messageID, 
+                messageText=self._message, 
+                platform=self._platform, 
+                memberID=memberID, 
+                communityID=self._communityID,
+                chatHostID=self._chatHostID,
+                topicID=self._topicID,
+                timestamp=self._messageTimestamp,
+            )
 
         # TODO Check options and pass to agents if necessary
         
@@ -1497,7 +1544,7 @@ class ConversationOrchestrator:
         self._chatResponseMessage = sanitizedResponseMessage
         #print(ConsoleColors["default"])
 
-        if hasattr(self, "_responseID"):
+        if hasattr(self, "_responseID") and not self._transientSession:
             self.storeResponse(self._responseID)
         
         assistantMessage = Message(role="assistant", content=sanitizedResponseMessage)
@@ -1519,6 +1566,9 @@ class ConversationOrchestrator:
         return sanitizedResponseMessage
 
     def storeResponse(self, messageID: int=None):
+        if self._transientSession:
+            self._responseHistoryID = None
+            return
         responseID = messageID if messageID is not None else self._messageID + 1
         self._responseHistoryID = chatHistory.addChatHistory(
             messageID=responseID, 
