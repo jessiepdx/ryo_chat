@@ -20,7 +20,8 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 import requests
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, AsyncIterator
 from hypermindlabs.model_router import ModelExecutionError, ModelRouter
 from hypermindlabs.policy_manager import PolicyManager, PolicyValidationError
 from hypermindlabs.tool_registry import (
@@ -65,6 +66,30 @@ logger = logging.getLogger(__name__)
 
 # Set timezone for time
 timezone(-timedelta(hours=7), "Pacific")
+
+
+def _fallback_stream(message_text: str) -> AsyncIterator[Any]:
+    async def _stream():
+        yield SimpleNamespace(
+            message=SimpleNamespace(content=message_text),
+            done=True,
+            total_duration=0,
+            load_duration=0,
+            prompt_eval_count=0,
+            prompt_eval_duration=0,
+            eval_count=0,
+            eval_duration=0,
+        )
+
+    return _stream()
+
+
+def _routing_from_error(error: Exception) -> dict[str, Any]:
+    if isinstance(error, ModelExecutionError):
+        metadata = getattr(error, "metadata", None)
+        if isinstance(metadata, dict):
+            return metadata
+    return {"errors": [str(error)], "status": "failed_all_candidates"}
 
 
 
@@ -479,6 +504,9 @@ class ToolCallingAgent():
             logger.error(f"Tool calling model execution failed:\n{error}")
             logger.error(f"Routing metadata:\n{getattr(error, 'metadata', {})}")
             return list()
+        except Exception as error:  # noqa: BLE001
+            logger.error(f"Tool calling model execution failed unexpectedly:\n{error}")
+            return list()
 
         logger.info(f"Tool calling route metadata:\n{self._routing}")
         toolResults = list()
@@ -568,14 +596,22 @@ class MessageAnalysisAgent():
         
     async def generateResponse(self):
         logger.info(f"Generate a response for the message analysis agent.")
-        self._response, self._routing = await self._modelRouter.chat_with_fallback(
-            capability="analysis",
-            requested_model=self._model,
-            allowed_models=self._allowed_models,
-            messages=self._messages,
-            stream=True,
-            format="json",
-        )
+        try:
+            self._response, self._routing = await self._modelRouter.chat_with_fallback(
+                capability="analysis",
+                requested_model=self._model,
+                allowed_models=self._allowed_models,
+                messages=self._messages,
+                stream=True,
+                format="json",
+            )
+        except Exception as error:  # noqa: BLE001
+            self._routing = _routing_from_error(error)
+            logger.error(f"Message analysis model execution failed:\n{error}")
+            logger.error(f"Routing metadata:\n{self._routing}")
+            self._response = _fallback_stream(
+                '{"analysis":"unavailable","reason":"all_candidate_models_failed"}'
+            )
         logger.info(f"Message analysis route metadata:\n{self._routing}")
         return self._response
     
@@ -623,13 +659,21 @@ class DevTestAgent():
         
     async def generateResponse(self):
         logger.info(f"Generate a response for the dev test agent.")
-        self._response, self._routing = await self._modelRouter.chat_with_fallback(
-            capability="dev_test",
-            requested_model=self._model,
-            allowed_models=self._allowed_models,
-            messages=self._messages,
-            stream=True,
-        )
+        try:
+            self._response, self._routing = await self._modelRouter.chat_with_fallback(
+                capability="dev_test",
+                requested_model=self._model,
+                allowed_models=self._allowed_models,
+                messages=self._messages,
+                stream=True,
+            )
+        except Exception as error:  # noqa: BLE001
+            self._routing = _routing_from_error(error)
+            logger.error(f"Dev test model execution failed:\n{error}")
+            logger.error(f"Routing metadata:\n{self._routing}")
+            self._response = _fallback_stream(
+                "I could not complete the dev-test response because all configured models failed."
+            )
         logger.info(f"Dev test route metadata:\n{self._routing}")
         return self._response
     
@@ -677,13 +721,21 @@ class ChatConversationAgent():
         
     async def generateResponse(self):
         logger.info(f"Generate a response for the chat conversation agent.")
-        self._response, self._routing = await self._modelRouter.chat_with_fallback(
-            capability="chat",
-            requested_model=self._model,
-            allowed_models=self._allowed_models,
-            messages=self._messages,
-            stream=True,
-        )
+        try:
+            self._response, self._routing = await self._modelRouter.chat_with_fallback(
+                capability="chat",
+                requested_model=self._model,
+                allowed_models=self._allowed_models,
+                messages=self._messages,
+                stream=True,
+            )
+        except Exception as error:  # noqa: BLE001
+            self._routing = _routing_from_error(error)
+            logger.error(f"Chat conversation model execution failed:\n{error}")
+            logger.error(f"Routing metadata:\n{self._routing}")
+            self._response = _fallback_stream(
+                "I could not generate a full response because all configured models are unavailable right now."
+            )
         logger.info(f"Chat conversation route metadata:\n{self._routing}")
         return self._response
     

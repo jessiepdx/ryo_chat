@@ -6,7 +6,7 @@ This document is the operator-facing prerequisite layer for RYO startup, setup, 
 
 | Runtime | Hard Requirements | Optional Features | Graceful/Degraded Behavior |
 | --- | --- | --- | --- |
-| `scripts/setup_wizard.py` | Python deps installed, writable `config.json` path, `config.empty.json` available for first run | `curses` UI, `.env` write (`--write-env`), Ollama model probe | Falls back to plain prompts if curses is unavailable; model probe errors do not block save |
+| `scripts/setup_wizard.py` | Python deps installed, writable `config.json` path, `config.empty.json` available for first run | `curses` UI, `.env` write (`--write-env`), Ollama model probe, immediate DB bootstrap (`--bootstrap-postgres`) | Falls back to plain prompts if curses is unavailable; model probe errors do not block save |
 | `cli_ui.py` | Valid `config.json`, PostgreSQL reachable through `database` or configured fallback route, Ollama tool host reachable (`inference.tool.url`) | Brave search API key | Conversation continues when Brave key is missing; explicit `/search` command may fail without key |
 | `web_ui.py` (core site) | Valid `config.json`, PostgreSQL route available, `logs/` exists | Telegram miniapp login | Core routes continue even when miniapp login is unavailable |
 | `web_ui.py` (`/miniapp-login`) | Valid Telegram bot token and miniapp payload | N/A | Returns `503` when Telegram config is incomplete; returns `400` when payload is missing |

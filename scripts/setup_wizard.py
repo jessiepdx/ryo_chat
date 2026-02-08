@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -90,6 +91,39 @@ def save_partial_state(path: Path, state: dict) -> None:
 def clear_partial_state(path: Path) -> None:
     if path.exists():
         path.unlink()
+
+
+def resolve_bootstrap_target(config_data: dict, explicit_target: str | None = None) -> str:
+    if explicit_target in {"primary", "fallback", "both"}:
+        return explicit_target
+    fallback = config_data.get("database_fallback")
+    if isinstance(fallback, dict) and bool(fallback.get("enabled")):
+        return "both"
+    return "primary"
+
+
+def run_postgres_bootstrap(
+    config_path: Path,
+    target: str,
+    use_docker: bool = False,
+) -> tuple[bool, str]:
+    bootstrap_script = Path(__file__).resolve().parent / "bootstrap_postgres.py"
+    command = [
+        sys.executable,
+        str(bootstrap_script),
+        "--config",
+        str(config_path),
+        "--target",
+        target,
+    ]
+    if use_docker:
+        command.append("--docker")
+
+    result = subprocess.run(command, check=False, text=True, capture_output=True)
+    output = "\n".join(
+        chunk for chunk in [result.stdout.strip(), result.stderr.strip()] if chunk
+    )
+    return result.returncode == 0, output
 
 
 def is_valid_http_url(value: str | None) -> bool:
@@ -735,6 +769,8 @@ def build_state_non_interactive(args: argparse.Namespace, config_data: dict) -> 
         "twitter_consumer_secret": args.twitter_consumer_secret if args.twitter_consumer_secret is not None else twitter.get("consumer_secret", ""),
         "twitter_access_token": args.twitter_access_token if args.twitter_access_token is not None else twitter.get("access_token", ""),
         "twitter_access_token_secret": args.twitter_access_token_secret if args.twitter_access_token_secret is not None else twitter.get("access_token_secret", ""),
+        "bootstrap_postgres": bool(args.bootstrap_postgres),
+        "bootstrap_docker": bool(args.bootstrap_docker),
     }
     return state
 
@@ -921,6 +957,20 @@ def build_state_plain_interactive(
             default=_seeded_str(seed_state, "twitter_access_token_secret", str(twitter.get("access_token_secret", ""))),
             required=False,
         )
+        state["write_env"] = _bool_prompt_plain(
+            "Write/update .env from wizard values?",
+            default=_seeded_bool(seed_state, "write_env", args.write_env),
+        )
+        state["bootstrap_postgres"] = _bool_prompt_plain(
+            "Run PostgreSQL + pgvector bootstrap now?",
+            default=_seeded_bool(seed_state, "bootstrap_postgres", args.bootstrap_postgres),
+        )
+        state["bootstrap_docker"] = False
+        if state["bootstrap_postgres"]:
+            state["bootstrap_docker"] = _bool_prompt_plain(
+                "Use dockerized PostgreSQL provisioning?",
+                default=_seeded_bool(seed_state, "bootstrap_docker", args.bootstrap_docker),
+            )
     except KeyboardInterrupt as error:
         if state_path is not None:
             save_partial_state(state_path, state)
@@ -1216,10 +1266,24 @@ def build_state_curses(
             default=_seeded_bool(seed_state, "write_env", args.write_env),
         )
 
+        state["bootstrap_postgres"] = ui.prompt_yes_no(
+            "DB bootstrap",
+            "Run PostgreSQL + pgvector bootstrap after save?",
+            default=_seeded_bool(seed_state, "bootstrap_postgres", args.bootstrap_postgres),
+        )
+        state["bootstrap_docker"] = False
+        if state["bootstrap_postgres"]:
+            state["bootstrap_docker"] = ui.prompt_yes_no(
+                "DB bootstrap",
+                "Use dockerized PostgreSQL provisioning?",
+                default=_seeded_bool(seed_state, "bootstrap_docker", args.bootstrap_docker),
+            )
+
         summary = (
             f"Endpoint: {state['ollama_host']}\n"
             f"Primary DB: {state['db_host']}:{state['db_port']}/{state['db_name']}\n"
             f"Fallback enabled: {state['fallback_enabled']}\n"
+            f"Run DB bootstrap: {state['bootstrap_postgres']}\n"
             "Save changes to config file?"
         )
         confirmed = ui.prompt_yes_no("Confirm", summary, default=True)
@@ -1363,6 +1427,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-path", default=".env", help="Path to .env file to update when writing env values.")
     parser.add_argument("--env-template", default=".env.example", help="Template used when creating .env.")
     parser.add_argument("--write-env", action="store_true", help="Write/update .env with wizard values.")
+    parser.add_argument("--bootstrap-postgres", action="store_true", help="Run PostgreSQL + pgvector bootstrap after writing config.")
+    parser.add_argument("--bootstrap-docker", action="store_true", help="Use dockerized PostgreSQL provisioning when running bootstrap.")
+    parser.add_argument(
+        "--bootstrap-target",
+        choices=("primary", "fallback", "both"),
+        default=None,
+        help="Bootstrap target override. Default: primary unless fallback is enabled, then both.",
+    )
     parser.add_argument(
         "--telegram-only",
         action="store_true",
@@ -1530,6 +1602,33 @@ def main() -> int:
         updates = state_to_env_updates(state, telegram_only=args.telegram_only)
         write_env_with_updates(env_path, env_template, updates)
         print(f"Wrote env values: {env_path}")
+
+    bootstrap_requested = (
+        (not args.telegram_only)
+        and (args.bootstrap_postgres or bool(state.get("bootstrap_postgres", False)))
+    )
+    if bootstrap_requested:
+        bootstrap_target = resolve_bootstrap_target(
+            merged,
+            explicit_target=args.bootstrap_target,
+        )
+        bootstrap_use_docker = args.bootstrap_docker or bool(state.get("bootstrap_docker", False))
+        ok, output = run_postgres_bootstrap(
+            config_path=config_path,
+            target=bootstrap_target,
+            use_docker=bootstrap_use_docker,
+        )
+        print(f"PostgreSQL bootstrap target: {bootstrap_target}")
+        if bootstrap_use_docker:
+            print("PostgreSQL bootstrap mode: docker")
+        else:
+            print("PostgreSQL bootstrap mode: direct host")
+        if output:
+            print(output)
+        if not ok:
+            print("PostgreSQL bootstrap failed; config was saved but bootstrap did not complete.")
+            return 1
+        print("PostgreSQL bootstrap completed successfully.")
 
     if backup:
         print(f"Backed up existing config to: {backup}")

@@ -62,6 +62,12 @@ python3 scripts/setup_wizard.py --non-interactive --strict --ollama-host http://
 
 # telegram key ingress/rotation only (preserves inference/database settings)
 python3 scripts/setup_wizard.py --telegram-only
+
+# run DB bootstrap immediately after setup save
+python3 scripts/setup_wizard.py --bootstrap-postgres
+
+# run DB bootstrap with dockerized local provisioning
+python3 scripts/setup_wizard.py --bootstrap-postgres --bootstrap-docker
 ```
 
 Resume behavior:

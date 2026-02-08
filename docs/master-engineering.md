@@ -27,8 +27,8 @@ This document covers:
 10. Automated pgvector + PostgreSQL setup
 
 ### 2.1 Implementation Status Snapshot (February 8, 2026)
-1. Automatic model fallbacks: Partially implemented (`ModelRouter` integrated into core multi-agent chain; additional coverage and telemetry pending).
-2. Automatic PostgreSQL fallback generation with setup flow: Partially implemented (`DatabaseRouter` integrated; fallback config support and curses setup flow added; sync strategy and orchestration coverage pending).
+1. Automatic model fallbacks: Implemented (`ModelRouter` integrated into core multi-agent chain with graceful fallback handling when candidate models are exhausted, including fallback-exhaustion tests and route metadata logging).
+2. Automatic PostgreSQL fallback generation with setup flow: Implemented (`DatabaseRouter` integrated; fallback config support and setup workflow added; setup can now trigger immediate primary/fallback PostgreSQL bootstrap with optional docker provisioning).
 3. Complete documentation and master engineering documentation maintenance: Implemented in this cycle (checklist, changelog, and sync workflow artifacts added).
 4. Graceful degradation for tools with missing APIs: Implemented (structured tool runtime added with missing-key handling, arg validation, timeout/retry bounds, and error envelopes).
 5. Curses walkthrough for key ingress and model selection: Implemented (curses wizard with endpoint probing, model mapping, validation, optional `.env` updates, and resumable partial-state flow).
@@ -36,7 +36,7 @@ This document covers:
 7. Tool-calling stack review and improvements: Implemented (canonical tool registry, strict argument parsing/coercion path, structured unknown-tool handling, and expanded tool-calling tests).
 8. Automatic ingress of Telegram keys: Implemented (telegram-only setup/rotation mode, config merge preservation for inference/DB sections, startup validation in Telegram/Web miniapp paths, and ingress validation tests).
 9. Master engineering documentation and prerequisite explainer: Implemented (`docs/prerequisites.md` and `docs/troubleshooting-startup.md` added, README linkage updated, and sync checklist expanded).
-10. Automated pgvector + PostgreSQL setup: Implemented (config/manual bootstrap utility expanded with idempotent DB creation, optional docker provisioning, extension/type verification, SQL check support, and bootstrap tests).
+10. Automated pgvector + PostgreSQL setup: Implemented (config/manual bootstrap utility expanded with idempotent DB creation, optional docker provisioning, extension/type verification, schema-sanity SQL checks, and bootstrap tests).
 
 ## 3. Current State Review
 

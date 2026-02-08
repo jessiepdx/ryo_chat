@@ -3,6 +3,7 @@ import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 _SETUP_WIZARD_PATH = Path(__file__).resolve().parents[1] / "scripts" / "setup_wizard.py"
@@ -128,6 +129,41 @@ class TestSetupWizardValidation(unittest.TestCase):
             config_path.write_text("{invalid", encoding="utf-8")
             with self.assertRaises(ValueError):
                 setup_wizard.load_json(config_path)
+
+    def test_resolve_bootstrap_target_prefers_explicit_then_fallback_state(self):
+        config_data = {
+            "database_fallback": {"enabled": True}
+        }
+        self.assertEqual(
+            setup_wizard.resolve_bootstrap_target(config_data, explicit_target="primary"),
+            "primary",
+        )
+        self.assertEqual(
+            setup_wizard.resolve_bootstrap_target(config_data, explicit_target=None),
+            "both",
+        )
+        self.assertEqual(
+            setup_wizard.resolve_bootstrap_target({"database_fallback": {"enabled": False}}, explicit_target=None),
+            "primary",
+        )
+
+    def test_run_postgres_bootstrap_invokes_script_with_expected_flags(self):
+        completed = mock.Mock(returncode=0, stdout="ok", stderr="")
+        with mock.patch.object(setup_wizard.subprocess, "run", return_value=completed) as run_mock:
+            ok, output = setup_wizard.run_postgres_bootstrap(
+                config_path=Path("config.json"),
+                target="both",
+                use_docker=True,
+            )
+
+        self.assertTrue(ok)
+        self.assertIn("ok", output)
+        called = run_mock.call_args.args[0]
+        self.assertTrue(any(str(item).endswith("bootstrap_postgres.py") for item in called))
+        self.assertIn("--config", called)
+        self.assertIn("--target", called)
+        self.assertIn("both", called)
+        self.assertIn("--docker", called)
 
 
 if __name__ == "__main__":

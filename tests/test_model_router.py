@@ -121,6 +121,32 @@ class TestModelRouter(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["attempted_models"], ["m1", "m2"])
         self.assertEqual(metadata["fallback_count"], 1)
 
+    async def test_all_fallbacks_exhausted_raises_model_execution_error(self):
+        host = "http://custom:11434"
+        FakeAsyncClient.model_lists[host] = ["m1", "m2"]
+        FakeAsyncClient.chat_actions[(host, "m1", False)] = RuntimeError("m1 failed")
+        FakeAsyncClient.chat_actions[(host, "m2", False)] = RuntimeError("m2 failed")
+
+        router = mr.ModelRouter(
+            inference_config={"chat": {"url": host, "model": "m1"}},
+            endpoint_override=host,
+        )
+
+        with self.assertRaises(mr.ModelExecutionError) as context:
+            await router.chat_with_fallback(
+                capability="chat",
+                requested_model="m1",
+                allowed_models=["m1", "m2"],
+                messages=[{"role": "user", "content": "hello"}],
+                stream=False,
+            )
+
+        metadata = context.exception.metadata
+        self.assertEqual(metadata["attempted_models"], ["m1", "m2"])
+        self.assertEqual(metadata["selected_model"], "m1")
+        self.assertEqual(metadata["fallback_count"], 0)
+        self.assertEqual(len(metadata["errors"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

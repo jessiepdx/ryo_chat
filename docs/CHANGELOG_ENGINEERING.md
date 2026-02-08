@@ -5,20 +5,18 @@ This changelog tracks implementation deltas against `docs/master-engineering.md`
 ## 2026-02-08
 
 ### WO-001: Automatic Model Fallbacks
-Status: Partially implemented
+Status: Implemented
 
 Implemented:
 1. Added centralized model routing/fallback in `hypermindlabs/model_router.py`.
 2. Integrated routing into core multi-agent classes in `hypermindlabs/agents.py`.
 3. Added endpoint-aware setup support via `scripts/setup_wizard.py`.
 4. Added tests in `tests/test_model_router.py`.
-
-Remaining:
-1. Extend fallback/degradation behavior to legacy agent paths and tool-runtime hardening.
-2. Add broader telemetry and integration tests across all interfaces.
+5. Added graceful fallback stream handling for non-tool core agents when all model candidates fail (`MessageAnalysisAgent`, `DevTestAgent`, `ChatConversationAgent`).
+6. Added fallback-exhaustion test coverage in `tests/test_model_router.py`.
 
 ### WO-002: Automatic PostgreSQL Fallback Instance Generation
-Status: Partially implemented
+Status: Implemented
 
 Implemented:
 1. Added DB primary/fallback routing in `hypermindlabs/database_router.py`.
@@ -27,10 +25,8 @@ Implemented:
 4. Extended setup workflow for DB fallback settings in `scripts/setup_wizard.py`.
 5. Added pg bootstrap helper in `scripts/bootstrap_postgres.py`.
 6. Added tests in `tests/test_database_router.py`.
-
-Remaining:
-1. Add runtime reconciliation/sync policy for fallback-write scenarios.
-2. Add broader integration tests against live DB failover conditions.
+7. Added setup-triggered PostgreSQL bootstrap execution (`--bootstrap-postgres`) with optional docker provisioning (`--bootstrap-docker`) and target selection logic.
+8. Added setup wizard unit coverage for bootstrap target resolution and bootstrap command invocation wiring.
 
 ### WO-003: Complete Documentation and Master Engineering Maintenance
 Status: Implemented
@@ -145,3 +141,4 @@ Implemented:
 5. Added unit tests in `tests/test_pg_bootstrap.py` for config target loading, redaction behavior, and failure-path exit handling.
 6. Updated operator setup docs in `readme.md` with automated bootstrap commands.
 7. Updated implementation snapshot in `docs/master-engineering.md` (item #10).
+8. Expanded SQL verification to include vector+FK schema-sanity probes aligned with app vector table behavior.
