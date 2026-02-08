@@ -33,6 +33,7 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "bootstrap_connect_retries": 15,
         "bootstrap_retry_delay_seconds": 1.0,
         "bootstrap_port_scan_limit": 100,
+        "auto_migrate_on_app_start": True,
     },
     "tool_runtime": {
         "default_timeout_seconds": 8.0,
@@ -151,6 +152,7 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "database.bootstrap_connect_retries": (("RYO_BOOTSTRAP_CONNECT_RETRIES",), "int"),
     "database.bootstrap_retry_delay_seconds": (("RYO_BOOTSTRAP_RETRY_DELAY_SECONDS",), "float"),
     "database.bootstrap_port_scan_limit": (("RYO_BOOTSTRAP_PORT_SCAN_LIMIT",), "int"),
+    "database.auto_migrate_on_app_start": (("RYO_DB_AUTO_MIGRATE_ON_START",), "bool"),
     "tool_runtime.default_timeout_seconds": (("RYO_TOOL_RUNTIME_DEFAULT_TIMEOUT_SECONDS",), "float"),
     "tool_runtime.default_max_retries": (("RYO_TOOL_RUNTIME_DEFAULT_MAX_RETRIES",), "int"),
     "tool_runtime.brave_timeout_seconds": (("RYO_TOOL_RUNTIME_BRAVE_TIMEOUT_SECONDS",), "float"),

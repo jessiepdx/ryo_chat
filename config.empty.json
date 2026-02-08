@@ -84,7 +84,8 @@
       "connect_timeout_seconds": 2,
       "bootstrap_connect_retries": 15,
       "bootstrap_retry_delay_seconds": 1.0,
-      "bootstrap_port_scan_limit": 100
+      "bootstrap_port_scan_limit": 100,
+      "auto_migrate_on_app_start": true
     },
     "tool_runtime": {
       "default_timeout_seconds": 8.0,

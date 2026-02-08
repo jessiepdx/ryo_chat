@@ -82,6 +82,31 @@ logger = logging.getLogger(__name__)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db" / "migrations"
 MIGRATION_TOKEN_PATTERN = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+STARTUP_CORE_MIGRATIONS: tuple[str, ...] = (
+    "001_member_data.sql",
+    "002_member_telegram.sql",
+    "003_member_telegram_user_id_nullable.sql",
+    "004_member_secure.sql",
+    "010_chat_history.sql",
+    "020_community_data.sql",
+    "021_community_telegram.sql",
+    "030_community_score.sql",
+    "050_proposals.sql",
+    "051_proposal_disclosure.sql",
+    "070_inference_usage.sql",
+)
+STARTUP_VECTOR_MIGRATIONS: tuple[str, ...] = (
+    "011_create_vector_extension.sql",
+    "012_chat_history_embeddings.sql",
+    "040_knowledge.sql",
+    "041_knowledge_retrievals.sql",
+    "060_spam.sql",
+)
+VECTOR_DIMENSION_MIGRATIONS: set[str] = {
+    "012_chat_history_embeddings.sql",
+    "040_knowledge.sql",
+    "060_spam.sql",
+}
 
 
 def _render_migration_sql(sql_text: str, context: dict[str, Any] | None = None) -> str:
@@ -106,6 +131,74 @@ def execute_migration(cursor: Any, migration_filename: str, context: dict[str, A
     migration_sql = migration_path.read_text(encoding="utf-8")
     rendered_sql = _render_migration_sql(migration_sql, context=context)
     cursor.execute(rendered_sql)
+
+
+def ensure_startup_database_migrations() -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "route_status": "unknown",
+        "active_target": "unknown",
+        "core_applied": list(),
+        "vector_applied": list(),
+        "core_failed": list(),
+        "vector_failed": list(),
+        "connection_error": None,
+    }
+
+    try:
+        config_manager = ConfigManager()
+        route = config_manager.databaseRoute if isinstance(config_manager.databaseRoute, dict) else {}
+        report["route_status"] = str(route.get("status", "unknown"))
+        report["active_target"] = str(route.get("active_target", "unknown"))
+        conninfo = str(config_manager._instance.db_conninfo or "").strip()
+        vector_dimensions = max(1, config_manager.runtimeInt("vectors.embedding_dimensions", 768))
+    except Exception as error:  # noqa: BLE001
+        report["connection_error"] = str(error)
+        return report
+
+    if not conninfo:
+        report["connection_error"] = "Empty database connection info."
+        return report
+
+    connection = None
+    try:
+        connection = psycopg.connect(conninfo=conninfo)
+        cursor = connection.cursor()
+
+        for migration_filename in STARTUP_CORE_MIGRATIONS:
+            try:
+                execute_migration(cursor, migration_filename)
+                connection.commit()
+                report["core_applied"].append(migration_filename)
+            except (Exception, psycopg.DatabaseError) as error:  # noqa: PERF203
+                connection.rollback()
+                report["core_failed"].append(
+                    {"migration": migration_filename, "error": str(error)}
+                )
+
+        for migration_filename in STARTUP_VECTOR_MIGRATIONS:
+            try:
+                context = (
+                    {"vector_dimensions": vector_dimensions}
+                    if migration_filename in VECTOR_DIMENSION_MIGRATIONS
+                    else None
+                )
+                execute_migration(cursor, migration_filename, context=context)
+                connection.commit()
+                report["vector_applied"].append(migration_filename)
+            except (Exception, psycopg.DatabaseError) as error:  # noqa: PERF203
+                connection.rollback()
+                report["vector_failed"].append(
+                    {"migration": migration_filename, "error": str(error)}
+                )
+
+        cursor.close()
+    except (Exception, psycopg.DatabaseError) as error:
+        report["connection_error"] = str(error)
+    finally:
+        if connection is not None:
+            connection.close()
+
+    return report
 
 
 # NOTE OLD - but other aspects of code still use... Maybe make into a class for dot syntax use

@@ -282,6 +282,56 @@ def run_setup_wizard(non_interactive: bool) -> bool:
     return True
 
 
+def ensure_database_migrations(runtime_settings: dict[str, Any]) -> None:
+    auto_migrate = bool(get_runtime_setting(runtime_settings, "database.auto_migrate_on_app_start", True))
+    if not auto_migrate:
+        print("[db] Auto migration disabled (`runtime.database.auto_migrate_on_app_start=false`).")
+        return
+
+    try:
+        from hypermindlabs.utils import ensure_startup_database_migrations
+    except Exception as error:  # noqa: BLE001
+        print(f"[db] WARNING: unable to import migration runner: {error}")
+        return
+
+    report = ensure_startup_database_migrations()
+    route_status = str(report.get("route_status", "unknown"))
+    active_target = str(report.get("active_target", "unknown"))
+    connection_error = report.get("connection_error")
+    core_applied = report.get("core_applied", [])
+    core_failed = report.get("core_failed", [])
+    vector_applied = report.get("vector_applied", [])
+    vector_failed = report.get("vector_failed", [])
+
+    if connection_error:
+        print(
+            "[db] WARNING: migration connection failed "
+            f"(route={route_status}/{active_target}): {connection_error}"
+        )
+        return
+
+    if core_failed:
+        print(
+            "[db] WARNING: core migration failures detected "
+            f"(route={route_status}/{active_target}, failed={len(core_failed)})."
+        )
+        for item in core_failed:
+            migration_name = str(item.get("migration", "unknown"))
+            error_text = str(item.get("error", "")).splitlines()[0]
+            print(f"  - {migration_name}: {error_text}")
+    else:
+        print(
+            "[db] Core migrations ensured "
+            f"(route={route_status}/{active_target}, applied={len(core_applied)})."
+        )
+
+    if vector_failed:
+        print(
+            "[db] Vector migrations partial/unavailable "
+            f"(applied={len(vector_applied)}, failed={len(vector_failed)})."
+        )
+
+
 def valid_http_url(value: str | None) -> bool:
     if not value:
         return False
@@ -2191,6 +2241,9 @@ def main() -> int:
         if backup:
             print(f"[bootstrap] Backed up config to: {backup}")
         print(f"[bootstrap] Updated config: {CONFIG_FILE}")
+
+    runtime_settings = build_runtime_settings(config_data=config_data)
+    ensure_database_migrations(runtime_settings=runtime_settings)
 
     state["last_run_epoch"] = int(time.time())
     save_state(state)
