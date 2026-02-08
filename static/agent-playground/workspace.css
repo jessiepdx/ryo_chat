@@ -38,6 +38,10 @@
     min-height: 2rem;
 }
 
+#ap-toolbar select {
+    min-width: 11rem;
+}
+
 #ap-run-status {
     display: inline-flex;
     align-items: center;
@@ -52,6 +56,27 @@
 #ap-run-meta {
     font-size: 0.8rem;
     color: var(--accent-midway);
+}
+
+#ap-run-mode-meta {
+    font-size: 0.8rem;
+    color: var(--accent-midway);
+}
+
+.ap-metric-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    border: 1px solid var(--accent-border);
+    border-radius: 999px;
+    padding: 0.2rem 0.55rem;
+    font-size: 0.78rem;
+    background-color: rgba(28, 39, 52, 0.8);
+    color: #d3deea;
+}
+
+.ap-metric-chip strong {
+    color: #8ad5ff;
 }
 
 #ap-grid {
@@ -139,6 +164,22 @@
     font-size: 0.9rem;
 }
 
+.ap-pane-toolbar {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr 1fr;
+    gap: 0.4rem;
+}
+
+.ap-pane-input,
+.ap-pane-select {
+    min-height: 2rem;
+    background-color: #141c27;
+    border: 1px solid var(--accent-border);
+    color: #dce6f0;
+    border-radius: 0.35rem;
+    padding: 0.3rem 0.45rem;
+}
+
 .ap-chat-message {
     border: 1px solid var(--accent-border);
     border-radius: 0.5rem;
@@ -173,10 +214,140 @@
     font-size: 0.85rem;
 }
 
+.ap-trace-headline {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+}
+
 .ap-trace-row.active {
     border-color: #77d7ff;
     box-shadow: inset 0 0 0 1px #77d7ff;
     background-color: #152331;
+}
+
+.ap-row-stage {
+    color: #b2c5db;
+    font-size: 0.78rem;
+    letter-spacing: 0.01rem;
+}
+
+.ap-row-summary {
+    color: #d6e4f3;
+    font-size: 0.8rem;
+}
+
+.ap-badge {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--accent-border);
+    border-radius: 999px;
+    padding: 0.1rem 0.45rem;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04rem;
+    background-color: #223043;
+    color: #dce7f3;
+}
+
+.ap-badge-mono {
+    font-family: "Fira Code", monospace;
+    text-transform: none;
+    letter-spacing: 0;
+    background-color: #162231;
+}
+
+.ap-badge-success {
+    border-color: #3dbb80;
+    color: #a7f8cc;
+    background-color: #1a3328;
+}
+
+.ap-badge-error {
+    border-color: #ca6670;
+    color: #ffc8cf;
+    background-color: #3b2227;
+}
+
+.ap-badge-cancelled {
+    border-color: #c9a161;
+    color: #ffe1b0;
+    background-color: #3a2b18;
+}
+
+.ap-card {
+    border: 1px solid var(--accent-border);
+    border-radius: 0.45rem;
+    padding: 0.55rem;
+    background-color: #131b26;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+
+.ap-card-headline {
+    font-size: 0.78rem;
+    letter-spacing: 0.05rem;
+    text-transform: uppercase;
+    color: #87bddf;
+}
+
+.ap-kv-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.25rem 0.55rem;
+}
+
+.ap-kv-key {
+    color: #8ea7bf;
+    font-size: 0.74rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04rem;
+}
+
+.ap-kv-value {
+    color: #d4e2ef;
+    font-size: 0.77rem;
+    word-break: break-word;
+}
+
+.ap-list {
+    margin: 0;
+    padding-left: 1.1rem;
+    display: grid;
+    gap: 0.3rem;
+    color: #d0deec;
+    font-size: 0.8rem;
+}
+
+.ap-details {
+    border: 1px solid rgba(121, 144, 169, 0.35);
+    border-radius: 0.35rem;
+    padding: 0.2rem 0.45rem;
+    background-color: rgba(14, 21, 30, 0.8);
+}
+
+.ap-details > summary {
+    cursor: pointer;
+    color: #9bb5cd;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04rem;
+}
+
+.ap-inspector-header {
+    display: flex;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+}
+
+.ap-ok {
+    color: #90e2b7;
+}
+
+.ap-error {
+    color: #ff9da7;
 }
 
 .ap-row-meta {
@@ -303,5 +474,9 @@
     #ap-composer-actions {
         width: 100%;
         min-width: 0;
+    }
+
+    .ap-pane-toolbar {
+        grid-template-columns: 1fr;
     }
 }

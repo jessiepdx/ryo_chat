@@ -20,6 +20,31 @@ const modeBuilders = {
     replay: buildReplayPayload,
 };
 
+const fallbackRunModes = [
+    { id: "chat", label: "Chat" },
+    { id: "workflow", label: "Workflow" },
+    { id: "batch", label: "Batch" },
+    { id: "compare", label: "Compare" },
+    { id: "replay", label: "Replay" },
+];
+
+function normalizeRunLabel(run) {
+    if (!run || typeof run !== "object") {
+        return "-";
+    }
+    const runID = String(run.run_id || "");
+    const mode = String(run.mode || "unknown");
+    const status = String(run.status || "unknown");
+    const updated = String(run.updated_at || run.created_at || "").replace("T", " ").replace("Z", "");
+    const shortID = runID ? runID.slice(0, 8) : "run";
+    return `${shortID} | ${mode} | ${status} | ${updated || "-"}`;
+}
+
+function countStatus(metrics, statusKey) {
+    const counts = (metrics && typeof metrics.status_counts === "object") ? metrics.status_counts : {};
+    return Number.parseInt(counts?.[statusKey], 10) || 0;
+}
+
 class AgentPlaygroundApp {
     constructor(rootElement) {
         this.root = rootElement;
@@ -27,6 +52,7 @@ class AgentPlaygroundApp {
         this.eventSource = null;
         this.store = new TraceStore();
         this.bootstrapData = null;
+        this.runHistory = [];
 
         this.chatPane = new ChatPane(document.querySelector("[data-pane='chat']"));
         this.tracePane = new TracePane(document.querySelector("[data-pane='trace']"), (event) => this.onTraceSelect(event));
@@ -36,8 +62,10 @@ class AgentPlaygroundApp {
 
         this.refs = {
             modeSelect: document.getElementById("ap-run-mode"),
+            runHistory: document.getElementById("ap-run-history"),
             runStatus: document.getElementById("ap-run-status"),
             runID: document.getElementById("ap-run-id"),
+            runModeActive: document.getElementById("ap-run-mode-active"),
             input: document.getElementById("ap-input"),
             runBtn: document.getElementById("ap-run-btn"),
             startBtn: document.getElementById("ap-start-btn"),
@@ -47,6 +75,11 @@ class AgentPlaygroundApp {
             resumeBtn: document.getElementById("ap-resume-btn"),
             schemaForm: document.getElementById("ap-schema-form"),
             schemaCapability: document.getElementById("ap-schema-capability"),
+            metricTotal: document.getElementById("ap-metric-total"),
+            metricRunning: document.getElementById("ap-metric-running"),
+            metricAvg: document.getElementById("ap-metric-avg"),
+            metricCompleted: document.getElementById("ap-metric-completed"),
+            metricFailed: document.getElementById("ap-metric-failed"),
         };
 
         this.optionsRenderer = null;
@@ -60,11 +93,13 @@ class AgentPlaygroundApp {
         this.refs.runStatus.textContent = String(text || "Idle");
     }
 
-    setRunID(runID) {
-        if (!this.refs.runID) {
-            return;
+    setRunMeta(run) {
+        if (this.refs.runID) {
+            this.refs.runID.textContent = String(run?.run_id || "-");
         }
-        this.refs.runID.textContent = runID || "-";
+        if (this.refs.runModeActive) {
+            this.refs.runModeActive.textContent = String(run?.mode || "-");
+        }
     }
 
     activeRun() {
@@ -73,6 +108,106 @@ class AgentPlaygroundApp {
 
     activeRunID() {
         return this.activeRun()?.run_id || null;
+    }
+
+    setMetrics(metrics) {
+        const total = Number.parseInt(metrics?.total_runs, 10) || 0;
+        const running = Array.isArray(metrics?.active_runs) ? metrics.active_runs.length : countStatus(metrics, "running");
+        const avgSeconds = Number(metrics?.average_run_seconds || 0);
+        const completed = countStatus(metrics, "completed");
+        const failed = countStatus(metrics, "failed");
+
+        if (this.refs.metricTotal) {
+            this.refs.metricTotal.textContent = String(total);
+        }
+        if (this.refs.metricRunning) {
+            this.refs.metricRunning.textContent = String(running);
+        }
+        if (this.refs.metricAvg) {
+            this.refs.metricAvg.textContent = String(Number.isFinite(avgSeconds) ? avgSeconds.toFixed(2) : "0.00");
+        }
+        if (this.refs.metricCompleted) {
+            this.refs.metricCompleted.textContent = String(completed);
+        }
+        if (this.refs.metricFailed) {
+            this.refs.metricFailed.textContent = String(failed);
+        }
+    }
+
+    populateRunHistory(runs, activeRunID = null) {
+        this.runHistory = Array.isArray(runs) ? runs.slice() : [];
+        if (!this.refs.runHistory) {
+            return;
+        }
+
+        this.refs.runHistory.innerHTML = "";
+        if (this.runHistory.length === 0) {
+            const option = document.createElement("option");
+            option.value = "";
+            option.textContent = "No runs yet";
+            this.refs.runHistory.appendChild(option);
+            this.refs.runHistory.disabled = true;
+            return;
+        }
+
+        this.refs.runHistory.disabled = false;
+        for (const run of this.runHistory) {
+            const option = document.createElement("option");
+            option.value = String(run.run_id || "");
+            option.textContent = normalizeRunLabel(run);
+            this.refs.runHistory.appendChild(option);
+        }
+
+        const preferred = String(activeRunID || this.activeRunID() || this.runHistory[0].run_id || "");
+        if (preferred) {
+            this.refs.runHistory.value = preferred;
+        }
+    }
+
+    upsertRunHistory(run) {
+        if (!run || typeof run !== "object" || !run.run_id) {
+            return;
+        }
+        const runID = String(run.run_id);
+        const nextRuns = this.runHistory.slice();
+        const index = nextRuns.findIndex((item) => String(item.run_id) === runID);
+        if (index >= 0) {
+            nextRuns[index] = run;
+        } else {
+            nextRuns.unshift(run);
+        }
+        nextRuns.sort((left, right) => String(right.updated_at || "").localeCompare(String(left.updated_at || "")));
+        this.populateRunHistory(nextRuns, runID);
+    }
+
+    async refreshRunsList(activeRunID = null) {
+        const response = await fetch(`${this.apiBase}/runs?limit=40`);
+        const payload = await response.json();
+        if (!response.ok || payload.status !== "ok") {
+            return;
+        }
+        this.populateRunHistory(payload.runs || [], activeRunID || this.activeRunID());
+    }
+
+    async refreshMetrics() {
+        const response = await fetch(`${this.apiBase}/metrics`);
+        const payload = await response.json();
+        if (!response.ok || payload.status !== "ok") {
+            return;
+        }
+        this.setMetrics(payload.metrics || {});
+    }
+
+    panelMetrics() {
+        const run = this.store.run || {};
+        return {
+            event_count: this.store.events.length,
+            snapshot_count: this.store.snapshots.length,
+            artifact_count: this.store.artifacts.length,
+            run_status: run.status || "idle",
+            run_mode: run.mode || "-",
+            run_updated_at: run.updated_at || run.created_at || null,
+        };
     }
 
     async loadBootstrap() {
@@ -85,13 +220,15 @@ class AgentPlaygroundApp {
 
         this.populateRunModes(payload.run_modes || []);
         this.configureSchemaForm(payload.manifest || {});
+        this.setMetrics(payload.metrics || {});
 
         const initialRuns = Array.isArray(payload.runs) ? payload.runs : [];
+        this.populateRunHistory(initialRuns);
         if (initialRuns.length > 0) {
             const latest = initialRuns[0];
             this.store.setRun(latest);
             this.statePane.setRun(latest);
-            this.setRunID(latest.run_id);
+            this.setRunMeta(latest);
             this.setStatus(latest.status || "idle");
             await this.refreshRunDetail(latest.run_id);
             if (latest.status === "running") {
@@ -99,6 +236,7 @@ class AgentPlaygroundApp {
             }
         } else {
             this.setStatus("Idle");
+            this.setRunMeta(null);
         }
     }
 
@@ -108,15 +246,7 @@ class AgentPlaygroundApp {
         }
 
         this.refs.modeSelect.innerHTML = "";
-        const modes = Array.isArray(runModes) && runModes.length > 0
-            ? runModes
-            : [
-                { id: "chat", label: "Chat" },
-                { id: "workflow", label: "Workflow" },
-                { id: "batch", label: "Batch" },
-                { id: "compare", label: "Compare" },
-                { id: "replay", label: "Replay" },
-            ];
+        const modes = Array.isArray(runModes) && runModes.length > 0 ? runModes : fallbackRunModes;
 
         for (const mode of modes) {
             const option = document.createElement("option");
@@ -194,15 +324,24 @@ class AgentPlaygroundApp {
     bindEvents() {
         this.refs.runBtn?.addEventListener("click", () => this.startRun());
         this.refs.startBtn?.addEventListener("click", () => this.startRun());
-        this.refs.refreshBtn?.addEventListener("click", () => {
+        this.refs.refreshBtn?.addEventListener("click", async () => {
             const runID = this.activeRunID();
             if (runID) {
-                this.refreshRunDetail(runID);
+                await this.refreshRunDetail(runID);
             }
+            await this.refreshRunsList(runID);
+            await this.refreshMetrics();
         });
         this.refs.cancelBtn?.addEventListener("click", () => this.cancelActiveRun());
         this.refs.replayBtn?.addEventListener("click", () => this.replayActiveRun());
         this.refs.resumeBtn?.addEventListener("click", () => this.resumeActiveRun());
+        this.refs.runHistory?.addEventListener("change", () => {
+            const runID = String(this.refs.runHistory.value || "").trim();
+            if (!runID) {
+                return;
+            }
+            this.refreshRunDetail(runID);
+        });
 
         this.refs.input?.addEventListener("keydown", (event) => {
             if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
@@ -256,6 +395,7 @@ class AgentPlaygroundApp {
         }
 
         this.setStatus("Starting run...");
+        this.chatPane.reset();
 
         const response = await fetch(`${this.apiBase}/runs`, {
             method: "POST",
@@ -276,8 +416,9 @@ class AgentPlaygroundApp {
         this.store.reset();
         this.store.setRun(run);
         this.statePane.setRun(run);
-        this.setRunID(run.run_id);
+        this.setRunMeta(run);
         this.setStatus(run.status || "queued");
+        this.upsertRunHistory(run);
 
         if (payload.message) {
             this.chatPane.addUserMessage(payload.message);
@@ -285,6 +426,7 @@ class AgentPlaygroundApp {
 
         await this.refreshRunDetail(run.run_id);
         this.connectStream(run.run_id);
+        this.refreshMetrics();
     }
 
     onTraceSelect(event) {
@@ -312,20 +454,27 @@ class AgentPlaygroundApp {
                 "Run completed.";
             this.chatPane.finalizeAssistantMessage(String(responseText || ""));
             this.setStatus("Completed");
+            this.refreshMetrics();
+            this.refreshRunsList(event.run_id);
         }
         if (eventType === "run.failed") {
             this.setStatus("Failed");
             this.chatPane.addSystemMessage(`Run failed: ${event.payload?.error || "unknown error"}`);
+            this.refreshMetrics();
+            this.refreshRunsList(event.run_id);
         }
         if (eventType === "run.cancelled") {
             this.setStatus("Cancelled");
             this.chatPane.addSystemMessage("Run cancelled.");
+            this.refreshMetrics();
+            this.refreshRunsList(event.run_id);
         }
 
         if (this.store.selectedSeq === null) {
             this.onTraceSelect(event);
         }
 
+        this.inspectorPane.setMetrics(this.panelMetrics());
         const seq = Number.parseInt(event.seq, 10);
         if (!Number.isNaN(seq) && seq % 5 === 0) {
             this.refreshRunDetail(event.run_id);
@@ -399,20 +548,20 @@ class AgentPlaygroundApp {
         this.statePane.setRun(payload.run);
         this.statePane.setSnapshots(this.store.snapshots);
         this.artifactsPane.setArtifacts(this.store.artifacts);
-        this.inspectorPane.setMetrics({
-            event_count: this.store.events.length,
-            snapshot_count: this.store.snapshots.length,
-            artifact_count: this.store.artifacts.length,
-        });
+        this.inspectorPane.setMetrics(this.panelMetrics());
 
-        this.setRunID(payload.run.run_id);
+        this.setRunMeta(payload.run);
         this.setStatus(payload.run.status || "idle");
+        this.upsertRunHistory(payload.run);
 
         const selected = this.store.getSelectedEvent();
         if (selected) {
             this.tracePane.selectSeq(selected.seq);
             this.statePane.setSelectedEvent(selected);
             this.inspectorPane.setEvent(selected);
+        } else if (this.store.events.length > 0) {
+            const latestEvent = this.store.events[this.store.events.length - 1];
+            this.onTraceSelect(latestEvent);
         }
     }
 
@@ -424,6 +573,8 @@ class AgentPlaygroundApp {
         const payload = await cancelRun(this.apiBase, runID);
         if (payload?.run) {
             await this.refreshRunDetail(payload.run.run_id);
+            await this.refreshMetrics();
+            await this.refreshRunsList(payload.run.run_id);
         }
     }
 
@@ -439,10 +590,12 @@ class AgentPlaygroundApp {
         });
         if (payload?.run?.run_id) {
             this.store.reset();
-            this.setRunID(payload.run.run_id);
+            this.setRunMeta(payload.run);
             this.setStatus(payload.run.status || "queued");
+            this.upsertRunHistory(payload.run);
             await this.refreshRunDetail(payload.run.run_id);
             this.connectStream(payload.run.run_id);
+            this.refreshMetrics();
         }
     }
 
@@ -454,10 +607,12 @@ class AgentPlaygroundApp {
         const payload = await resumeRun(this.apiBase, runID);
         if (payload?.run?.run_id) {
             this.store.reset();
-            this.setRunID(payload.run.run_id);
+            this.setRunMeta(payload.run);
             this.setStatus(payload.run.status || "queued");
+            this.upsertRunHistory(payload.run);
             await this.refreshRunDetail(payload.run.run_id);
             this.connectStream(payload.run.run_id);
+            this.refreshMetrics();
         }
     }
 

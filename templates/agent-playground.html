@@ -13,12 +13,22 @@
         <div class="ap-toolbar-group">
             <label for="ap-run-mode">Run Mode</label>
             <select id="ap-run-mode"></select>
+            <label for="ap-run-history">Run History</label>
+            <select id="ap-run-history"></select>
             <button id="ap-start-btn" type="button">Start Run</button>
             <button id="ap-refresh-btn" type="button">Refresh</button>
         </div>
         <div class="ap-toolbar-group">
             <span id="ap-run-status">Idle</span>
             <span id="ap-run-meta">Run: <span id="ap-run-id">-</span></span>
+            <span id="ap-run-mode-meta">Mode: <span id="ap-run-mode-active">-</span></span>
+        </div>
+        <div class="ap-toolbar-group" id="ap-metrics-row">
+            <span class="ap-metric-chip">Total <strong id="ap-metric-total">0</strong></span>
+            <span class="ap-metric-chip">Running <strong id="ap-metric-running">0</strong></span>
+            <span class="ap-metric-chip">Avg(s) <strong id="ap-metric-avg">0</strong></span>
+            <span class="ap-metric-chip">Completed <strong id="ap-metric-completed">0</strong></span>
+            <span class="ap-metric-chip">Failed <strong id="ap-metric-failed">0</strong></span>
         </div>
     </section>
 
@@ -76,7 +86,7 @@
 
 {% block footer %}
 <div id="ap-composer">
-    <textarea id="ap-input" placeholder="Type a prompt, workflow instruction, or batch lines..."></textarea>
+    <textarea id="ap-input" placeholder="Enter a user prompt. For batch mode, add one input per line. For workflow mode, define stage intent in natural language."></textarea>
     <div id="ap-composer-actions">
         <button id="ap-run-btn" type="button">Run</button>
         <button id="ap-cancel-btn" type="button">Cancel</button>
