@@ -25,6 +25,29 @@
     flex-wrap: wrap;
 }
 
+.ap-toolbar-label {
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08rem;
+    color: var(--accent-midway);
+}
+
+.ap-pane-toggle {
+    min-height: 1.8rem;
+    padding: 0.25rem 0.55rem;
+    border-radius: 999px;
+    border: 1px solid var(--accent-border);
+    background-color: #1a1f25;
+    color: #e8e8e8;
+    font-size: 0.75rem;
+    letter-spacing: 0.04rem;
+}
+
+.ap-pane-toggle.is-active {
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 1px rgba(255, 174, 0, 0.3) inset;
+}
+
 #ap-toolbar label {
     font-size: 0.85rem;
     text-transform: uppercase;
@@ -83,8 +106,9 @@
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: 1.4fr 1fr 1fr;
-    grid-template-rows: minmax(220px, 1fr) minmax(220px, 1fr);
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    grid-auto-rows: minmax(220px, auto);
+    grid-auto-flow: dense;
     gap: var(--micro-rem);
 }
 
@@ -124,6 +148,28 @@
     color: #c8d4e0;
 }
 
+.ap-pane-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+}
+
+.ap-pane-collapse-btn {
+    min-height: 1.65rem;
+    padding: 0.2rem 0.5rem;
+    font-size: 0.68rem;
+    letter-spacing: 0.05rem;
+    text-transform: uppercase;
+    background-color: #151b23;
+    color: #f2f2f2;
+    border: 1px solid var(--accent-border);
+}
+
+.ap-pane-collapse-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
 .ap-pane-body {
     flex: 1;
     min-height: 0;
@@ -135,28 +181,66 @@
 }
 
 #ap-chat-pane {
-    grid-column: 1 / 2;
-    grid-row: 1 / 3;
+    grid-column: span 6;
+    grid-row: span 2;
 }
 
 #ap-trace-pane {
-    grid-column: 2 / 3;
-    grid-row: 1 / 2;
+    grid-column: span 3;
+    grid-row: span 1;
 }
 
 #ap-state-pane {
-    grid-column: 3 / 4;
-    grid-row: 1 / 2;
+    grid-column: span 3;
+    grid-row: span 1;
 }
 
 #ap-artifacts-pane {
-    grid-column: 2 / 3;
-    grid-row: 2 / 3;
+    grid-column: span 3;
+    grid-row: span 1;
 }
 
 #ap-inspector-pane {
-    grid-column: 3 / 4;
-    grid-row: 2 / 3;
+    grid-column: span 3;
+    grid-row: span 1;
+}
+
+.ap-pane-hidden {
+    display: none !important;
+}
+
+.ap-pane-collapsed {
+    min-height: auto;
+}
+
+.ap-pane-collapsed .ap-pane-body {
+    display: none;
+}
+
+.ap-pane-collapsed .ap-pane-header {
+    border-bottom: 0;
+}
+
+#ap-workspace[data-layout="chat_focus"] #ap-chat-pane {
+    grid-column: span 7;
+}
+
+#ap-workspace[data-layout="chat_focus"] #ap-trace-pane,
+#ap-workspace[data-layout="chat_focus"] #ap-state-pane,
+#ap-workspace[data-layout="chat_focus"] #ap-artifacts-pane,
+#ap-workspace[data-layout="chat_focus"] #ap-inspector-pane {
+    grid-column: span 2;
+}
+
+#ap-workspace[data-layout="analysis_focus"] #ap-chat-pane {
+    grid-column: span 4;
+}
+
+#ap-workspace[data-layout="analysis_focus"] #ap-trace-pane,
+#ap-workspace[data-layout="analysis_focus"] #ap-state-pane,
+#ap-workspace[data-layout="analysis_focus"] #ap-artifacts-pane,
+#ap-workspace[data-layout="analysis_focus"] #ap-inspector-pane {
+    grid-column: span 4;
 }
 
 .ap-empty {
@@ -425,38 +509,56 @@
 }
 
 @media (max-width: 1100px) {
+    #ap-toolbar {
+        gap: 0.45rem;
+    }
+
+    #ap-toolbar select {
+        min-width: 9.5rem;
+    }
+
     #ap-grid {
-        grid-template-columns: 1fr 1fr;
-        grid-template-rows: repeat(3, minmax(220px, auto));
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        grid-auto-rows: minmax(210px, auto);
     }
 
     #ap-chat-pane {
-        grid-column: 1 / 3;
-        grid-row: 1 / 2;
+        grid-column: span 6;
+        grid-row: span 1;
     }
 
-    #ap-trace-pane {
-        grid-column: 1 / 2;
-        grid-row: 2 / 3;
-    }
-
+    #ap-trace-pane,
     #ap-state-pane {
-        grid-column: 2 / 3;
-        grid-row: 2 / 3;
+        grid-column: span 3;
+        grid-row: span 1;
     }
 
-    #ap-artifacts-pane {
-        grid-column: 1 / 2;
-        grid-row: 3 / 4;
-    }
-
+    #ap-artifacts-pane,
     #ap-inspector-pane {
-        grid-column: 2 / 3;
-        grid-row: 3 / 4;
+        grid-column: span 3;
+        grid-row: span 1;
     }
 }
 
 @media (max-width: 760px) {
+    #ap-toolbar {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .ap-toolbar-group {
+        width: 100%;
+    }
+
+    #ap-pane-controls {
+        order: 3;
+    }
+
+    .ap-pane-toggle {
+        flex: 1;
+        min-width: 5.2rem;
+    }
+
     #ap-grid {
         display: flex;
         flex-direction: column;

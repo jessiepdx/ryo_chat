@@ -28,6 +28,17 @@ const fallbackRunModes = [
     { id: "replay", label: "Replay" },
 ];
 
+const workspacePrefsStorageKey = "ryo.agent-playground.workspace-prefs.v1";
+const paneDefinitions = Object.freeze([
+    { key: "schema", label: "Schema", elementID: "ap-schema-pane" },
+    { key: "chat", label: "Chat", elementID: "ap-chat-pane" },
+    { key: "trace", label: "Trace", elementID: "ap-trace-pane" },
+    { key: "state", label: "State", elementID: "ap-state-pane" },
+    { key: "artifacts", label: "Artifacts", elementID: "ap-artifacts-pane" },
+    { key: "inspector", label: "Inspector", elementID: "ap-inspector-pane" },
+]);
+const layoutPresets = new Set(["balanced", "chat_focus", "analysis_focus"]);
+
 function normalizeRunLabel(run) {
     if (!run || typeof run !== "object") {
         return "-";
@@ -53,6 +64,12 @@ class AgentPlaygroundApp {
         this.store = new TraceStore();
         this.bootstrapData = null;
         this.runHistory = [];
+        this.panes = new Map(
+            paneDefinitions.map((pane) => [
+                pane.key,
+                { ...pane, element: document.getElementById(pane.elementID) },
+            ]),
+        );
 
         this.chatPane = new ChatPane(document.querySelector("[data-pane='chat']"));
         this.tracePane = new TracePane(document.querySelector("[data-pane='trace']"), (event) => this.onTraceSelect(event));
@@ -75,6 +92,9 @@ class AgentPlaygroundApp {
             resumeBtn: document.getElementById("ap-resume-btn"),
             schemaForm: document.getElementById("ap-schema-form"),
             schemaCapability: document.getElementById("ap-schema-capability"),
+            paneControls: document.getElementById("ap-pane-controls"),
+            layoutPreset: document.getElementById("ap-layout-preset"),
+            layoutReset: document.getElementById("ap-layout-reset"),
             metricTotal: document.getElementById("ap-metric-total"),
             metricRunning: document.getElementById("ap-metric-running"),
             metricAvg: document.getElementById("ap-metric-avg"),
@@ -84,6 +104,193 @@ class AgentPlaygroundApp {
 
         this.optionsRenderer = null;
         this.schemaSources = new Map();
+        this.workspacePrefs = this._loadWorkspacePrefs();
+        this._bindPaneCollapseButtons();
+        this._applyWorkspacePrefs();
+    }
+
+    _defaultWorkspacePrefs() {
+        const visible = {};
+        const collapsed = {};
+        for (const definition of paneDefinitions) {
+            visible[definition.key] = true;
+            collapsed[definition.key] = false;
+        }
+        return {
+            layout: "balanced",
+            visible,
+            collapsed,
+        };
+    }
+
+    _normalizeWorkspacePrefs(rawPrefs) {
+        const defaults = this._defaultWorkspacePrefs();
+        const normalized = {
+            layout: defaults.layout,
+            visible: { ...defaults.visible },
+            collapsed: { ...defaults.collapsed },
+        };
+        if (!rawPrefs || typeof rawPrefs !== "object") {
+            return normalized;
+        }
+
+        const layout = String(rawPrefs.layout || "").trim();
+        if (layoutPresets.has(layout)) {
+            normalized.layout = layout;
+        }
+
+        for (const definition of paneDefinitions) {
+            const key = definition.key;
+            if (rawPrefs.visible && typeof rawPrefs.visible === "object" && key in rawPrefs.visible) {
+                normalized.visible[key] = Boolean(rawPrefs.visible[key]);
+            }
+            if (rawPrefs.collapsed && typeof rawPrefs.collapsed === "object" && key in rawPrefs.collapsed) {
+                normalized.collapsed[key] = Boolean(rawPrefs.collapsed[key]);
+            }
+        }
+
+        if (Object.values(normalized.visible).every((value) => !value)) {
+            normalized.visible.chat = true;
+        }
+
+        return normalized;
+    }
+
+    _loadWorkspacePrefs() {
+        try {
+            const raw = window.localStorage.getItem(workspacePrefsStorageKey);
+            if (!raw) {
+                return this._defaultWorkspacePrefs();
+            }
+            const parsed = JSON.parse(raw);
+            return this._normalizeWorkspacePrefs(parsed);
+        } catch (_error) {
+            return this._defaultWorkspacePrefs();
+        }
+    }
+
+    _saveWorkspacePrefs() {
+        try {
+            window.localStorage.setItem(
+                workspacePrefsStorageKey,
+                JSON.stringify(this.workspacePrefs),
+            );
+        } catch (_error) {
+            return;
+        }
+    }
+
+    _paneVisibleCount() {
+        return Object.values(this.workspacePrefs.visible).filter(Boolean).length;
+    }
+
+    _setLayoutPreset(layoutName) {
+        const normalized = String(layoutName || "").trim();
+        this.workspacePrefs.layout = layoutPresets.has(normalized) ? normalized : "balanced";
+        this._applyWorkspacePrefs();
+        this._saveWorkspacePrefs();
+    }
+
+    _togglePaneVisible(paneKey) {
+        const key = String(paneKey || "").trim();
+        if (!this.panes.has(key)) {
+            return;
+        }
+        const currentlyVisible = Boolean(this.workspacePrefs.visible[key]);
+        if (currentlyVisible && this._paneVisibleCount() <= 1) {
+            this.setStatus("At least one pane must remain visible.");
+            return;
+        }
+        this.workspacePrefs.visible[key] = !currentlyVisible;
+        if (!this.workspacePrefs.visible[key]) {
+            this.workspacePrefs.collapsed[key] = false;
+        }
+        this._applyWorkspacePrefs();
+        this._saveWorkspacePrefs();
+    }
+
+    _togglePaneCollapsed(paneKey) {
+        const key = String(paneKey || "").trim();
+        if (!this.panes.has(key)) {
+            return;
+        }
+        if (!this.workspacePrefs.visible[key]) {
+            return;
+        }
+        this.workspacePrefs.collapsed[key] = !Boolean(this.workspacePrefs.collapsed[key]);
+        this._applyWorkspacePrefs();
+        this._saveWorkspacePrefs();
+    }
+
+    _resetPaneLayout() {
+        this.workspacePrefs = this._defaultWorkspacePrefs();
+        this._applyWorkspacePrefs();
+        this._saveWorkspacePrefs();
+    }
+
+    _bindPaneCollapseButtons() {
+        const controls = document.querySelectorAll("[data-pane-collapse]");
+        for (const control of controls) {
+            control.addEventListener("click", () => {
+                const paneKey = String(control.dataset.paneCollapse || "");
+                this._togglePaneCollapsed(paneKey);
+            });
+        }
+    }
+
+    _renderPaneToggles() {
+        const container = this.refs.paneControls;
+        if (!container) {
+            return;
+        }
+
+        container.innerHTML = "";
+        const label = document.createElement("span");
+        label.className = "ap-toolbar-label";
+        label.textContent = "Panes";
+        container.appendChild(label);
+
+        for (const definition of paneDefinitions) {
+            const key = definition.key;
+            const visible = Boolean(this.workspacePrefs.visible[key]);
+            const toggle = document.createElement("button");
+            toggle.type = "button";
+            toggle.className = `ap-pane-toggle ${visible ? "is-active" : ""}`.trim();
+            toggle.dataset.paneToggle = key;
+            toggle.textContent = definition.label;
+            toggle.title = visible ? "Hide pane" : "Show pane";
+            toggle.addEventListener("click", () => this._togglePaneVisible(key));
+            container.appendChild(toggle);
+        }
+    }
+
+    _applyWorkspacePrefs() {
+        if (this.root) {
+            this.root.dataset.layout = String(this.workspacePrefs.layout || "balanced");
+        }
+
+        if (this.refs.layoutPreset) {
+            this.refs.layoutPreset.value = String(this.workspacePrefs.layout || "balanced");
+        }
+
+        for (const [key, pane] of this.panes.entries()) {
+            if (!pane.element) {
+                continue;
+            }
+            const visible = Boolean(this.workspacePrefs.visible[key]);
+            const collapsed = Boolean(this.workspacePrefs.collapsed[key]);
+            pane.element.classList.toggle("ap-pane-hidden", !visible);
+            pane.element.classList.toggle("ap-pane-collapsed", visible && collapsed);
+
+            const collapseButton = pane.element.querySelector("[data-pane-collapse]");
+            if (collapseButton) {
+                collapseButton.textContent = collapsed ? "Expand" : "Collapse";
+                collapseButton.setAttribute("aria-expanded", collapsed ? "false" : "true");
+                collapseButton.disabled = !visible;
+            }
+        }
+
+        this._renderPaneToggles();
     }
 
     setStatus(text) {
@@ -335,6 +542,12 @@ class AgentPlaygroundApp {
         this.refs.cancelBtn?.addEventListener("click", () => this.cancelActiveRun());
         this.refs.replayBtn?.addEventListener("click", () => this.replayActiveRun());
         this.refs.resumeBtn?.addEventListener("click", () => this.resumeActiveRun());
+        this.refs.layoutPreset?.addEventListener("change", () => {
+            this._setLayoutPreset(this.refs.layoutPreset?.value || "balanced");
+        });
+        this.refs.layoutReset?.addEventListener("click", () => {
+            this._resetPaneLayout();
+        });
         this.refs.runHistory?.addEventListener("change", () => {
             const runID = String(this.refs.runHistory.value || "").trim();
             if (!runID) {

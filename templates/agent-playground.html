@@ -18,6 +18,18 @@
             <button id="ap-start-btn" type="button">Start Run</button>
             <button id="ap-refresh-btn" type="button">Refresh</button>
         </div>
+        <div class="ap-toolbar-group" id="ap-pane-controls">
+            <span class="ap-toolbar-label">Panes</span>
+        </div>
+        <div class="ap-toolbar-group">
+            <label for="ap-layout-preset">Layout</label>
+            <select id="ap-layout-preset">
+                <option value="balanced">Balanced</option>
+                <option value="chat_focus">Chat Focus</option>
+                <option value="analysis_focus">Analysis Focus</option>
+            </select>
+            <button id="ap-layout-reset" type="button">Reset Panes</button>
+        </div>
         <div class="ap-toolbar-group">
             <span id="ap-run-status">Idle</span>
             <span id="ap-run-meta">Run: <span id="ap-run-id">-</span></span>
@@ -35,6 +47,9 @@
     <section class="ap-pane" id="ap-schema-pane">
         <header class="ap-pane-header">
             <div class="ap-pane-title">Schema Driven Config</div>
+            <div class="ap-pane-header-actions">
+                <button class="ap-pane-collapse-btn" type="button" data-pane-collapse="schema" aria-expanded="true">Collapse</button>
+            </div>
         </header>
         <div class="ap-pane-body">
             <div class="ap-toolbar-group">
@@ -49,6 +64,9 @@
         <article class="ap-pane" id="ap-chat-pane">
             <header class="ap-pane-header">
                 <div class="ap-pane-title">Chat / Run</div>
+                <div class="ap-pane-header-actions">
+                    <button class="ap-pane-collapse-btn" type="button" data-pane-collapse="chat" aria-expanded="true">Collapse</button>
+                </div>
             </header>
             <div class="ap-pane-body" data-pane="chat"></div>
         </article>
@@ -56,6 +74,9 @@
         <article class="ap-pane" id="ap-trace-pane">
             <header class="ap-pane-header">
                 <div class="ap-pane-title">Trace / Steps</div>
+                <div class="ap-pane-header-actions">
+                    <button class="ap-pane-collapse-btn" type="button" data-pane-collapse="trace" aria-expanded="true">Collapse</button>
+                </div>
             </header>
             <div class="ap-pane-body" data-pane="trace"></div>
         </article>
@@ -63,6 +84,9 @@
         <article class="ap-pane" id="ap-state-pane">
             <header class="ap-pane-header">
                 <div class="ap-pane-title">State</div>
+                <div class="ap-pane-header-actions">
+                    <button class="ap-pane-collapse-btn" type="button" data-pane-collapse="state" aria-expanded="true">Collapse</button>
+                </div>
             </header>
             <div class="ap-pane-body" data-pane="state"></div>
         </article>
@@ -70,6 +94,9 @@
         <article class="ap-pane" id="ap-artifacts-pane">
             <header class="ap-pane-header">
                 <div class="ap-pane-title">Artifacts</div>
+                <div class="ap-pane-header-actions">
+                    <button class="ap-pane-collapse-btn" type="button" data-pane-collapse="artifacts" aria-expanded="true">Collapse</button>
+                </div>
             </header>
             <div class="ap-pane-body" data-pane="artifacts"></div>
         </article>
@@ -77,6 +104,9 @@
         <article class="ap-pane" id="ap-inspector-pane">
             <header class="ap-pane-header">
                 <div class="ap-pane-title">Inspector</div>
+                <div class="ap-pane-header-actions">
+                    <button class="ap-pane-collapse-btn" type="button" data-pane-collapse="inspector" aria-expanded="true">Collapse</button>
+                </div>
             </header>
             <div class="ap-pane-body" data-pane="inspector"></div>
         </article>

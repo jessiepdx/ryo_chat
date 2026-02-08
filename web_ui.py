@@ -18,6 +18,7 @@
 ###########
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -183,9 +184,23 @@ def _select_bind_port(bind_host: str, starting_port: int, scan_limit: int) -> in
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,96}$")
 
 
-def _set_auth_message(message: str, kind: str = "error") -> None:
+def _set_auth_message(message: str, kind: str = "error", active_tab: str | None = None) -> None:
     session["auth_message"] = str(message)
     session["auth_message_kind"] = str(kind)
+    if active_tab in {"login", "signup"}:
+        session["auth_active_tab"] = active_tab
+
+
+def _database_unavailable() -> bool:
+    route = config.databaseRoute if isinstance(config.databaseRoute, dict) else {}
+    return str(route.get("status", "")).strip().lower() == "failed_all"
+
+
+def _database_unavailable_message() -> str:
+    return (
+        "Account authentication is unavailable while PostgreSQL is unreachable. "
+        "Run app.py setup to repair database connection/auth."
+    )
 
 
 def _normalize_username(value: str | None) -> str:
@@ -276,7 +291,32 @@ availableMenu = [
 ]
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex()
+
+
+def _resolve_web_secret_key() -> str:
+    explicit = str(os.getenv("RYO_WEB_SECRET_KEY") or os.getenv("FLASK_SECRET_KEY") or "").strip()
+    if explicit:
+        return explicit
+
+    # Deterministic fallback prevents session invalidation across watchdog restarts.
+    route = config.databaseRoute if isinstance(config.databaseRoute, dict) else {}
+    seed = "|".join(
+        [
+            str(config.botName or ""),
+            str(config.bot_id or ""),
+            str(config.bot_token or ""),
+            str(route.get("primary_conninfo") or ""),
+        ]
+    )
+    if not seed.strip("|"):
+        seed = secrets.token_hex(32)
+    logger.warning("No RYO_WEB_SECRET_KEY/FLASK_SECRET_KEY configured; using deterministic fallback secret.")
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+app.secret_key = _resolve_web_secret_key()
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 
 @app.before_request
@@ -284,6 +324,7 @@ def loadUser():
     # Build user data and menu data
     g.authMessage = session.pop("auth_message", None)
     g.authMessageKind = session.pop("auth_message_kind", "error")
+    g.authActiveTab = session.pop("auth_active_tab", "login")
     if "member_id" not in session:
         g.memberData = None
         g.menuData = None
@@ -310,6 +351,7 @@ def baseTemplateData():
         "menuData": g.menuData,
         "authMessage": g.authMessage,
         "authMessageKind": g.authMessageKind,
+        "authActiveTab": g.authActiveTab,
         "passwordPolicyHint": _password_policy_hint(),
         "passwordPolicyMinLength": _password_min_length(),
     }
@@ -511,26 +553,38 @@ def miniAppDashboard():
 @app.route("/login", methods=['POST'])
 def login():
     logger.info("Web login requested.")
+    if _database_unavailable():
+        logger.error("Web login blocked: database route unavailable.")
+        _set_auth_message(_database_unavailable_message(), kind="error", active_tab="login")
+        return redirect(url_for("index"))
+
     username = _normalize_username(request.form.get("username"))
     password = str(request.form.get("userpass") or "").strip()
 
     if not username or not password:
-        _set_auth_message("Username and password are required.", kind="error")
+        _set_auth_message("Username and password are required.", kind="error", active_tab="login")
         return redirect(url_for("index"))
 
     member = members.loginMember(username, password)
     if member is None:
-        _set_auth_message("Login failed. Check your username/password.", kind="error")
+        logger.warning("Web login failed for username='%s'.", username)
+        _set_auth_message("Login failed. Check your username/password.", kind="error", active_tab="login")
         return redirect(url_for("index"))
 
     session["member_id"] = member["member_id"]
-    _set_auth_message(f"Welcome back {member.get('first_name', username)}.", kind="success")
+    logger.info("Web login success for member_id=%s username='%s'.", member.get("member_id"), username)
+    _set_auth_message(f"Welcome back {member.get('first_name', username)}.", kind="success", active_tab="login")
     return redirect(url_for("index"))
 
 
 @app.route("/signup", methods=["POST"])
 def signup():
     logger.info("Web signup requested.")
+    if _database_unavailable():
+        logger.error("Web signup blocked: database route unavailable.")
+        _set_auth_message(_database_unavailable_message(), kind="error", active_tab="signup")
+        return redirect(url_for("index"))
+
     username = _normalize_username(request.form.get("username"))
     password = str(request.form.get("userpass") or "").strip()
     passwordConfirm = str(request.form.get("userpass-confirm") or "").strip()
@@ -538,17 +592,21 @@ def signup():
     lastName = str(request.form.get("last_name") or "").strip()
 
     if not username or not password:
-        _set_auth_message("Username and password are required to sign up.", kind="error")
+        _set_auth_message("Username and password are required to sign up.", kind="error", active_tab="signup")
         return redirect(url_for("index"))
     if not _username_is_valid(username):
-        _set_auth_message("Username must be 3-96 chars: letters, numbers, underscore.", kind="error")
+        _set_auth_message(
+            "Username must be 3-96 chars: letters, numbers, underscore.",
+            kind="error",
+            active_tab="signup",
+        )
         return redirect(url_for("index"))
     if password != passwordConfirm:
-        _set_auth_message("Password confirmation does not match.", kind="error")
+        _set_auth_message("Password confirmation does not match.", kind="error", active_tab="signup")
         return redirect(url_for("index"))
     passwordError = _password_policy_error(password)
     if passwordError is not None:
-        _set_auth_message(passwordError, kind="error")
+        _set_auth_message(passwordError, kind="error", active_tab="signup")
         return redirect(url_for("index"))
 
     member, errorMessage = members.registerWebMember(
@@ -558,11 +616,21 @@ def signup():
         lastName=lastName or None,
     )
     if member is None:
-        _set_auth_message(errorMessage or "Signup failed. Please try a different username.", kind="error")
+        logger.warning("Web signup failed for username='%s': %s", username, errorMessage)
+        _set_auth_message(
+            errorMessage or "Signup failed. Please try a different username.",
+            kind="error",
+            active_tab="signup",
+        )
         return redirect(url_for("index"))
 
     session["member_id"] = member["member_id"]
-    _set_auth_message(f"Signup complete. Welcome {member.get('first_name', username)}.", kind="success")
+    logger.info("Web signup success for member_id=%s username='%s'.", member.get("member_id"), username)
+    _set_auth_message(
+        f"Signup complete. Welcome {member.get('first_name', username)}.",
+        kind="success",
+        active_tab="signup",
+    )
     return redirect(url_for("index"))
 
 
