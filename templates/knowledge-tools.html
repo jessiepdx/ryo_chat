@@ -62,9 +62,14 @@
         {% endif %}
     </div>
     <div class="panel-content">
-        <p>Knowledge</p>
-        <p>Sort</p>
-        <p>Panel</p>
+        <section class="ap-side-card">
+            <h4>Knowledge Filters</h4>
+            <ul class="ap-side-list">
+                <li>Browse by configured domain tags.</li>
+                <li>Select an entry to load editor state in the right panel.</li>
+                <li>Save updates with metadata tags for retrieval tuning.</li>
+            </ul>
+        </section>
     </div>
     <div class="panel-footer footer-detached">
     </div>
@@ -149,9 +154,16 @@
 {% block rightBottomPanel %}
 <div id="right-bottom-panel">
     <div class="panel-header">
+        <div class="section-auxiliary">
+            <h3>Knowledge Workflow</h3>
+        </div>
     </div>
-    <div class="panel-content">
-        <b>Knowledge Tools</b> - all the Knowledge display we want in the <i>bottom</i> panel
+    <div class="panel-content ap-side-layout">
+        <ul class="ap-side-list">
+            <li>Create or edit entries with domain tags and clear source text.</li>
+            <li>Use concise, factual knowledge chunks for better retrieval quality.</li>
+            <li>Re-run retrieval checks after updates to validate matching behavior.</li>
+        </ul>
     </div>
     <div class="panel-footer">
     </div>

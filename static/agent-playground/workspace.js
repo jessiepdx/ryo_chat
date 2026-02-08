@@ -56,6 +56,17 @@ function countStatus(metrics, statusKey) {
     return Number.parseInt(counts?.[statusKey], 10) || 0;
 }
 
+function shortText(value, maxLength = 220) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (!text) {
+        return "-";
+    }
+    if (text.length <= maxLength) {
+        return text;
+    }
+    return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
 class AgentPlaygroundApp {
     constructor(rootElement) {
         this.root = rootElement;
@@ -95,6 +106,19 @@ class AgentPlaygroundApp {
             paneControls: document.getElementById("ap-pane-controls"),
             layoutPreset: document.getElementById("ap-layout-preset"),
             layoutReset: document.getElementById("ap-layout-reset"),
+            modelRequestedInput: document.getElementById("ap-model-requested-input"),
+            modelRequestedSelect: document.getElementById("ap-model-requested-select"),
+            modelSourceHint: document.getElementById("ap-model-source-hint"),
+            sideRunID: document.getElementById("ap-side-run-id"),
+            sideRunStatus: document.getElementById("ap-side-run-status"),
+            sideRunMode: document.getElementById("ap-side-run-mode"),
+            sideRunModel: document.getElementById("ap-side-run-model"),
+            sideRunEvents: document.getElementById("ap-side-run-events"),
+            sideEventSeq: document.getElementById("ap-side-event-seq"),
+            sideEventType: document.getElementById("ap-side-event-type"),
+            sideEventStage: document.getElementById("ap-side-event-stage"),
+            sideEventStatus: document.getElementById("ap-side-event-status"),
+            sideEventSummary: document.getElementById("ap-side-event-summary"),
             metricTotal: document.getElementById("ap-metric-total"),
             metricRunning: document.getElementById("ap-metric-running"),
             metricAvg: document.getElementById("ap-metric-avg"),
@@ -104,6 +128,7 @@ class AgentPlaygroundApp {
 
         this.optionsRenderer = null;
         this.schemaSources = new Map();
+        this.modelInventory = [];
         this.workspacePrefs = this._loadWorkspacePrefs();
         this._bindPaneCollapseButtons();
         this._applyWorkspacePrefs();
@@ -307,6 +332,7 @@ class AgentPlaygroundApp {
         if (this.refs.runModeActive) {
             this.refs.runModeActive.textContent = String(run?.mode || "-");
         }
+        this.renderSideRunSummary(run || null);
     }
 
     activeRun() {
@@ -417,6 +443,174 @@ class AgentPlaygroundApp {
         };
     }
 
+    requestedModelValue() {
+        return String(this.refs.modelRequestedInput?.value || "").trim();
+    }
+
+    setRequestedModelValue(value) {
+        const requested = String(value || "").trim();
+        if (this.refs.modelRequestedInput) {
+            this.refs.modelRequestedInput.value = requested;
+        }
+        this.syncModelSelectToInput();
+    }
+
+    syncModelSelectToInput() {
+        if (!this.refs.modelRequestedSelect) {
+            return;
+        }
+        const requested = this.requestedModelValue();
+        if (!requested) {
+            this.refs.modelRequestedSelect.value = "";
+            return;
+        }
+        const exact = this.modelInventory.find((modelName) => modelName === requested);
+        this.refs.modelRequestedSelect.value = exact ? exact : "__custom__";
+    }
+
+    populateModelSelect(models, defaultModel = "") {
+        if (!this.refs.modelRequestedSelect) {
+            return;
+        }
+
+        this.modelInventory = Array.isArray(models)
+            ? [...new Set(models.map((item) => String(item || "").trim()).filter(Boolean))]
+            : [];
+
+        const select = this.refs.modelRequestedSelect;
+        select.innerHTML = "";
+
+        const defaultsOption = document.createElement("option");
+        defaultsOption.value = "";
+        defaultsOption.textContent = "Use Router Default";
+        select.appendChild(defaultsOption);
+
+        const customOption = document.createElement("option");
+        customOption.value = "__custom__";
+        customOption.textContent = "Custom (from text input)";
+        select.appendChild(customOption);
+
+        for (const modelName of this.modelInventory) {
+            const option = document.createElement("option");
+            option.value = modelName;
+            option.textContent = modelName;
+            select.appendChild(option);
+        }
+
+        if (!this.requestedModelValue() && defaultModel) {
+            this.setRequestedModelValue(defaultModel);
+        }
+        this.syncModelSelectToInput();
+    }
+
+    bindModelRequestedControls() {
+        this.refs.modelRequestedSelect?.addEventListener("change", () => {
+            const selected = String(this.refs.modelRequestedSelect?.value || "");
+            if (selected && selected !== "__custom__") {
+                this.setRequestedModelValue(selected);
+            }
+            if (selected === "") {
+                this.setRequestedModelValue("");
+            }
+        });
+
+        this.refs.modelRequestedInput?.addEventListener("input", () => {
+            this.syncModelSelectToInput();
+        });
+    }
+
+    async loadModelInventory() {
+        try {
+            const response = await fetch(`${this.apiBase}/models`);
+            const payload = await response.json();
+            if (!response.ok || payload.status !== "ok") {
+                throw new Error(payload.message || "Model API failed.");
+            }
+
+            const configured = payload.configured_models && typeof payload.configured_models === "object"
+                ? Object.values(payload.configured_models)
+                : [];
+            const available = Array.isArray(payload.available_models) ? payload.available_models : [];
+            const combined = [...new Set([...available, ...configured].map((item) => String(item || "").trim()).filter(Boolean))];
+            const defaultRequested = String(payload.default_model_requested || configured[0] || "").trim();
+            this.populateModelSelect(combined, defaultRequested);
+
+            if (this.refs.modelSourceHint) {
+                const host = String(payload.ollama_host || "-");
+                const count = Number.parseInt(payload.available_count, 10) || combined.length;
+                if (payload.error) {
+                    this.refs.modelSourceHint.textContent = `Model probe warning (${host}): ${payload.error}`;
+                } else {
+                    this.refs.modelSourceHint.textContent = `Loaded ${count} model(s) from ${host}.`;
+                }
+            }
+        } catch (error) {
+            this.populateModelSelect([], this.requestedModelValue());
+            if (this.refs.modelSourceHint) {
+                this.refs.modelSourceHint.textContent = `Model inventory unavailable: ${error}`;
+            }
+        }
+    }
+
+    renderSideRunSummary(run) {
+        if (this.refs.sideRunID) {
+            this.refs.sideRunID.textContent = String(run?.run_id || "-");
+        }
+        if (this.refs.sideRunStatus) {
+            this.refs.sideRunStatus.textContent = String(run?.status || "idle");
+        }
+        if (this.refs.sideRunMode) {
+            this.refs.sideRunMode.textContent = String(run?.mode || "-");
+        }
+        if (this.refs.sideRunEvents) {
+            this.refs.sideRunEvents.textContent = String(this.store.events.length || 0);
+        }
+
+        const runRequest = run && typeof run.request === "object" ? run.request : {};
+        const runOptions = runRequest && typeof runRequest.options === "object" ? runRequest.options : {};
+        const requestedModel = String(runOptions.model_requested || this.requestedModelValue() || "").trim();
+        if (this.refs.sideRunModel) {
+            this.refs.sideRunModel.textContent = requestedModel || "router default";
+        }
+    }
+
+    renderSideEventSummary(event) {
+        if (this.refs.sideEventSeq) {
+            this.refs.sideEventSeq.textContent = String(event?.seq || "-");
+        }
+        if (this.refs.sideEventType) {
+            this.refs.sideEventType.textContent = String(event?.event_type || "-");
+        }
+        if (this.refs.sideEventStage) {
+            this.refs.sideEventStage.textContent = String(event?.stage || "-");
+        }
+        if (this.refs.sideEventStatus) {
+            this.refs.sideEventStatus.textContent = String(event?.status || "-");
+        }
+
+        if (!this.refs.sideEventSummary) {
+            return;
+        }
+        if (!event || typeof event !== "object") {
+            this.refs.sideEventSummary.textContent = "Select a trace row to inspect payload details.";
+            return;
+        }
+
+        const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+        const keys = Object.keys(payload);
+        if (keys.length === 0) {
+            this.refs.sideEventSummary.textContent = "No payload details for this step.";
+            return;
+        }
+
+        const headlineKey = ["detail", "error", "reason", "response_preview", "chunk"].find((key) => key in payload);
+        if (headlineKey) {
+            this.refs.sideEventSummary.textContent = shortText(payload[headlineKey], 260);
+            return;
+        }
+        this.refs.sideEventSummary.textContent = shortText(JSON.stringify(payload), 260);
+    }
+
     async loadBootstrap() {
         const response = await fetch(`${this.apiBase}/bootstrap`);
         const payload = await response.json();
@@ -444,6 +638,7 @@ class AgentPlaygroundApp {
         } else {
             this.setStatus("Idle");
             this.setRunMeta(null);
+            this.renderSideEventSummary(null);
         }
     }
 
@@ -562,6 +757,8 @@ class AgentPlaygroundApp {
                 this.startRun();
             }
         });
+
+        this.bindModelRequestedControls();
     }
 
     getMode() {
@@ -579,6 +776,10 @@ class AgentPlaygroundApp {
             return null;
         }
         const value = validation.value;
+        const requestedModel = this.requestedModelValue();
+        if (requestedModel) {
+            value.model_requested = requestedModel;
+        }
         if (this.refs.schemaCapability?.value) {
             value._schema_capability = this.refs.schemaCapability.value;
         }
@@ -596,6 +797,11 @@ class AgentPlaygroundApp {
 
         const builder = modeBuilders[mode] || buildChatPayload;
         const payload = builder(inputText, options);
+        payload.options = payload.options && typeof payload.options === "object" ? payload.options : {};
+        const requestedModel = this.requestedModelValue();
+        if (requestedModel) {
+            payload.options.model_requested = requestedModel;
+        }
 
         if (["chat", "workflow", "compare"].includes(mode) && !payload.message) {
             this.setStatus("Message required");
@@ -650,17 +856,22 @@ class AgentPlaygroundApp {
         this.tracePane.selectSeq(event.seq);
         this.statePane.setSelectedEvent(event);
         this.inspectorPane.setEvent(event);
+        this.renderSideEventSummary(event);
     }
 
     handleIncomingEvent(event) {
         this.store.appendEvent(event);
         this.tracePane.appendEvent(event);
+        this.renderSideRunSummary(this.store.run);
 
         const eventType = String(event.event_type || "");
         if (eventType === "run.token") {
             this.chatPane.appendAssistantChunk(event.payload?.chunk || "");
         }
         if (eventType === "run.completed") {
+            if (this.store.run) {
+                this.store.run.status = "completed";
+            }
             const responseText =
                 event.payload?.result?.response ||
                 event.payload?.response_preview ||
@@ -671,12 +882,18 @@ class AgentPlaygroundApp {
             this.refreshRunsList(event.run_id);
         }
         if (eventType === "run.failed") {
+            if (this.store.run) {
+                this.store.run.status = "failed";
+            }
             this.setStatus("Failed");
             this.chatPane.addSystemMessage(`Run failed: ${event.payload?.error || "unknown error"}`);
             this.refreshMetrics();
             this.refreshRunsList(event.run_id);
         }
         if (eventType === "run.cancelled") {
+            if (this.store.run) {
+                this.store.run.status = "cancelled";
+            }
             this.setStatus("Cancelled");
             this.chatPane.addSystemMessage("Run cancelled.");
             this.refreshMetrics();
@@ -766,15 +983,19 @@ class AgentPlaygroundApp {
         this.setRunMeta(payload.run);
         this.setStatus(payload.run.status || "idle");
         this.upsertRunHistory(payload.run);
+        this.renderSideRunSummary(payload.run);
 
         const selected = this.store.getSelectedEvent();
         if (selected) {
             this.tracePane.selectSeq(selected.seq);
             this.statePane.setSelectedEvent(selected);
             this.inspectorPane.setEvent(selected);
+            this.renderSideEventSummary(selected);
         } else if (this.store.events.length > 0) {
             const latestEvent = this.store.events[this.store.events.length - 1];
             this.onTraceSelect(latestEvent);
+        } else {
+            this.renderSideEventSummary(null);
         }
     }
 
@@ -831,7 +1052,12 @@ class AgentPlaygroundApp {
 
     async init() {
         this.bindEvents();
+        if (window.panelMan && typeof window.panelMan.showPanel === "function" && window.innerWidth > 980) {
+            window.panelMan.showPanel("left");
+            window.panelMan.showPanel("right");
+        }
         await this.loadBootstrap();
+        await this.loadModelInventory();
     }
 }
 

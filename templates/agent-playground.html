@@ -7,6 +7,57 @@
 <script type="module" src="{{ url_for('static', filename='agent-playground/workspace.js') }}"></script>
 {% endblock %}
 
+{% block leftPanel %}
+<div id="left-panel" class="panel-section-left">
+    <div class="panel-header">
+        <nav onclick="panelMan.togglePanel('left');">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <g id="Edit / Add_Minus_Square">
+                    <path id="Vector" d="M8 12H16M4 16.8002V7.2002C4 6.08009 4 5.51962 4.21799 5.0918C4.40973 4.71547 4.71547 4.40973 5.0918 4.21799C5.51962 4 6.08009 4 7.2002 4H16.8002C17.9203 4 18.4801 4 18.9079 4.21799C19.2842 4.40973 19.5905 4.71547 19.7822 5.0918C20.0002 5.51962 20.0002 6.07967 20.0002 7.19978V16.7998C20.0002 17.9199 20.0002 18.48 19.7822 18.9078C19.5905 19.2841 19.2842 19.5905 18.9079 19.7822C18.4805 20 17.9215 20 16.8036 20H7.19691C6.07899 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2842 4.21799 18.9079C4 18.4801 4 17.9203 4 16.8002Z" stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                </g>
+            </svg>
+        </nav>
+        <div class="section-auxiliary">
+            <h3>Playground Controls</h3>
+        </div>
+    </div>
+    <div class="panel-content ap-side-layout">
+        <section class="ap-side-card">
+            <h4>Workspace Sections</h4>
+            <ul id="ap-side-sections" class="ap-side-list">
+                {% for section in contentData.sections %}
+                <li>{{ section }}</li>
+                {% endfor %}
+            </ul>
+        </section>
+
+        <section class="ap-side-card">
+            <h4>Requested Model</h4>
+            <p class="ap-side-muted">Type a model name or choose from discovered Ollama models.</p>
+            <div class="ap-model-requested-row">
+                <input id="ap-model-requested-input" type="text" placeholder="qwen3-vl:latest" autocomplete="off" />
+                <select id="ap-model-requested-select">
+                    <option value="">Loading models...</option>
+                </select>
+            </div>
+            <p id="ap-model-source-hint" class="ap-side-muted">Model inventory pending...</p>
+        </section>
+
+        <section class="ap-side-card">
+            <h4>Run Hotkeys</h4>
+            <ul class="ap-side-list">
+                <li><code>Ctrl/Cmd + Enter</code> starts a run.</li>
+                <li>Use pane toggles to focus trace/state/artifacts.</li>
+                <li>Select a trace step to inspect exact payloads.</li>
+            </ul>
+        </section>
+    </div>
+    <div class="panel-footer button-bar">
+        <div class="button-text">Run Setup</div>
+    </div>
+</div>
+{% endblock %}
+
 {% block content %}
 <div id="ap-workspace" data-api-base="/api/agent-playground">
     <section id="ap-toolbar">
@@ -111,6 +162,58 @@
             <div class="ap-pane-body" data-pane="inspector"></div>
         </article>
     </section>
+</div>
+{% endblock %}
+
+{% block rightTopPanel %}
+<div id="right-top-panel">
+    <div class="panel-header">
+        <div class="section-auxiliary">
+            <h3>Active Run Snapshot</h3>
+        </div>
+        <nav onclick="panelMan.togglePanel('right');">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <g id="Edit / Add_Minus_Square">
+                    <path id="Vector" d="M8 12H16M4 16.8002V7.2002C4 6.08009 4 5.51962 4.21799 5.0918C4.40973 4.71547 4.71547 4.40973 5.0918 4.21799C5.51962 4 6.08009 4 7.2002 4H16.8002C17.9203 4 18.4801 4 18.9079 4.21799C19.2842 4.40973 19.5905 4.71547 19.7822 5.0918C20.0002 5.51962 20.0002 6.07967 20.0002 7.19978V16.7998C20.0002 17.9199 20.0002 18.48 19.7822 18.9078C19.5905 19.2841 19.2842 19.5905 18.9079 19.7822C18.4805 20 17.9215 20 16.8036 20H7.19691C6.07899 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2842 4.21799 18.9079C4 18.4801 4 17.9203 4 16.8002Z" stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                </g>
+            </svg>
+        </nav>
+    </div>
+    <div class="panel-content ap-side-layout">
+        <div class="ap-side-stat-grid">
+            <span class="ap-side-key">Run ID</span><span id="ap-side-run-id" class="ap-side-value">-</span>
+            <span class="ap-side-key">Status</span><span id="ap-side-run-status" class="ap-side-value">idle</span>
+            <span class="ap-side-key">Mode</span><span id="ap-side-run-mode" class="ap-side-value">-</span>
+            <span class="ap-side-key">Model</span><span id="ap-side-run-model" class="ap-side-value">router default</span>
+            <span class="ap-side-key">Events</span><span id="ap-side-run-events" class="ap-side-value">0</span>
+        </div>
+        <p class="ap-side-muted">Updates in real time from the append-only run stream.</p>
+    </div>
+    <div class="panel-footer button-bar">
+        <div class="button-text">Run Metadata</div>
+    </div>
+</div>
+{% endblock %}
+
+{% block rightBottomPanel %}
+<div id="right-bottom-panel">
+    <div class="panel-header">
+        <div class="section-auxiliary">
+            <h3>Selected Step</h3>
+        </div>
+    </div>
+    <div class="panel-content ap-side-layout">
+        <div class="ap-side-stat-grid">
+            <span class="ap-side-key">Sequence</span><span id="ap-side-event-seq" class="ap-side-value">-</span>
+            <span class="ap-side-key">Event Type</span><span id="ap-side-event-type" class="ap-side-value">-</span>
+            <span class="ap-side-key">Stage</span><span id="ap-side-event-stage" class="ap-side-value">-</span>
+            <span class="ap-side-key">Status</span><span id="ap-side-event-status" class="ap-side-value">-</span>
+        </div>
+        <pre id="ap-side-event-summary" class="ap-side-json">Select a trace row to inspect payload details.</pre>
+    </div>
+    <div class="panel-footer button-bar">
+        <div class="button-text">Trace Inspector</div>
+    </div>
 </div>
 {% endblock %}
 

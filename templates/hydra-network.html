@@ -3,16 +3,47 @@
 {% block title %}{{ contentData.title }}{% endblock %}
 
 {% block content %}
-<h3>Hydra Network stuff</h3>
-<p>More preprossing and out put here</p>
+<section class="ap-side-card">
+    <h4>Hydra Network Scope</h4>
+    <ul class="ap-side-list">
+        {% for section in contentData.sections %}
+        <li>{{ section }}</li>
+        {% endfor %}
+    </ul>
+    <p class="ap-side-muted">Manage node connectivity, route health, and deployment topology for distributed interfaces.</p>
+</section>
+<section class="ap-side-card">
+    <h4>Operator Focus</h4>
+    <ul class="ap-side-list">
+        <li>Check route uptime and restart behavior.</li>
+        <li>Validate ingress and failover pathways.</li>
+        <li>Review runtime capacity against interface demand.</li>
+    </ul>
+</section>
 {% endblock %}
 
 {% block rightTopPanel %}
 <div id="right-top-panel">
-    <div class="panel-header" onclick="panelMan.togglePanel('right');">
+    <div class="panel-header">
+        <div class="section-auxiliary">
+            <h3>Node Status</h3>
+        </div>
+        <nav onclick="panelMan.togglePanel('right');">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <g id="System / Bar_Top">
+                    <path id="Vector" d="M8 12H16M4 16.8002V7.2002C4 6.08009 4 5.51962 4.21799 5.0918C4.40973 4.71547 4.71547 4.40973 5.0918 4.21799C5.51962 4 6.08009 4 7.2002 4H16.8002C17.9203 4 18.4801 4 18.9079 4.21799C19.2842 4.40973 19.5905 4.71547 19.7822 5.0918C20.0002 5.51962 20.0002 6.07967 20.0002 7.19978V16.7998C20.0002 17.9199 20.0002 18.48 19.7822 18.9078C19.5905 19.2841 19.2842 19.5905 18.9079 19.7822C18.4805 20 17.9215 20 16.8036 20H7.19691C6.07899 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2842 4.21799 18.9079C4 18.4801 4 17.9203 4 16.8002Z" stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                </g>
+            </svg>
+        </nav>
     </div>
-    <div class="panel-content">
-        <b>Hydra Network</b> - all the hydra network display we want in the <i>top</i> panel
+    <div class="panel-content ap-side-layout">
+        <div class="ap-side-stat-grid">
+            <span class="ap-side-key">Web Route</span><span class="ap-side-value">managed</span>
+            <span class="ap-side-key">Telegram Route</span><span class="ap-side-value">managed</span>
+            <span class="ap-side-key">CLI Route</span><span class="ap-side-value">managed</span>
+            <span class="ap-side-key">X Route</span><span class="ap-side-value">managed</span>
+        </div>
+        <p class="ap-side-muted">Operational snapshot of route topology and health within the launcher watchdog network.</p>
     </div>
     <div class="panel-footer">
     </div>
@@ -22,9 +53,16 @@
 {% block rightBottomPanel %}
 <div id="right-bottom-panel">          
     <div class="panel-header">
+        <div class="section-auxiliary">
+            <h3>Network Actions</h3>
+        </div>
     </div>
-    <div class="panel-content">
-        <b>Hydra Network</b> - all the hydra network display we want in the <i>bottom</i> panel
+    <div class="panel-content ap-side-layout">
+        <ul class="ap-side-list">
+            <li>Review watchdog restart trends per route.</li>
+            <li>Validate endpoint exposure before tunnel forwarding.</li>
+            <li>Confirm auth and model dependencies before scaling interfaces.</li>
+        </ul>
     </div>
     <div class="panel-footer">
     </div>
@@ -32,5 +70,5 @@
 {% endblock %}
 
 {% block footer %}
-A live updated <b>Hydra Network</b> feed
+Live hydra network feed
 {% endblock %}

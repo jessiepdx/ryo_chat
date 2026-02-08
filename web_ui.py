@@ -27,6 +27,8 @@ import socket
 import time
 from datetime import datetime
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from flask import (
     Flask,
     Response,
@@ -255,6 +257,50 @@ def _lineage_from_request(payload: dict) -> dict[str, Any]:
     if isinstance(lineage, dict):
         return lineage
     return {}
+
+
+def _configured_inference_models() -> dict[str, str]:
+    configured: dict[str, str] = {}
+    inference = config.inference if isinstance(config.inference, dict) else {}
+    for capability in ("chat", "tool", "generate", "embedding", "multimodal"):
+        section = inference.get(capability)
+        if not isinstance(section, dict):
+            continue
+        model_name = str(section.get("model") or "").strip()
+        if model_name:
+            configured[capability] = model_name
+    return configured
+
+
+def _resolve_ollama_host() -> str:
+    host = _runtime_str("inference.default_ollama_host", "http://127.0.0.1:11434")
+    return host.rstrip("/")
+
+
+def _fetch_ollama_models(host: str, timeout_seconds: float = 3.0) -> tuple[list[str], str | None]:
+    endpoint = f"{host}/api/tags"
+    request_obj = urllib_request.Request(endpoint, method="GET")
+    try:
+        with urllib_request.urlopen(request_obj, timeout=float(timeout_seconds)) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as error:
+        return [], f"Ollama endpoint returned HTTP {error.code}"
+    except urllib_error.URLError as error:
+        return [], f"Failed to reach Ollama endpoint: {error.reason}"
+    except TimeoutError:
+        return [], "Timed out while reaching Ollama endpoint"
+    except Exception as error:  # noqa: BLE001
+        return [], str(error)
+
+    discovered: list[str] = []
+    for entry in payload.get("models", []) if isinstance(payload, dict) else []:
+        model_name: str | None = None
+        if isinstance(entry, dict):
+            model_name = entry.get("model") or entry.get("name")
+        cleaned = str(model_name or "").strip()
+        if cleaned and cleaned not in discovered:
+            discovered.append(cleaned)
+    return discovered, None
 
 
 availableMenu = [
@@ -714,6 +760,37 @@ def playgroundCapabilityByIDAPI(capability_id: str):
     if capability is None:
         return jsonify({"status": "error", "message": "Capability not found."}), 404
     return jsonify({"status": "ok", "capability": capability})
+
+
+@app.get("/api/agent-playground/models")
+def playgroundModelsAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    host = _resolve_ollama_host()
+    models, error = _fetch_ollama_models(host, timeout_seconds=3.5)
+    configured = _configured_inference_models()
+    configured_values = [value for value in configured.values() if value]
+
+    default_requested = (
+        configured.get("chat")
+        or configured.get("tool")
+        or configured.get("generate")
+        or (configured_values[0] if configured_values else "")
+    )
+
+    return jsonify(
+        {
+            "status": "ok",
+            "ollama_host": host,
+            "available_models": models,
+            "available_count": len(models),
+            "configured_models": configured,
+            "default_model_requested": default_requested,
+            "error": error,
+        }
+    )
 
 
 @app.get("/api/agent-playground/runs")
