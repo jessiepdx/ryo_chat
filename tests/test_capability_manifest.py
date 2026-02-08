@@ -34,6 +34,7 @@ class CapabilityManifestTests(unittest.TestCase):
         self.assertIn("tools.list", capability_ids)
         self.assertIn("tools.sandbox", capability_ids)
         self.assertIn("tools.approvals", capability_ids)
+        self.assertIn("tools.harness", capability_ids)
 
     def test_find_capability_returns_none_for_missing_id(self):
         fake_manifest = {"capabilities": [{"id": "a"}, {"id": "b"}]}

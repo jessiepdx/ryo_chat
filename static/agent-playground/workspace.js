@@ -15,6 +15,7 @@ import { AgentBuilder } from "./agent-builder.js";
 import { ToolRegistryView } from "./tools/tool-registry-view.js";
 import { SandboxPolicyEditor } from "./tools/sandbox-policy-editor.js";
 import { ApprovalQueueView } from "./tools/approval-queue.js";
+import { ToolHarnessView } from "./tools/tool-harness.js";
 
 const modeBuilders = {
     chat: buildChatPayload,
@@ -204,6 +205,22 @@ class AgentPlaygroundApp {
             approvalWriteHint: document.getElementById("ap-approval-write-hint"),
             approvalStatus: document.getElementById("ap-approval-status"),
             approvalRefresh: document.getElementById("ap-approval-refresh"),
+            toolHarnessCaseSelect: document.getElementById("ap-tool-harness-case-select"),
+            toolHarnessToolSelect: document.getElementById("ap-tool-harness-tool-select"),
+            toolHarnessFixtureName: document.getElementById("ap-tool-harness-fixture-name"),
+            toolHarnessDescription: document.getElementById("ap-tool-harness-description"),
+            toolHarnessMode: document.getElementById("ap-tool-harness-mode"),
+            toolHarnessInputJSON: document.getElementById("ap-tool-harness-input-json"),
+            toolHarnessWriteHint: document.getElementById("ap-tool-harness-write-hint"),
+            toolHarnessStatus: document.getElementById("ap-tool-harness-status"),
+            toolHarnessReport: document.getElementById("ap-tool-harness-report"),
+            toolHarnessRefresh: document.getElementById("ap-tool-harness-refresh"),
+            toolHarnessNew: document.getElementById("ap-tool-harness-new"),
+            toolHarnessSave: document.getElementById("ap-tool-harness-save"),
+            toolHarnessRun: document.getElementById("ap-tool-harness-run"),
+            toolHarnessSaveGolden: document.getElementById("ap-tool-harness-save-golden"),
+            toolHarnessSaveContract: document.getElementById("ap-tool-harness-save-contract"),
+            toolHarnessDelete: document.getElementById("ap-tool-harness-delete"),
         };
 
         this.optionsRenderer = null;
@@ -284,6 +301,30 @@ class AgentPlaygroundApp {
                 writeHint: this.refs.approvalWriteHint,
                 status: this.refs.approvalStatus,
                 refreshBtn: this.refs.approvalRefresh,
+            },
+            {
+                onStatus: (message) => this.setStatus(message),
+            },
+        );
+        this.toolHarnessView = new ToolHarnessView(
+            this.apiBase,
+            {
+                caseSelect: this.refs.toolHarnessCaseSelect,
+                toolSelect: this.refs.toolHarnessToolSelect,
+                fixtureName: this.refs.toolHarnessFixtureName,
+                description: this.refs.toolHarnessDescription,
+                mode: this.refs.toolHarnessMode,
+                inputJSON: this.refs.toolHarnessInputJSON,
+                writeHint: this.refs.toolHarnessWriteHint,
+                status: this.refs.toolHarnessStatus,
+                report: this.refs.toolHarnessReport,
+                refreshBtn: this.refs.toolHarnessRefresh,
+                newBtn: this.refs.toolHarnessNew,
+                saveBtn: this.refs.toolHarnessSave,
+                runBtn: this.refs.toolHarnessRun,
+                saveGoldenBtn: this.refs.toolHarnessSaveGolden,
+                saveContractBtn: this.refs.toolHarnessSaveContract,
+                deleteBtn: this.refs.toolHarnessDelete,
             },
             {
                 onStatus: (message) => this.setStatus(message),
@@ -914,6 +955,11 @@ class AgentPlaygroundApp {
             addSource("tools.approvals", "Tool Approval Queue", approvalsCapability.schema, {});
         }
 
+        const harnessCapability = capabilities.find((capability) => capability?.id === "tools.harness");
+        if (harnessCapability?.schema) {
+            addSource("tools.harness", "Tool Harness Fixture", harnessCapability.schema, {});
+        }
+
         if (this.schemaSources.size === 0) {
             return;
         }
@@ -1357,6 +1403,15 @@ class AgentPlaygroundApp {
             );
         } catch (error) {
             this.setStatus(`Approval queue init warning: ${error}`);
+        }
+        try {
+            await this.toolHarnessView.init(
+                this.bootstrapData?.tool_harness_cases || [],
+                this.bootstrapData?.tool_registry || [],
+                Boolean(this.bootstrapData?.can_write_harness),
+            );
+        } catch (error) {
+            this.setStatus(`Tool harness init warning: ${error}`);
         }
         await this.loadModelInventory();
     }

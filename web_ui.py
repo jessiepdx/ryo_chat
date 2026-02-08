@@ -56,12 +56,21 @@ from hypermindlabs.tool_registry import (
     ToolRegistryStore,
     ToolRegistryValidationError,
     build_tool_specs,
+    register_runtime_tools,
     tool_catalog_entries,
 )
 from hypermindlabs.tool_sandbox import (
     ToolSandboxPolicyStore,
     ToolSandboxPolicyValidationError,
     normalize_tool_sandbox_policy,
+)
+from hypermindlabs.tool_runtime import ToolRuntime
+from hypermindlabs.tool_test_harness import (
+    ToolHarnessValidationError,
+    ToolTestHarnessStore,
+    build_contract_snapshot,
+    compare_contract_snapshots,
+    compare_golden_outputs,
 )
 from hypermindlabs.utils import ConfigManager, CustomFormatter, MemberManager, KnowledgeManager
 from urllib.parse import parse_qs
@@ -129,6 +138,7 @@ agentDefinitions = AgentDefinitionStore()
 toolRegistry = ToolRegistryStore()
 toolSandboxPolicies = ToolSandboxPolicyStore()
 toolApprovals = ApprovalManager()
+toolHarness = ToolTestHarnessStore()
 
 logger.info(f"Database route status: {config.databaseRoute}")
 miniappConfigIssues = config.getTelegramConfigIssues(require_owner=False, require_web_ui_url=False)
@@ -312,6 +322,19 @@ def _request_json_dict() -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _payload_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
 def _tool_sandbox_items() -> list[dict[str, Any]]:
     policies_by_tool = {
         str(item.get("tool_name")): item
@@ -418,6 +441,89 @@ def _builtin_tool_names() -> set[str]:
         custom_tool_entries=[],
     )
     return set(specs.keys())
+
+
+def _harness_brave_search(queryString: str, count: int = 5) -> list[dict[str, Any]]:
+    return [
+        {
+            "title": "Harness stub result",
+            "url": "https://example.com/harness",
+            "description": f"braveSearch stubbed in web harness mode for query='{queryString}'.",
+            "score": 0.0,
+        }
+        for _ in range(max(1, min(int(count), 5)))
+    ]
+
+
+def _harness_chat_history_search(
+    queryString: str,
+    count: int = 2,
+    runtime_context: dict | None = None,
+) -> list[dict[str, Any]]:
+    context = runtime_context if isinstance(runtime_context, dict) else {}
+    return [
+        {
+            "message": f"chatHistorySearch stub for '{queryString}'",
+            "score": 0.0,
+            "run_id": context.get("run_id"),
+        }
+        for _ in range(max(1, min(int(count), 5)))
+    ]
+
+
+def _harness_knowledge_search(queryString: str, count: int = 2) -> list[dict[str, Any]]:
+    return [
+        {
+            "domain": "harness",
+            "title": "Knowledge search stub",
+            "excerpt": f"knowledgeSearch stub for '{queryString}'.",
+            "score": 0.0,
+        }
+        for _ in range(max(1, min(int(count), 5)))
+    ]
+
+
+def _harness_skip_tools() -> dict[str, Any]:
+    return {"status": "skipped", "source": "tool_harness"}
+
+
+def _harness_tool_specs() -> dict[str, Any]:
+    custom_tools = toolRegistry.list_custom_tools(include_disabled=False)
+    return build_tool_specs(
+        brave_search_fn=_harness_brave_search,
+        chat_history_search_fn=_harness_chat_history_search,
+        knowledge_search_fn=_harness_knowledge_search,
+        skip_tools_fn=_harness_skip_tools,
+        knowledge_domains=config.knowledgeDomains,
+        custom_tool_entries=custom_tools,
+    )
+
+
+def _tool_policy_overrides() -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for row in _tool_sandbox_items():
+        tool_name = str(row.get("tool_name") or "").strip()
+        if not tool_name:
+            continue
+        policy = row.get("sandbox_policy")
+        if not isinstance(policy, dict):
+            policy = {}
+        output[tool_name] = {
+            "side_effect_class": str(row.get("side_effect_class") or "read_only"),
+            "sandbox_policy": policy,
+            "require_approval": bool(row.get("approval_required", False)),
+            "dry_run": bool(row.get("dry_run", False)),
+        }
+    return output
+
+
+def _tool_catalog_index() -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for row in _tool_catalog_items():
+        tool_name = str(row.get("name") or "").strip()
+        if tool_name:
+            output[tool_name] = row
+    return output
 
 
 availableMenu = [
@@ -853,6 +959,7 @@ def playgroundBootstrapAPI():
         "agent_definitions": agentDefinitions.list_definitions(owner_member_id=memberID),
         "tool_registry": _tool_catalog_items(),
         "tool_sandbox_policies": _tool_sandbox_items(),
+        "tool_harness_cases": toolHarness.list_cases(),
         "approval_queue": toolApprovals.list_requests(
             status="pending",
             member_id=None if _member_can_write_playground_registry(member) else memberID,
@@ -860,6 +967,7 @@ def playgroundBootstrapAPI():
         ),
         "can_write_registry": _member_can_write_playground_registry(member),
         "can_manage_approvals": _member_can_write_playground_registry(member),
+        "can_write_harness": _member_can_write_playground_registry(member),
     }
     return jsonify(response)
 
@@ -1284,6 +1392,248 @@ def playgroundToolSandboxPolicyDeleteAPI(tool_name: str):
     if not removed:
         return jsonify({"status": "error", "message": "Sandbox policy not found."}), 404
     return jsonify({"status": "ok", "policies": _tool_sandbox_items()})
+
+
+@app.get("/api/agent-playground/tools/harness/cases")
+def playgroundToolHarnessCasesListAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    return jsonify(
+        {
+            "status": "ok",
+            "cases": toolHarness.list_cases(),
+            "tools": _tool_catalog_items(),
+            "can_write": _member_can_write_playground_registry(member),
+        }
+    )
+
+
+@app.post("/api/agent-playground/tools/harness/cases")
+def playgroundToolHarnessCaseUpsertAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    if not _member_can_write_playground_registry(member):
+        return _api_forbidden("Tool harness writes require admin or owner role.")
+
+    payload = _request_json_dict()
+    casePayload = payload.get("case")
+    if not isinstance(casePayload, dict):
+        casePayload = payload
+
+    catalog = _tool_catalog_index()
+    tool_name = str(casePayload.get("tool_name") or "").strip()
+    if not tool_name:
+        return jsonify({"status": "error", "message": "tool_name is required."}), 400
+    if tool_name not in catalog:
+        return jsonify({"status": "error", "message": "Tool is not available in catalog."}), 400
+
+    try:
+        case = toolHarness.upsert_case(
+            casePayload,
+            actor_member_id=int(member.get("member_id", 0)),
+        )
+    except ToolHarnessValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    return jsonify(
+        {
+            "status": "ok",
+            "case": case,
+            "cases": toolHarness.list_cases(),
+        }
+    )
+
+
+@app.delete("/api/agent-playground/tools/harness/cases/<case_id>")
+def playgroundToolHarnessCaseDeleteAPI(case_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    if not _member_can_write_playground_registry(member):
+        return _api_forbidden("Tool harness writes require admin or owner role.")
+
+    removed = toolHarness.remove_case(case_id)
+    if not removed:
+        return jsonify({"status": "error", "message": "Tool harness case not found."}), 404
+    return jsonify({"status": "ok", "cases": toolHarness.list_cases()})
+
+
+@app.post("/api/agent-playground/tools/harness/cases/<case_id>/golden")
+def playgroundToolHarnessCaseGoldenAPI(case_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    if not _member_can_write_playground_registry(member):
+        return _api_forbidden("Tool harness writes require admin or owner role.")
+
+    case = toolHarness.get_case(case_id)
+    if case is None:
+        return jsonify({"status": "error", "message": "Tool harness case not found."}), 404
+
+    payload = _request_json_dict()
+    has_explicit = "golden_output" in payload
+    goldenOutput = payload.get("golden_output")
+    if not has_explicit:
+        lastReport = case.get("last_report")
+        if isinstance(lastReport, dict):
+            result = lastReport.get("result")
+            if isinstance(result, dict):
+                goldenOutput = result.get("tool_results")
+    if goldenOutput is None:
+        return jsonify({"status": "error", "message": "No golden output available to save."}), 400
+
+    try:
+        updated = toolHarness.set_golden_output(
+            case_id,
+            goldenOutput,
+            actor_member_id=int(member.get("member_id", 0)),
+        )
+    except ToolHarnessValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    return jsonify({"status": "ok", "case": updated})
+
+
+@app.post("/api/agent-playground/tools/harness/cases/<case_id>/contract")
+def playgroundToolHarnessCaseContractAPI(case_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    if not _member_can_write_playground_registry(member):
+        return _api_forbidden("Tool harness writes require admin or owner role.")
+
+    case = toolHarness.get_case(case_id)
+    if case is None:
+        return jsonify({"status": "error", "message": "Tool harness case not found."}), 404
+
+    payload = _request_json_dict()
+    contractSnapshot = payload.get("contract_snapshot")
+    if not isinstance(contractSnapshot, dict):
+        tool_name = str(case.get("tool_name") or "").strip()
+        catalog = _tool_catalog_index()
+        tool_row = catalog.get(tool_name)
+        if not isinstance(tool_row, dict):
+            return jsonify({"status": "error", "message": "Tool contract source is unavailable."}), 400
+        contractSnapshot = build_contract_snapshot(tool_name, tool_row.get("input_schema"))
+
+    try:
+        updated = toolHarness.set_contract_snapshot(
+            case_id,
+            contractSnapshot,
+            actor_member_id=int(member.get("member_id", 0)),
+        )
+    except ToolHarnessValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    return jsonify({"status": "ok", "case": updated, "contract_snapshot": contractSnapshot})
+
+
+@app.post("/api/agent-playground/tools/harness/run")
+def playgroundToolHarnessRunAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    if not _member_can_write_playground_registry(member):
+        return _api_forbidden("Tool harness execution requires admin or owner role.")
+
+    payload = _request_json_dict()
+    case_id = str(payload.get("case_id") or "").strip()
+    if not case_id:
+        return jsonify({"status": "error", "message": "case_id is required."}), 400
+
+    case = toolHarness.get_case(case_id)
+    if case is None:
+        return jsonify({"status": "error", "message": "Tool harness case not found."}), 404
+    if not bool(case.get("enabled", True)):
+        return jsonify({"status": "error", "message": "Tool harness case is disabled."}), 400
+
+    tool_name = str(case.get("tool_name") or "").strip()
+    catalog = _tool_catalog_index()
+    tool_row = catalog.get(tool_name)
+    if not isinstance(tool_row, dict):
+        return jsonify({"status": "error", "message": "Tool is no longer available in the catalog."}), 400
+
+    execution_mode = str(payload.get("execution_mode") or case.get("execution_mode") or "real").strip().lower()
+    if execution_mode not in {"real", "mock"}:
+        execution_mode = "real"
+
+    specs = _harness_tool_specs()
+    if tool_name not in specs:
+        return jsonify({"status": "error", "message": "Tool is unavailable for harness execution."}), 400
+
+    runtime = ToolRuntime(
+        api_keys={"brave_search": str(config.brave_keys or "").strip()},
+        enable_human_approval=False,
+        default_dry_run=(execution_mode == "mock"),
+    )
+    runtime.set_runtime_context(
+        {
+            "run_id": f"tool-harness-{case_id}-{int(time.time())}",
+            "member_id": int(member.get("member_id", 0)),
+            "source": "agent_playground.tool_harness",
+        }
+    )
+    register_runtime_tools(
+        runtime,
+        specs,
+        tool_policy=_tool_policy_overrides(),
+    )
+
+    started = time.perf_counter()
+    result = runtime.execute(tool_name, case.get("input_args", {}))
+    duration_ms = int((time.perf_counter() - started) * 1000)
+
+    current_contract = build_contract_snapshot(tool_name, tool_row.get("input_schema"))
+    contract_result = compare_contract_snapshots(case.get("contract_snapshot"), current_contract)
+    regression_result = compare_golden_outputs(case.get("golden_output"), result.get("tool_results"))
+
+    report = {
+        "schema": "ryo.tool_harness_report.v1",
+        "case_id": case_id,
+        "tool_name": tool_name,
+        "execution_mode": execution_mode,
+        "run_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "duration_ms": duration_ms,
+        "result": result,
+        "contract": contract_result,
+        "regression": regression_result,
+    }
+
+    member_id = int(member.get("member_id", 0))
+    persist_run = _payload_bool(payload.get("persist_run"), True)
+    save_contract = _payload_bool(payload.get("save_contract"), False)
+    save_golden = _payload_bool(payload.get("save_golden"), False)
+
+    updated_case = case
+    try:
+        if persist_run:
+            updated_case = toolHarness.record_run(case_id, report, actor_member_id=member_id)
+        if save_contract:
+            updated_case = toolHarness.set_contract_snapshot(
+                case_id,
+                current_contract,
+                actor_member_id=member_id,
+            )
+        if save_golden:
+            if result.get("status") != "success":
+                return jsonify({"status": "error", "message": "Cannot save golden output for failed tool run."}), 400
+            updated_case = toolHarness.set_golden_output(
+                case_id,
+                result.get("tool_results"),
+                actor_member_id=member_id,
+            )
+    except ToolHarnessValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    return jsonify(
+        {
+            "status": "ok",
+            "report": report,
+            "case": updated_case,
+        }
+    )
 
 
 @app.get("/api/agent-playground/tool-approvals")

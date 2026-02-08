@@ -168,6 +168,41 @@
             </div>
             <p id="ap-approval-status" class="ap-side-muted">Approval queue idle.</p>
         </section>
+
+        <section class="ap-side-card">
+            <h4>Tool Test Harness</h4>
+            <div class="ap-side-inline-grid">
+                <select id="ap-tool-harness-case-select">
+                    <option value="">Select case</option>
+                </select>
+                <select id="ap-tool-harness-tool-select">
+                    <option value="">Select tool</option>
+                </select>
+            </div>
+            <input id="ap-tool-harness-fixture-name" type="text" placeholder="Fixture name" />
+            <input id="ap-tool-harness-description" type="text" placeholder="Fixture description (optional)" />
+            <div class="ap-side-inline-grid">
+                <label class="ap-side-label" for="ap-tool-harness-mode">Execution mode</label>
+                <select id="ap-tool-harness-mode">
+                    <option value="real">real</option>
+                    <option value="mock">mock</option>
+                </select>
+            </div>
+            <label class="ap-side-label" for="ap-tool-harness-input-json">Fixture Input (JSON)</label>
+            <textarea id="ap-tool-harness-input-json" class="ap-side-json-editor" rows="7" placeholder='{"queryString":"hello","count":1}'></textarea>
+            <div id="ap-tool-harness-write-hint" class="ap-side-muted">Checking harness permissions...</div>
+            <div class="ap-side-action-row">
+                <button id="ap-tool-harness-refresh" type="button">Refresh</button>
+                <button id="ap-tool-harness-new" type="button">New</button>
+                <button id="ap-tool-harness-save" type="button">Save Case</button>
+                <button id="ap-tool-harness-run" type="button">Run Case</button>
+                <button id="ap-tool-harness-save-golden" type="button">Save Golden</button>
+                <button id="ap-tool-harness-save-contract" type="button">Save Contract</button>
+                <button id="ap-tool-harness-delete" type="button">Delete</button>
+            </div>
+            <p id="ap-tool-harness-status" class="ap-side-muted">Tool harness idle.</p>
+            <pre id="ap-tool-harness-report" class="ap-side-json">No harness report yet.</pre>
+        </section>
     </div>
     <div class="panel-footer button-bar">
         <div class="button-text">Run Setup</div>

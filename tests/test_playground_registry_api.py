@@ -8,6 +8,7 @@ from hypermindlabs.replay_manager import ReplayManager
 from hypermindlabs.run_manager import RunManager
 from hypermindlabs.tool_registry import ToolRegistryStore
 from hypermindlabs.tool_sandbox import ToolSandboxPolicyStore
+from hypermindlabs.tool_test_harness import ToolTestHarnessStore
 
 try:
     import web_ui
@@ -28,6 +29,7 @@ class PlaygroundRegistryAPITests(unittest.TestCase):
         self.original_tool_store = web_ui.toolRegistry
         self.original_sandbox_store = getattr(web_ui, "toolSandboxPolicies", None)
         self.original_approvals = getattr(web_ui, "toolApprovals", None)
+        self.original_tool_harness = getattr(web_ui, "toolHarness", None)
         self.original_run_manager = web_ui.playgroundRuns
         self.original_replay_manager = web_ui.playgroundReplay
         self.original_get_member = web_ui.members.getMemberByID
@@ -36,6 +38,7 @@ class PlaygroundRegistryAPITests(unittest.TestCase):
         web_ui.toolRegistry = self.tool_store
         web_ui.toolSandboxPolicies = ToolSandboxPolicyStore(storage_path=Path(self.tempdir.name) / "tool_sandbox.json")
         web_ui.toolApprovals = ApprovalManager(storage_path=Path(self.tempdir.name) / "tool_approvals.json")
+        web_ui.toolHarness = ToolTestHarnessStore(storage_path=Path(self.tempdir.name) / "tool_harness.json")
         web_ui.playgroundRuns = RunManager(enable_db=False)
         web_ui.playgroundReplay = ReplayManager(web_ui.playgroundRuns)
         web_ui.members.getMemberByID = lambda member_id: {
@@ -58,6 +61,7 @@ class PlaygroundRegistryAPITests(unittest.TestCase):
             web_ui.toolSandboxPolicies = self.original_sandbox_store
         if self.original_approvals is not None:
             web_ui.toolApprovals = self.original_approvals
+        web_ui.toolHarness = self.original_tool_harness
         web_ui.playgroundRuns = self.original_run_manager
         web_ui.playgroundReplay = self.original_replay_manager
         web_ui.members.getMemberByID = self.original_get_member
@@ -192,6 +196,68 @@ class PlaygroundRegistryAPITests(unittest.TestCase):
         )
         self.assertEqual(decision_response.status_code, 200)
         self.assertEqual(decision_response.get_json()["approval"]["status"], "approved")
+
+    def test_tool_harness_case_run_and_baselines(self):
+        tool_response = self.client.post(
+            "/api/agent-playground/tools",
+            json={
+                "tool": {
+                    "name": "customHarnessTool",
+                    "description": "Harness custom tool",
+                    "enabled": True,
+                    "handler_mode": "static",
+                    "static_result": {"ok": True, "version": 1},
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "queryString": {"type": "string"},
+                        },
+                        "required": ["queryString"],
+                    },
+                }
+            },
+        )
+        self.assertEqual(tool_response.status_code, 200)
+
+        create_case = self.client.post(
+            "/api/agent-playground/tools/harness/cases",
+            json={
+                "case": {
+                    "tool_name": "customHarnessTool",
+                    "fixture_name": "Static output check",
+                    "execution_mode": "real",
+                    "input_args": {"queryString": "hello"},
+                }
+            },
+        )
+        self.assertEqual(create_case.status_code, 200)
+        case = create_case.get_json()["case"]
+        case_id = case["case_id"]
+
+        first_run = self.client.post(
+            "/api/agent-playground/tools/harness/run",
+            json={"case_id": case_id, "persist_run": True},
+        )
+        self.assertEqual(first_run.status_code, 200)
+        first_report = first_run.get_json()["report"]
+        self.assertEqual(first_report["result"]["status"], "success")
+        self.assertEqual(first_report["regression"]["status"], "missing_golden")
+
+        save_contract = self.client.post(f"/api/agent-playground/tools/harness/cases/{case_id}/contract", json={})
+        self.assertEqual(save_contract.status_code, 200)
+        self.assertEqual(save_contract.get_json()["case"]["contract_snapshot"]["tool_name"], "customHarnessTool")
+
+        save_golden = self.client.post(f"/api/agent-playground/tools/harness/cases/{case_id}/golden", json={})
+        self.assertEqual(save_golden.status_code, 200)
+        self.assertTrue(save_golden.get_json()["case"]["golden_hash"])
+
+        second_run = self.client.post(
+            "/api/agent-playground/tools/harness/run",
+            json={"case_id": case_id, "persist_run": True},
+        )
+        self.assertEqual(second_run.status_code, 200)
+        second_report = second_run.get_json()["report"]
+        self.assertEqual(second_report["regression"]["status"], "pass")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from hypermindlabs.runtime_settings import DEFAULT_RUNTIME_SETTINGS
 from hypermindlabs.approval_manager import ApprovalManager
 from hypermindlabs.tool_registry import ToolRegistryStore
 from hypermindlabs.tool_sandbox import ToolSandboxPolicyStore
+from hypermindlabs.tool_test_harness import ToolTestHarnessStore
 from hypermindlabs.utils import ConfigManager
 
 
@@ -325,6 +326,32 @@ def _tool_approvals_capability() -> dict[str, Any]:
     }
 
 
+def _tool_harness_capability() -> dict[str, Any]:
+    harness = ToolTestHarnessStore()
+    return {
+        "id": "tools.harness",
+        "title": "Tool Test Harness",
+        "permissions": {"read": ["user", "admin", "owner"], "write": ["admin", "owner"]},
+        "schema": {
+            "type": "object",
+            "required": ["tool_name", "fixture_name", "input_args"],
+            "properties": {
+                "case_id": {"type": "string"},
+                "tool_name": {"type": "string"},
+                "fixture_name": {"type": "string"},
+                "description": {"type": "string"},
+                "execution_mode": {"type": "string", "enum": ["real", "mock"]},
+                "enabled": {"type": "boolean"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "input_args": {"type": "object"},
+                "contract_snapshot": {"type": "object"},
+                "golden_output": {"type": ["object", "array", "string", "number", "boolean", "null"]},
+            },
+        },
+        "items": harness.list_cases(),
+    }
+
+
 
 def build_capability_manifest(member_roles: list[str] | None = None) -> dict[str, Any]:
     roles = [str(role).strip() for role in (member_roles or []) if str(role).strip()]
@@ -336,6 +363,7 @@ def build_capability_manifest(member_roles: list[str] | None = None) -> dict[str
         _tool_capability(),
         _tool_sandbox_capability(),
         _tool_approvals_capability(),
+        _tool_harness_capability(),
         _agents_capability(),
         _memory_capability(),
         _evals_capability(),
