@@ -447,14 +447,17 @@
 
 #ap-composer {
     width: 100%;
-    display: flex;
-    align-items: stretch;
+    max-width: 100%;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(16rem, 22rem);
+    align-items: start;
     gap: var(--micro-rem);
-    flex-wrap: wrap;
+    height: auto;
+    min-height: max-content;
 }
 
 #ap-input {
-    flex: 1 1 22rem;
+    width: 100%;
     min-height: clamp(4rem, 2.6rem + 2.8vw, 6.5rem);
     resize: vertical;
     background-color: #111720;
@@ -466,8 +469,8 @@
 }
 
 #ap-composer-actions {
-    min-width: clamp(16rem, 20vw, 20rem);
-    flex: 0 1 20rem;
+    width: 100%;
+    min-width: 0;
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: var(--micro-rem);
@@ -674,14 +677,13 @@
     }
 
     #ap-composer {
-        flex-direction: column;
+        grid-template-columns: 1fr;
         align-items: stretch;
     }
 
     #ap-composer-actions {
         width: 100%;
         min-width: 0;
-        flex: 1 1 auto;
     }
 
     .ap-pane-toolbar {
