@@ -277,21 +277,38 @@ select {
 
 #login-form {
     display: flex;
-    flex-flow: row;
+    flex-flow: column;
+    gap: var(--micro-rem);
     justify-content: center;
 }
 
-#login-form input:nth-child(1) {
-    border-top-right-radius: unset;
-    border-bottom-right-radius: unset;
-    border: var(--border-width) solid var(--accent-midway);
-    border-right: unset !important;
+#signup-form {
+    display: flex;
+    flex-flow: column;
+    gap: var(--micro-rem);
+    justify-content: center;
 }
 
-#login-form input:nth-last-child(1) {
-    border-top-left-radius: unset;
-    border-bottom-left-radius: unset;
+#login-form input,
+#signup-form input {
     border: var(--border-width) solid var(--accent-midway);
+}
+
+.auth-message {
+    font-size: var(--micro-rem);
+    padding: var(--micro-rem);
+    border-radius: calc(0.5 * var(--border-radius));
+    border: var(--border-width) solid var(--accent-midway);
+}
+
+.auth-message.error {
+    color: var(--accent-primary);
+    background-color: var(--accent-dark);
+}
+
+.auth-message.success {
+    color: var(--accent-primary);
+    background-color: var(--accent-midway);
 }
 
 #logo {

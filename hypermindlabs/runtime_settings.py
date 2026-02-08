@@ -22,6 +22,7 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "default_multimodal_model": "llama3.2-vision:latest",
         "model_context_window": 4096,
         "probe_timeout_seconds": 3.0,
+        "prompt_model_selection_on_startup": False,
     },
     "database": {
         "default_primary_host": "127.0.0.1",
@@ -120,6 +121,14 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "terminate_timeout_seconds": 8,
         "kill_timeout_seconds": 4,
         "thread_join_timeout_seconds": 2,
+        "auto_start_routes": True,
+    },
+    "web": {
+        "host": "127.0.0.1",
+        "port": 4747,
+        "port_scan_limit": 100,
+        "debug": False,
+        "use_reloader": False,
     },
 }
 
@@ -133,6 +142,7 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "inference.default_multimodal_model": (("RYO_DEFAULT_MULTIMODAL_MODEL", "OLLAMA_MULTIMODAL_MODEL"), "str"),
     "inference.model_context_window": (("RYO_INFERENCE_CONTEXT_WINDOW",), "int"),
     "inference.probe_timeout_seconds": (("RYO_OLLAMA_PROBE_TIMEOUT_SECONDS",), "float"),
+    "inference.prompt_model_selection_on_startup": (("RYO_PROMPT_MODEL_SELECTION_ON_STARTUP",), "bool"),
     "database.default_primary_host": (("RYO_DB_DEFAULT_PRIMARY_HOST", "POSTGRES_HOST"), "str"),
     "database.default_primary_port": (("RYO_DB_DEFAULT_PRIMARY_PORT", "POSTGRES_PORT"), "str"),
     "database.default_fallback_host": (("RYO_DB_DEFAULT_FALLBACK_HOST", "POSTGRES_FALLBACK_HOST"), "str"),
@@ -175,6 +185,21 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "watchdog.terminate_timeout_seconds": (("RYO_WATCHDOG_TERMINATE_TIMEOUT_SECONDS",), "float"),
     "watchdog.kill_timeout_seconds": (("RYO_WATCHDOG_KILL_TIMEOUT_SECONDS",), "float"),
     "watchdog.thread_join_timeout_seconds": (("RYO_WATCHDOG_THREAD_JOIN_TIMEOUT_SECONDS",), "float"),
+    "watchdog.auto_start_routes": (("RYO_WATCHDOG_AUTO_START_ROUTES",), "bool"),
+    "web.host": (("RYO_WEB_HOST",), "str"),
+    "web.port": (("RYO_WEB_PORT",), "int"),
+    "web.port_scan_limit": (("RYO_WEB_PORT_SCAN_LIMIT",), "int"),
+    "web.debug": (("RYO_WEB_DEBUG",), "bool"),
+    "web.use_reloader": (("RYO_WEB_USE_RELOADER",), "bool"),
+}
+
+COMMUNITY_SCORE_REQUIREMENT_MAP: dict[str, str] = {
+    "private_chat": "minimum_community_score_private_chat",
+    "private_image": "minimum_community_score_private_image",
+    "group_image": "minimum_community_score_group_image",
+    "other_group": "minimum_community_score_other_group",
+    "link_sharing": "minimum_community_score_link",
+    "message_forwarding": "minimum_community_score_forward",
 }
 
 
@@ -272,6 +297,20 @@ def build_runtime_settings(
         runtime_config = config_data.get("runtime")
         if isinstance(runtime_config, dict):
             _deep_merge(settings, runtime_config)
+
+        community_requirements = config_data.get("community_score_requirements")
+        if isinstance(community_requirements, dict):
+            for public_key, runtime_key in COMMUNITY_SCORE_REQUIREMENT_MAP.items():
+                raw_value = community_requirements.get(public_key)
+                if raw_value is None:
+                    continue
+                try:
+                    parsed = int(str(raw_value).strip())
+                except (TypeError, ValueError):
+                    continue
+                if parsed < 0:
+                    parsed = 0
+                set_runtime_setting(settings, f"telegram.{runtime_key}", parsed)
 
     env_values = env_data if env_data is not None else os.environ
     for path, (env_keys, value_type) in ENV_OVERRIDES.items():

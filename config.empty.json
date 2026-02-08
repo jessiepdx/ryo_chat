@@ -56,6 +56,14 @@
       "model": "llama3.2-vision:latest"
     }
   },
+  "community_score_requirements": {
+    "private_chat": 50,
+    "private_image": 70,
+    "group_image": 20,
+    "other_group": 20,
+    "link_sharing": 20,
+    "message_forwarding": 20
+  },
   "runtime": {
     "inference": {
       "default_ollama_host": "http://127.0.0.1:11434",
@@ -65,7 +73,8 @@
       "default_tool_model": "llama3.2:latest",
       "default_multimodal_model": "llama3.2-vision:latest",
       "model_context_window": 4096,
-      "probe_timeout_seconds": 3.0
+      "probe_timeout_seconds": 3.0,
+      "prompt_model_selection_on_startup": false
     },
     "database": {
       "default_primary_host": "127.0.0.1",
@@ -187,7 +196,15 @@
       "max_restarts_per_window": 5,
       "terminate_timeout_seconds": 8,
       "kill_timeout_seconds": 4,
-      "thread_join_timeout_seconds": 2
+      "thread_join_timeout_seconds": 2,
+      "auto_start_routes": true
+    },
+    "web": {
+      "host": "127.0.0.1",
+      "port": 4747,
+      "port_scan_limit": 100,
+      "debug": false,
+      "use_reloader": false
     }
   },
   "twitter_keys": {

@@ -233,7 +233,11 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Help command issued by {user.name} (user_id: {user.id}).")
 
-    helpMsg = """The following commands are available:\n\n"""
+    helpMsg = """The following commands are available:
+
+/botid to display the chatbot Telegram ID
+/userid to display your Telegram user ID
+"""
 
     if chat.type == "private":
         member = members.getMemberByTelegramID(user.id)
@@ -317,6 +321,47 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as err:
             logger.error(f"Exception while replying to a telegram message\n{err}")
+
+
+async def botID(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Display this bot's Telegram identifier."""
+    message = update.effective_message
+    user = update.effective_user
+    username = "unknown" if user is None else user.name
+    userID = "unknown" if user is None else user.id
+
+    logger.info(f"BotID command issued by {username} (user_id: {userID}).")
+
+    try:
+        bot = await context.bot.get_me()
+        botUsername = f"@{bot.username}" if bot.username else "not set"
+        await message.reply_text(
+            text=f"Bot ID: {bot.id}\nBot Username: {botUsername}"
+        )
+    except Exception as err:
+        logger.error(f"Exception while replying to a telegram message:\n{err}")
+
+
+async def userID(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Display the caller's Telegram user identifier."""
+    message = update.effective_message
+    user = update.effective_user
+    username = "unknown" if user is None else user.name
+    userID = "unknown" if user is None else user.id
+
+    logger.info(f"UserID command issued by {username} (user_id: {userID}).")
+
+    if user is None:
+        try:
+            await message.reply_text(text="Unable to resolve a user id for this update.")
+        except Exception as err:
+            logger.error(f"Exception while replying to a telegram message:\n{err}")
+        return
+
+    try:
+        await message.reply_text(text=f"User ID: {user.id}")
+    except Exception as err:
+        logger.error(f"Exception while replying to a telegram message:\n{err}")
 
 
 
@@ -2874,6 +2919,8 @@ def main() -> None:
     application.add_handler(CommandHandler("dashboard", dashboard, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("help", help))
     application.add_handler(CommandHandler("info", info))
+    application.add_handler(CommandHandler("botid", botID))
+    application.add_handler(CommandHandler("userid", userID))
     application.add_handler(CommandHandler("statistics", statisticsManager))
     application.add_handler(CommandHandler("password", setPassword, filters=filters.ChatType.PRIVATE))
 

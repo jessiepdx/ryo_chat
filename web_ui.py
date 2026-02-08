@@ -19,7 +19,10 @@
 
 import json
 import logging
+import os
+import re
 import secrets
+import socket
 from datetime import datetime
 from flask import Flask, request, abort, url_for, redirect, session, render_template, g, jsonify
 from hypermindlabs.utils import ConfigManager, CustomFormatter, MemberManager, KnowledgeManager
@@ -91,6 +94,87 @@ if miniappConfigIssues:
         ", ".join(miniappConfigIssues),
     )
 
+
+def _runtime_int(path: str, default: int) -> int:
+    return config.runtimeInt(path, default)
+
+
+def _runtime_bool(path: str, default: bool) -> bool:
+    return config.runtimeBool(path, default)
+
+
+def _runtime_str(path: str, default: str) -> str:
+    value = config.runtimeValue(path, default)
+    text = default if value is None else str(value).strip()
+    return text if text else default
+
+
+def _normalize_bind_host(value: str | None) -> str:
+    host = str(value if value is not None else "").strip()
+    if host == "::":
+        return "0.0.0.0"
+    return host or "127.0.0.1"
+
+
+def _coerce_port(value: str | int | None, default: int) -> int:
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        port = int(default)
+    if port <= 0:
+        port = int(default)
+    if port > 65535:
+        port = 65535
+    return port
+
+
+def _display_host(bind_host: str) -> str:
+    cleaned = _normalize_bind_host(bind_host)
+    if cleaned == "0.0.0.0":
+        return "127.0.0.1"
+    return cleaned
+
+
+def _port_available(bind_host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((bind_host, port))
+        except OSError:
+            return False
+    return True
+
+
+def _select_bind_port(bind_host: str, starting_port: int, scan_limit: int) -> int:
+    max_attempts = max(0, int(scan_limit))
+    current = _coerce_port(starting_port, 4747)
+    for _ in range(max_attempts + 1):
+        if _port_available(bind_host, current):
+            return current
+        if current >= 65535:
+            break
+        current += 1
+    raise RuntimeError(
+        f"No available local port found for host {bind_host}. "
+        f"Start={starting_port}, scan_limit={scan_limit}"
+    )
+
+
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,96}$")
+
+
+def _set_auth_message(message: str, kind: str = "error") -> None:
+    session["auth_message"] = str(message)
+    session["auth_message_kind"] = str(kind)
+
+
+def _normalize_username(value: str | None) -> str:
+    return str(value or "").strip().lstrip("@")
+
+
+def _username_is_valid(value: str) -> bool:
+    return USERNAME_PATTERN.fullmatch(value) is not None
+
 availableMenu = [
     {
         "title": "Agent Playground",
@@ -131,6 +215,8 @@ app.secret_key = secrets.token_hex()
 @app.before_request
 def loadUser():
     # Build user data and menu data
+    g.authMessage = session.pop("auth_message", None)
+    g.authMessageKind = session.pop("auth_message_kind", "error")
     if "member_id" not in session:
         g.memberData = None
         g.menuData = None
@@ -148,7 +234,9 @@ def loadUser():
 def baseTemplateData():
     baseTemplateContext = {
         "memberData": g.memberData,
-        "menuData": g.menuData
+        "menuData": g.menuData,
+        "authMessage": g.authMessage,
+        "authMessageKind": g.authMessageKind,
     }
     return baseTemplateContext
 
@@ -347,20 +435,56 @@ def miniAppDashboard():
     
 @app.route("/login", methods=['POST'])
 def login():
-    print("Login")
-    # redirect to home page if not logged in
-    if request.method == 'POST':
-        print("POST")
-        # get the record for the username
-        username = request.form["username"]
-        password = request.form.get("userpass")
-        member = members.loginMember(username, password)
-        print(member)
-        
-        if member is not None:
-            session["member_id"] = member["member_id"]
-            
+    logger.info("Web login requested.")
+    username = _normalize_username(request.form.get("username"))
+    password = str(request.form.get("userpass") or "").strip()
+
+    if not username or not password:
+        _set_auth_message("Username and password are required.", kind="error")
         return redirect(url_for("index"))
+
+    member = members.loginMember(username, password)
+    if member is None:
+        _set_auth_message("Login failed. Check your username/password.", kind="error")
+        return redirect(url_for("index"))
+
+    session["member_id"] = member["member_id"]
+    _set_auth_message(f"Welcome back {member.get('first_name', username)}.", kind="success")
+    return redirect(url_for("index"))
+
+
+@app.route("/signup", methods=["POST"])
+def signup():
+    logger.info("Web signup requested.")
+    username = _normalize_username(request.form.get("username"))
+    password = str(request.form.get("userpass") or "").strip()
+    passwordConfirm = str(request.form.get("userpass-confirm") or "").strip()
+    firstName = str(request.form.get("first_name") or "").strip()
+    lastName = str(request.form.get("last_name") or "").strip()
+
+    if not username or not password:
+        _set_auth_message("Username and password are required to sign up.", kind="error")
+        return redirect(url_for("index"))
+    if not _username_is_valid(username):
+        _set_auth_message("Username must be 3-96 chars: letters, numbers, underscore.", kind="error")
+        return redirect(url_for("index"))
+    if password != passwordConfirm:
+        _set_auth_message("Password confirmation does not match.", kind="error")
+        return redirect(url_for("index"))
+
+    member, errorMessage = members.registerWebMember(
+        username=username,
+        password=password,
+        firstName=firstName or username,
+        lastName=lastName or None,
+    )
+    if member is None:
+        _set_auth_message(errorMessage or "Signup failed. Please try a different username.", kind="error")
+        return redirect(url_for("index"))
+
+    session["member_id"] = member["member_id"]
+    _set_auth_message(f"Signup complete. Welcome {member.get('first_name', username)}.", kind="success")
+    return redirect(url_for("index"))
 
 
 @app.post("/miniapp-login")
@@ -396,11 +520,32 @@ def miniappLogin():
 
 
 if __name__ == "__main__":
-    #print("Begin Flask Application")
     logger.info("RYO - begin web ui application.")
+    bindHost = _normalize_bind_host(os.getenv("RYO_WEB_RESOLVED_HOST", _runtime_str("web.host", "127.0.0.1")))
+    startPort = _coerce_port(
+        os.getenv("RYO_WEB_RESOLVED_PORT"),
+        _runtime_int("web.port", 4747),
+    )
+    scanLimit = max(0, _runtime_int("web.port_scan_limit", 100))
+    debugMode = _runtime_bool("web.debug", False)
+    useReloader = _runtime_bool("web.use_reloader", False) and debugMode
+
+    bindPort = _select_bind_port(bindHost, startPort, scanLimit)
+    publicHost = _display_host(bindHost)
+    publicURL = f"http://{publicHost}:{bindPort}/"
+    logger.info(
+        "Web UI runtime endpoint: %s (bind_host=%s, start_port=%s, scan_limit=%s, debug=%s, reloader=%s)",
+        publicURL,
+        bindHost,
+        startPort,
+        scanLimit,
+        debugMode,
+        useReloader,
+    )
 
     app.run(
-        host="0.0.0.0",
-        port=4747,
-        debug=True
+        host=bindHost,
+        port=bindPort,
+        debug=debugMode,
+        use_reloader=useReloader,
     )

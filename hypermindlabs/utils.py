@@ -151,6 +151,10 @@ class MemberManager:
                 cursor.execute(memberTelegramTable_sql)
                 connection.commit()
 
+                # Allow web-only accounts that are not yet linked to a Telegram user id.
+                cursor.execute("ALTER TABLE member_telegram ALTER COLUMN user_id DROP NOT NULL;")
+                connection.commit()
+
                 # Create the member password hash table
                 memberSecureTable_sql = """CREATE TABLE IF NOT EXISTS member_secure (
                     secure_id SERIAL PRIMARY KEY,
@@ -358,6 +362,111 @@ class MemberManager:
                 connection.close()
                 logger.debug(f"PostgreSQL connection is closed.")
 
+    def registerWebMember(
+        self,
+        username: str,
+        password: str,
+        firstName: str | None = None,
+        lastName: str | None = None,
+        email: str | None = None,
+    ) -> tuple[dict | None, str | None]:
+        logger.info("Register a new member from web signup.")
+        cleanUsername = str(username or "").strip().lstrip("@")
+        if cleanUsername == "":
+            return None, "Username is required."
+        if str(password or "").strip() == "":
+            return None, "Password is required."
+
+        connection = None
+        memberID = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+
+            cursor.execute(
+                """SELECT mem.member_id
+                FROM member_data AS mem
+                JOIN member_telegram AS tg
+                ON mem.member_id = tg.member_id
+                WHERE LOWER(tg.username) = LOWER(%s)
+                LIMIT 1;""",
+                (cleanUsername,),
+            )
+            existing = cursor.fetchone()
+            if existing is not None:
+                cursor.close()
+                return None, "Username is already in use."
+
+            memberData = {
+                "first_name": str(firstName or cleanUsername).strip(),
+                "last_name": str(lastName).strip() if lastName else None,
+                "email": str(email).strip() if email else None,
+                "roles": ["user"],
+                "register_date": datetime.now(),
+                "community_score": 0,
+            }
+
+            cursor.execute(
+                """INSERT INTO member_data (first_name, last_name, email, roles, register_date, community_score)
+                VALUES (%(first_name)s, %(last_name)s, %(email)s, %(roles)s, %(register_date)s, %(community_score)s)
+                RETURNING member_id;""",
+                memberData,
+            )
+            result = cursor.fetchone()
+            memberID = result.get("member_id") if result else None
+            if memberID is None:
+                cursor.close()
+                return None, "Unable to allocate member id."
+
+            cursor.execute(
+                """INSERT INTO member_telegram (member_id, first_name, last_name, username, user_id)
+                VALUES (%s, %s, %s, %s, %s);""",
+                (
+                    memberID,
+                    memberData["first_name"],
+                    memberData["last_name"],
+                    cleanUsername,
+                    None,
+                ),
+            )
+            connection.commit()
+            cursor.close()
+        except psycopg.Error as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+            return None, "Database error during signup."
+        finally:
+            if connection:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+
+        if memberID is None:
+            return None, "Signup failed."
+
+        configuredPassword = self.setPassword(memberID, password=password)
+        if configuredPassword is None:
+            cleanupConnection = None
+            try:
+                cleanupConnection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
+                cleanupCursor = cleanupConnection.cursor()
+                cleanupCursor.execute("DELETE FROM member_data WHERE member_id = %s;", (memberID,))
+                cleanupConnection.commit()
+                cleanupCursor.close()
+            except psycopg.Error as error:
+                logger.error(f"Exception while cleaning up failed signup:\n{error}")
+            finally:
+                if cleanupConnection:
+                    cleanupConnection.close()
+            minPasswordLength = ConfigManager().runtimeInt("security.password_min_length", 12)
+            return (
+                None,
+                "Password does not meet policy. "
+                f"Use at least {max(8, minPasswordLength)} chars with uppercase, lowercase, digits, and symbols.",
+            )
+
+        member = self.getMemberByID(memberID)
+        return member, None
+
     def loginMember(self, username: str, password: str) -> dict:
         logger.info(f"Login member with username and password.")
         # Get primary key and register date by the username
@@ -372,7 +481,7 @@ class MemberManager:
             FROM member_data AS mem
             JOIN member_telegram AS tg
             ON mem.member_id = tg.member_id
-            WHERE tg.username = %s
+            WHERE LOWER(tg.username) = LOWER(%s)
             LIMIT 1;"""
 
             cursor.execute(getSaltQuery_sql, (username, ))

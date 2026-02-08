@@ -45,6 +45,33 @@ class TestRuntimeSettings(unittest.TestCase):
         )
         self.assertEqual(overridden["inference"]["default_ollama_host"], "http://ryo-ollama:11434")
 
+    def test_build_runtime_settings_supports_startup_bool_overrides(self):
+        settings = build_runtime_settings(
+            config_data={},
+            env_data={
+                "RYO_PROMPT_MODEL_SELECTION_ON_STARTUP": "true",
+                "RYO_WATCHDOG_AUTO_START_ROUTES": "false",
+            },
+        )
+        self.assertTrue(settings["inference"]["prompt_model_selection_on_startup"])
+        self.assertFalse(settings["watchdog"]["auto_start_routes"])
+
+    def test_build_runtime_settings_hydrates_from_public_community_requirements(self):
+        config_data = {
+            "runtime": {
+                "telegram": {
+                    "minimum_community_score_private_chat": 33,
+                }
+            },
+            "community_score_requirements": {
+                "private_chat": 90,
+                "link_sharing": 55,
+            },
+        }
+        settings = build_runtime_settings(config_data=config_data, env_data={})
+        self.assertEqual(settings["telegram"]["minimum_community_score_private_chat"], 90)
+        self.assertEqual(settings["telegram"]["minimum_community_score_link"], 55)
+
     def test_load_dotenv_file_parses_basic_lines(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             dotenv_path = Path(tmp_dir) / ".env"
