@@ -68,6 +68,38 @@ def venv_python_path(venv_dir: Path) -> Path:
     return venv_dir / "bin" / "python"
 
 
+def _normalized_path(value: str | Path | None) -> Path | None:
+    if value is None:
+        return None
+    try:
+        return Path(value).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def is_active_target_venv(
+    target_venv_dir: Path,
+    *,
+    current_prefix: str | Path | None = None,
+    virtual_env_var: str | None = None,
+) -> bool:
+    target = _normalized_path(target_venv_dir)
+    if target is None:
+        return False
+
+    if current_prefix is None:
+        current_prefix = sys.prefix
+    if virtual_env_var is None:
+        virtual_env_var = os.getenv("VIRTUAL_ENV")
+
+    active_from_env = _normalized_path(virtual_env_var)
+    if active_from_env is not None and active_from_env == target:
+        return True
+
+    active_from_prefix = _normalized_path(current_prefix)
+    return active_from_prefix is not None and active_from_prefix == target
+
+
 def run_command(
     command: list[str],
     *,
@@ -90,9 +122,8 @@ def ensure_venv_and_reexec() -> None:
         print(f"[bootstrap] Creating virtual environment at {VENV_DIR} ...")
         run_command([sys.executable, "-m", "venv", str(VENV_DIR)], cwd=PROJECT_ROOT, check=True)
 
-    current = Path(sys.executable).resolve()
-    target = venv_python.resolve()
-    if current != target:
+    if not is_active_target_venv(VENV_DIR):
+        target = venv_python
         print(f"[bootstrap] Re-launching under virtual environment: {target}")
         os.execv(str(target), [str(target), str(Path(__file__).resolve()), *sys.argv[1:]])
 
@@ -654,7 +685,11 @@ def bootstrap_ollama_and_models(
         print("[ollama] Missing models detected:")
         for name in missing:
             print(f"  - {name}")
-        if prompt_yes_no("Pull missing models now?", default=True, non_interactive=non_interactive):
+        if prompt_yes_no(
+            "Pull missing models now?",
+            default=(not non_interactive),
+            non_interactive=non_interactive,
+        ):
             for model_name in missing:
                 ok = pull_model(model_name)
                 if ok:

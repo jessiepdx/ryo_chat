@@ -5,6 +5,33 @@ import app
 
 
 class TestAppLauncher(unittest.TestCase):
+    def test_is_active_target_venv_from_prefix(self):
+        self.assertTrue(
+            app.is_active_target_venv(
+                app.PROJECT_ROOT / ".venv",
+                current_prefix=app.PROJECT_ROOT / ".venv",
+                virtual_env_var=None,
+            )
+        )
+
+    def test_is_active_target_venv_from_env_var(self):
+        self.assertTrue(
+            app.is_active_target_venv(
+                app.PROJECT_ROOT / ".venv",
+                current_prefix="/usr",
+                virtual_env_var=str(app.PROJECT_ROOT / ".venv"),
+            )
+        )
+
+    def test_is_active_target_venv_false_for_system_prefix(self):
+        self.assertFalse(
+            app.is_active_target_venv(
+                app.PROJECT_ROOT / ".venv",
+                current_prefix="/usr",
+                virtual_env_var=None,
+            )
+        )
+
     def test_should_run_setup_when_config_was_created(self):
         state = {"setup_completed": True}
         artifacts = {"created_config": True}
