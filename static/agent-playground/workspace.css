@@ -248,7 +248,7 @@
 
 .ap-pane-toolbar {
     display: grid;
-    grid-template-columns: 1.4fr 1fr 1fr;
+    grid-template-columns: 1.4fr 1fr 1fr 1fr;
     gap: 0.4rem;
 }
 
@@ -294,6 +294,34 @@
     flex-direction: column;
     gap: 0.2rem;
     font-size: 0.85rem;
+}
+
+.ap-trace-row-depth {
+    padding-left: calc(0.45rem + (var(--ap-trace-depth, 0) * 0.5rem));
+}
+
+.ap-trace-group-row {
+    border: 1px solid var(--accent-border);
+    background-color: #1a2430;
+    color: #d6e4f3;
+    min-height: 2rem;
+    padding: 0.35rem 0.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    font-size: 0.78rem;
+}
+
+.ap-trace-group-title {
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04rem;
+}
+
+.ap-trace-group-meta {
+    color: #9fb2c8;
+    font-size: 0.74rem;
 }
 
 .ap-trace-headline {
@@ -418,6 +446,106 @@
     letter-spacing: 0.04rem;
 }
 
+.ap-action-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+}
+
+.ap-state-editor {
+    width: 100%;
+    min-height: 8rem;
+    resize: vertical;
+    background-color: #111720;
+    border: 1px solid var(--accent-border);
+    color: #dce6f0;
+    padding: 0.55rem 0.65rem;
+    font-family: "Fira Code", monospace;
+    font-size: 0.78rem;
+    line-height: 1.35;
+}
+
+.ap-workflow-graph {
+    display: grid;
+    gap: 0.35rem;
+}
+
+.ap-workflow-node {
+    border: 1px dashed var(--accent-border);
+    background-color: #111923;
+    padding: 0.4rem 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+}
+
+.ap-workflow-node strong {
+    font-size: 0.76rem;
+    letter-spacing: 0.03rem;
+    text-transform: uppercase;
+    color: #9dc6e4;
+}
+
+.ap-workflow-node span {
+    font-size: 0.8rem;
+    color: #d5e0ec;
+}
+
+.ap-result-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+}
+
+.ap-result-table th,
+.ap-result-table td {
+    border: 1px solid var(--accent-border);
+    padding: 0.35rem 0.45rem;
+    vertical-align: top;
+}
+
+.ap-result-table th {
+    text-transform: uppercase;
+    letter-spacing: 0.04rem;
+    font-size: 0.72rem;
+    color: #9dc6e4;
+}
+
+.ap-compare-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 0.4rem;
+}
+
+.ap-compare-card {
+    border: 1px solid var(--accent-border);
+    background-color: #111923;
+    padding: 0.45rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.22rem;
+}
+
+.ap-compare-card strong {
+    font-size: 0.8rem;
+    color: #cbe2f4;
+}
+
+.ap-compare-card span {
+    font-size: 0.72rem;
+    color: #9db4c7;
+    text-transform: uppercase;
+}
+
+.ap-compare-card pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: "Fira Code", monospace;
+    font-size: 0.72rem;
+    color: #d8e6f3;
+}
+
 .ap-inspector-header {
     display: flex;
     gap: 0.35rem;
@@ -454,6 +582,16 @@
     gap: var(--micro-rem);
     height: auto;
     min-height: max-content;
+}
+
+.ap-mode-helper {
+    grid-column: 1 / -1;
+    border: 1px solid var(--accent-border);
+    background-color: #1a2430;
+    color: #d8e6f3;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    padding: 0.45rem 0.6rem;
 }
 
 #ap-input {
@@ -722,6 +860,7 @@
 .ap-pane-select,
 .ap-chat-message,
 .ap-trace-row,
+.ap-trace-group-row,
 .ap-card,
 .ap-details,
 #ap-input,
@@ -729,6 +868,9 @@
 .ap-side-card,
 .ap-model-requested-row input,
 .ap-model-requested-row select,
-.ap-side-json {
+.ap-side-json,
+.ap-state-editor,
+.ap-workflow-node,
+.ap-compare-card {
     border-radius: var(--ap-panel-radius);
 }

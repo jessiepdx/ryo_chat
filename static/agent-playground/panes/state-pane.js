@@ -18,11 +18,15 @@ function createCard(title) {
 }
 
 class StatePane {
-    constructor(containerElement) {
+    constructor(containerElement, handlers = {}) {
         this.container = containerElement;
+        this.handlers = handlers && typeof handlers === "object" ? handlers : {};
         this.run = null;
         this.snapshots = [];
         this.selectedEvent = null;
+        this.replayDraft = "";
+        this.replayDraftSeq = null;
+        this.replayDraftError = "";
         this.render();
     }
 
@@ -57,6 +61,46 @@ class StatePane {
         return this.snapshots[this.snapshots.length - 1];
     }
 
+    _notifyStatus(message) {
+        const callback = this.handlers?.onStatus;
+        if (typeof callback === "function") {
+            callback(String(message || ""));
+        }
+    }
+
+    _notifyReplayFromStep(stepSeq) {
+        const callback = this.handlers?.onReplayFromStep;
+        if (typeof callback !== "function") {
+            return;
+        }
+        callback(Number.parseInt(stepSeq, 10));
+    }
+
+    _notifyReplayWithState(stepSeq, stateOverrides) {
+        const callback = this.handlers?.onReplayWithState;
+        if (typeof callback !== "function") {
+            return;
+        }
+        callback(
+            Number.parseInt(stepSeq, 10),
+            (stateOverrides && typeof stateOverrides === "object") ? stateOverrides : {},
+        );
+    }
+
+    _setReplayDraft(snapshot) {
+        const seq = Number.parseInt(snapshot?.step_seq, 10);
+        if (!Number.isFinite(seq)) {
+            return;
+        }
+        if (this.replayDraftSeq === seq && this.replayDraft) {
+            return;
+        }
+        const state = snapshot && typeof snapshot.state === "object" ? snapshot.state : {};
+        this.replayDraft = JSON.stringify(state, null, 2);
+        this.replayDraftSeq = seq;
+        this.replayDraftError = "";
+    }
+
     _appendRunSummary() {
         const card = createCard("Run State");
         const values = document.createElement("div");
@@ -82,6 +126,74 @@ class StatePane {
         }
         card.appendChild(values);
         this.container.appendChild(card);
+    }
+
+    _appendReplayControls(currentSnapshot) {
+        const stepSeq = Number.parseInt(currentSnapshot?.step_seq, 10);
+        if (!Number.isFinite(stepSeq)) {
+            return;
+        }
+        this._setReplayDraft(currentSnapshot);
+
+        const replayCard = createCard("Replay Controls");
+
+        const helper = document.createElement("div");
+        helper.className = "ap-row-meta";
+        helper.textContent = `Replay source step: ${stepSeq}`;
+        replayCard.appendChild(helper);
+
+        const actionRow = document.createElement("div");
+        actionRow.className = "ap-action-row";
+
+        const replayStepButton = document.createElement("button");
+        replayStepButton.type = "button";
+        replayStepButton.textContent = "Replay From Selected Step";
+        replayStepButton.addEventListener("click", () => {
+            this._notifyStatus(`Replaying from step #${stepSeq}...`);
+            this._notifyReplayFromStep(stepSeq);
+        });
+        actionRow.appendChild(replayStepButton);
+
+        const replayEditedButton = document.createElement("button");
+        replayEditedButton.type = "button";
+        replayEditedButton.textContent = "Replay With Edited State";
+        replayEditedButton.addEventListener("click", () => {
+            let parsedState = {};
+            try {
+                parsedState = JSON.parse(this.replayDraft || "{}");
+            } catch (_error) {
+                this.replayDraftError = "Edited state must be valid JSON.";
+                this.render();
+                return;
+            }
+            if (!parsedState || typeof parsedState !== "object" || Array.isArray(parsedState)) {
+                this.replayDraftError = "Edited state must be a JSON object.";
+                this.render();
+                return;
+            }
+            this.replayDraftError = "";
+            this._notifyStatus(`Replaying from step #${stepSeq} with edited state...`);
+            this._notifyReplayWithState(stepSeq, parsedState);
+        });
+        actionRow.appendChild(replayEditedButton);
+
+        replayCard.appendChild(actionRow);
+
+        const editor = document.createElement("textarea");
+        editor.className = "ap-state-editor";
+        editor.value = this.replayDraft || "{}";
+        editor.addEventListener("input", () => {
+            this.replayDraft = editor.value;
+            this.replayDraftError = "";
+        });
+        replayCard.appendChild(editor);
+
+        const editorMeta = document.createElement("div");
+        editorMeta.className = `ap-row-meta ${this.replayDraftError ? "ap-error" : ""}`.trim();
+        editorMeta.textContent = this.replayDraftError || "Edit JSON state overrides, then replay.";
+        replayCard.appendChild(editorMeta);
+
+        this.container.appendChild(replayCard);
     }
 
     _appendSelectedSnapshot() {
@@ -131,6 +243,7 @@ class StatePane {
         rawState.appendChild(rawBody);
         currentCard.appendChild(rawState);
         this.container.appendChild(currentCard);
+        this._appendReplayControls(currentSnapshot);
 
         const previous = this._snapshotForSeq(Number.parseInt(currentSnapshot.step_seq, 10) - 1);
         if (!previous || !previous.state || !currentSnapshot.state) {

@@ -1475,12 +1475,27 @@ select {
 
 #panel-sections {
     display: grid;
-    grid-template-columns: var(--left-panel-width) minmax(0, 1fr) var(--right-panel-width);
-    grid-template-areas: "left center right";
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "center";
     align-items: stretch;
     gap: var(--panel-gap);
     min-height: 0;
     overflow: hidden;
+}
+
+#panel-sections[data-left-open="1"][data-right-open="0"] {
+    grid-template-columns: var(--left-panel-width) minmax(0, 1fr);
+    grid-template-areas: "left center";
+}
+
+#panel-sections[data-left-open="0"][data-right-open="1"] {
+    grid-template-columns: minmax(0, 1fr) var(--right-panel-width);
+    grid-template-areas: "center right";
+}
+
+#panel-sections[data-left-open="1"][data-right-open="1"] {
+    grid-template-columns: var(--left-panel-width) minmax(0, 1fr) var(--right-panel-width);
+    grid-template-areas: "left center right";
 }
 
 #left-panel {

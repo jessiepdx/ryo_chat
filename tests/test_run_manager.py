@@ -87,6 +87,27 @@ class RunManagerTests(unittest.TestCase):
         self.assertEqual(replay["parent_run_id"], source["run_id"])
         self.assertEqual(replay["lineage"]["type"], "replay")
 
+    def test_replay_run_records_override_lineage(self):
+        manager = RunManager(execute_fn=lambda _m, _r: {"response": "ok"}, enable_db=False)
+        source = manager.create_run(
+            member_id=13,
+            mode="chat",
+            request_payload={"message": "lineage replay"},
+            auto_start=False,
+        )
+
+        replay = manager.replay_run(
+            source["run_id"],
+            replay_from_seq=4,
+            state_overrides={"memory": {"summary": "edited"}},
+            auto_start=False,
+        )
+        self.assertEqual(replay["lineage"]["type"], "replay")
+        self.assertEqual(replay["lineage"]["replay_from_seq"], 4)
+        self.assertTrue(replay["lineage"]["has_state_overrides"])
+        self.assertIn("memory", replay["lineage"]["state_override_keys"])
+        self.assertEqual(replay["request"]["state_overrides"]["memory"]["summary"], "edited")
+
     def test_metrics_summary_reports_status_counts(self):
         manager = RunManager(execute_fn=lambda _m, _r: {"response": "ok"}, enable_db=False)
         run = manager.create_run(

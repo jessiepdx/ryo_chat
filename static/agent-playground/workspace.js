@@ -29,6 +29,7 @@ const fallbackRunModes = [
 ];
 
 const workspacePrefsStorageKey = "ryo.agent-playground.workspace-prefs.v1";
+const runModeStorageKey = "ryo.agent-playground.last-mode.v1";
 const paneDefinitions = Object.freeze([
     { key: "schema", label: "Schema", elementID: "ap-schema-pane" },
     { key: "chat", label: "Chat", elementID: "ap-chat-pane" },
@@ -84,7 +85,11 @@ class AgentPlaygroundApp {
 
         this.chatPane = new ChatPane(document.querySelector("[data-pane='chat']"));
         this.tracePane = new TracePane(document.querySelector("[data-pane='trace']"), (event) => this.onTraceSelect(event));
-        this.statePane = new StatePane(document.querySelector("[data-pane='state']"));
+        this.statePane = new StatePane(document.querySelector("[data-pane='state']"), {
+            onStatus: (message) => this.setStatus(message),
+            onReplayFromStep: (stepSeq) => this.replayFromStep(stepSeq),
+            onReplayWithState: (stepSeq, stateOverrides) => this.replayWithState(stepSeq, stateOverrides),
+        });
         this.artifactsPane = new ArtifactsPane(document.querySelector("[data-pane='artifacts']"));
         this.inspectorPane = new InspectorPane(document.querySelector("[data-pane='inspector']"));
 
@@ -129,6 +134,7 @@ class AgentPlaygroundApp {
         this.optionsRenderer = null;
         this.schemaSources = new Map();
         this.modelInventory = [];
+        this.preferredRunMode = this._loadPreferredRunMode();
         this.workspacePrefs = this._loadWorkspacePrefs();
         this._bindPaneCollapseButtons();
         this._applyWorkspacePrefs();
@@ -204,6 +210,31 @@ class AgentPlaygroundApp {
                 workspacePrefsStorageKey,
                 JSON.stringify(this.workspacePrefs),
             );
+        } catch (_error) {
+            return;
+        }
+    }
+
+    _loadPreferredRunMode() {
+        try {
+            const stored = String(window.localStorage.getItem(runModeStorageKey) || "").trim().toLowerCase();
+            if (stored && modeBuilders[stored]) {
+                return stored;
+            }
+        } catch (_error) {
+            return "chat";
+        }
+        return "chat";
+    }
+
+    _savePreferredRunMode(mode) {
+        const normalized = String(mode || "").trim().toLowerCase();
+        if (!modeBuilders[normalized]) {
+            return;
+        }
+        this.preferredRunMode = normalized;
+        try {
+            window.localStorage.setItem(runModeStorageKey, normalized);
         } catch (_error) {
             return;
         }
@@ -661,6 +692,13 @@ class AgentPlaygroundApp {
             option.textContent = mode.label || mode.id;
             this.refs.modeSelect.appendChild(option);
         }
+
+        const fallbackMode = String(modes[0]?.id || "chat");
+        const preferred = this.preferredRunMode && modeBuilders[this.preferredRunMode]
+            ? this.preferredRunMode
+            : fallbackMode;
+        const hasPreferred = modes.some((mode) => String(mode.id) === preferred);
+        this.refs.modeSelect.value = hasPreferred ? preferred : fallbackMode;
     }
 
     configureSchemaForm(manifest) {
@@ -747,6 +785,12 @@ class AgentPlaygroundApp {
         });
         this.refs.layoutReset?.addEventListener("click", () => {
             this._resetPaneLayout();
+        });
+        this.refs.modeSelect?.addEventListener("change", () => {
+            this._savePreferredRunMode(this.getMode());
+            if (!this.activeRunID() && this.refs.runModeActive) {
+                this.refs.runModeActive.textContent = this.getMode();
+            }
         });
         this.refs.runHistory?.addEventListener("change", () => {
             const runID = String(this.refs.runHistory.value || "").trim();
@@ -1017,6 +1061,52 @@ class AgentPlaygroundApp {
         }
     }
 
+    async _activateSpawnedRun(run) {
+        if (!run || !run.run_id) {
+            return;
+        }
+        this.store.reset();
+        this.setRunMeta(run);
+        this.setStatus(run.status || "queued");
+        this.upsertRunHistory(run);
+        await this.refreshRunDetail(run.run_id);
+        this.connectStream(run.run_id);
+        this.refreshMetrics();
+    }
+
+    async replayFromStep(stepSeq) {
+        const runID = this.activeRunID();
+        if (!runID) {
+            return;
+        }
+        const normalizedSeq = Number.parseInt(stepSeq, 10);
+        const payload = await replayRun(this.apiBase, runID, {
+            replay_from_seq: Number.isNaN(normalizedSeq) ? undefined : normalizedSeq,
+        });
+        if (payload?.run?.run_id) {
+            await this._activateSpawnedRun(payload.run);
+        } else if (payload?.message) {
+            this.setStatus(String(payload.message));
+        }
+    }
+
+    async replayWithState(stepSeq, stateOverrides) {
+        const runID = this.activeRunID();
+        if (!runID) {
+            return;
+        }
+        const normalizedSeq = Number.parseInt(stepSeq, 10);
+        const payload = await replayRun(this.apiBase, runID, {
+            replay_from_seq: Number.isNaN(normalizedSeq) ? undefined : normalizedSeq,
+            state_overrides: (stateOverrides && typeof stateOverrides === "object") ? stateOverrides : {},
+        });
+        if (payload?.run?.run_id) {
+            await this._activateSpawnedRun(payload.run);
+        } else if (payload?.message) {
+            this.setStatus(String(payload.message));
+        }
+    }
+
     async replayActiveRun() {
         const runID = this.activeRunID();
         if (!runID) {
@@ -1024,18 +1114,7 @@ class AgentPlaygroundApp {
         }
         const selected = this.store.getSelectedEvent();
         const stepSeq = selected?.seq ? Number.parseInt(selected.seq, 10) : undefined;
-        const payload = await replayRun(this.apiBase, runID, {
-            replay_from_seq: Number.isNaN(stepSeq) ? undefined : stepSeq,
-        });
-        if (payload?.run?.run_id) {
-            this.store.reset();
-            this.setRunMeta(payload.run);
-            this.setStatus(payload.run.status || "queued");
-            this.upsertRunHistory(payload.run);
-            await this.refreshRunDetail(payload.run.run_id);
-            this.connectStream(payload.run.run_id);
-            this.refreshMetrics();
-        }
+        await this.replayFromStep(stepSeq);
     }
 
     async resumeActiveRun() {
@@ -1045,13 +1124,7 @@ class AgentPlaygroundApp {
         }
         const payload = await resumeRun(this.apiBase, runID);
         if (payload?.run?.run_id) {
-            this.store.reset();
-            this.setRunMeta(payload.run);
-            this.setStatus(payload.run.status || "queued");
-            this.upsertRunHistory(payload.run);
-            await this.refreshRunDetail(payload.run.run_id);
-            this.connectStream(payload.run.run_id);
-            this.refreshMetrics();
+            await this._activateSpawnedRun(payload.run);
         }
     }
 

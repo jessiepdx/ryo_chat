@@ -26,10 +26,12 @@ class TracePane {
         this.onSelect = onSelect;
         this.activeSeq = null;
         this.events = [];
+        this.collapsedRoots = new Set();
         this.filters = {
             query: "",
             eventType: "all",
             status: "all",
+            view: "grouped",
         };
         this.render();
     }
@@ -186,7 +188,98 @@ class TracePane {
         });
         wrapper.appendChild(statusSelect);
 
+        const viewSelect = document.createElement("select");
+        viewSelect.className = "ap-pane-select";
+        for (const view of ["grouped", "flat"]) {
+            const option = document.createElement("option");
+            option.value = view;
+            option.textContent = view === "grouped" ? "Nested timeline" : "Flat timeline";
+            if (view === this.filters.view) {
+                option.selected = true;
+            }
+            viewSelect.appendChild(option);
+        }
+        viewSelect.addEventListener("change", () => {
+            this.filters.view = viewSelect.value;
+            this.render();
+        });
+        wrapper.appendChild(viewSelect);
+
         target.appendChild(wrapper);
+    }
+
+    _rootKey(event) {
+        const stage = String(event?.stage || "").trim();
+        if (stage) {
+            const token = stage.split(".")[0].trim();
+            if (token) {
+                return token;
+            }
+        }
+        const eventType = String(event?.event_type || "").trim();
+        if (eventType) {
+            const token = eventType.split(".")[0].trim();
+            if (token) {
+                return token;
+            }
+        }
+        return "runtime";
+    }
+
+    _stageDepth(event) {
+        const stage = String(event?.stage || "").trim();
+        if (!stage) {
+            return 0;
+        }
+        const parts = stage.split(".").map((item) => item.trim()).filter(Boolean);
+        return Math.max(0, parts.length - 1);
+    }
+
+    _groupEvents(events) {
+        const grouped = new Map();
+        for (const event of events) {
+            const root = this._rootKey(event);
+            const bucket = grouped.get(root);
+            if (bucket) {
+                bucket.push(event);
+            } else {
+                grouped.set(root, [event]);
+            }
+        }
+        return Array.from(grouped.entries()).map(([root, groupedEvents]) => ({
+            root,
+            events: groupedEvents,
+        }));
+    }
+
+    _buildGroupHeader(group) {
+        const header = document.createElement("button");
+        header.type = "button";
+        header.className = "ap-trace-group-row";
+        const collapsed = this.collapsedRoots.has(group.root);
+        header.setAttribute("aria-expanded", collapsed ? "false" : "true");
+
+        const left = document.createElement("div");
+        left.className = "ap-trace-group-title";
+        const caret = collapsed ? "▶" : "▼";
+        left.textContent = `${caret} ${group.root}`;
+        header.appendChild(left);
+
+        const right = document.createElement("div");
+        right.className = "ap-trace-group-meta";
+        const latest = group.events[group.events.length - 1] || {};
+        right.textContent = `${group.events.length} step(s) | latest ${String(latest.status || "info")}`;
+        header.appendChild(right);
+
+        header.addEventListener("click", () => {
+            if (collapsed) {
+                this.collapsedRoots.delete(group.root);
+            } else {
+                this.collapsedRoots.add(group.root);
+            }
+            this.render();
+        });
+        return header;
     }
 
     _buildRow(event) {
@@ -194,6 +287,8 @@ class TracePane {
         row.className = "ap-trace-row";
         row.type = "button";
         row.dataset.seq = String(event.seq);
+        row.style.setProperty("--ap-trace-depth", String(this._stageDepth(event)));
+        row.classList.add("ap-trace-row-depth");
 
         if (this.activeSeq !== null && Number.parseInt(event.seq, 10) === this.activeSeq) {
             row.classList.add("active");
@@ -262,9 +357,22 @@ class TracePane {
             this.container.appendChild(empty);
             return;
         }
+        if (this.filters.view === "flat") {
+            for (const event of events) {
+                this.container.appendChild(this._buildRow(event));
+            }
+            return;
+        }
 
-        for (const event of events) {
-            this.container.appendChild(this._buildRow(event));
+        const grouped = this._groupEvents(events);
+        for (const group of grouped) {
+            this.container.appendChild(this._buildGroupHeader(group));
+            if (this.collapsedRoots.has(group.root)) {
+                continue;
+            }
+            for (const event of group.events) {
+                this.container.appendChild(this._buildRow(event));
+            }
         }
     }
 }

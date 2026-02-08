@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from hypermindlabs.run_events import TERMINAL_STATUSES, make_event
 from hypermindlabs.run_mode_handlers import normalize_run_mode
+from hypermindlabs.state_snapshot_store import build_replay_state_plan
 
 
 logger = logging.getLogger(__name__)
@@ -608,11 +609,12 @@ class RunManager:
             raise KeyError(f"Unknown run id: {run_id}")
 
         request_payload = _coerce_dict(source.get("request"))
+        override_payload = _coerce_dict(state_overrides)
         request_payload["source_run_id"] = run_id
         if isinstance(replay_from_seq, int) and replay_from_seq > 0:
             request_payload["replay_from_seq"] = replay_from_seq
-        if isinstance(state_overrides, dict) and state_overrides:
-            request_payload["state_overrides"] = deepcopy(state_overrides)
+        if override_payload:
+            request_payload["state_overrides"] = deepcopy(override_payload)
 
         self.append_event(
             run_id,
@@ -621,7 +623,8 @@ class RunManager:
             status="info",
             payload={
                 "replay_from_seq": replay_from_seq,
-                "has_state_overrides": bool(state_overrides),
+                "has_state_overrides": bool(override_payload),
+                "state_override_keys": sorted(override_payload.keys()),
             },
         )
 
@@ -634,6 +637,8 @@ class RunManager:
                 "type": "replay",
                 "from_run_id": run_id,
                 "replay_from_seq": replay_from_seq,
+                "has_state_overrides": bool(override_payload),
+                "state_override_keys": sorted(override_payload.keys()),
             },
             auto_start=auto_start,
         )
@@ -1053,8 +1058,33 @@ class RunManager:
                 merged_options.setdefault(key, value)
             payload["options"] = merged_options
 
-        replay_from_seq = payload.get("replay_from_seq")
+        replay_from_seq_raw = payload.get("replay_from_seq")
+        try:
+            replay_from_seq = int(replay_from_seq_raw) if replay_from_seq_raw is not None else None
+        except (TypeError, ValueError):
+            replay_from_seq = None
         state_overrides = _coerce_dict(payload.get("state_overrides"))
+        source_snapshots = self.get_snapshots(source_run_id, limit=1000) if source_run_id else []
+        replay_plan = build_replay_state_plan(source_snapshots, replay_from_seq, state_overrides)
+        selected_snapshot_seq = replay_plan.get("selected_snapshot_seq")
+        merged_state = _coerce_dict(replay_plan.get("merged_state"))
+        override_keys = replay_plan.get("override_keys") if isinstance(replay_plan.get("override_keys"), list) else []
+
+        context_payload = _coerce_dict(payload.get("context"))
+        replay_context = _coerce_dict(context_payload.get("replay_context"))
+        replay_context.update(
+            {
+                "source_run_id": source_run_id or None,
+                "replay_from_seq": replay_from_seq,
+                "selected_snapshot_seq": selected_snapshot_seq,
+                "state_override_keys": override_keys,
+                "has_state_overrides": bool(state_overrides),
+            }
+        )
+        if merged_state:
+            replay_context["state"] = merged_state
+        context_payload["replay_context"] = replay_context
+        payload["context"] = context_payload
 
         self.append_event(
             run["run_id"],
@@ -1064,7 +1094,21 @@ class RunManager:
             payload={
                 "source_run_id": source_run_id or None,
                 "replay_from_seq": replay_from_seq,
-                "state_overrides": state_overrides,
+                "selected_snapshot_seq": selected_snapshot_seq,
+                "state_override_keys": override_keys,
+                "has_state_overrides": bool(state_overrides),
+            },
+        )
+        self.append_artifact(
+            run["run_id"],
+            artifact_type="replay",
+            artifact_name="replay_state_plan",
+            artifact={
+                "source_run_id": source_run_id or None,
+                "replay_from_seq": replay_from_seq,
+                "selected_snapshot_seq": selected_snapshot_seq,
+                "state_override_keys": override_keys,
+                "merged_state": merged_state,
             },
         )
 
@@ -1073,6 +1117,8 @@ class RunManager:
         result = await self._execute_chat(run_copy)
         result["replay_source_run_id"] = source_run_id or None
         result["replay_from_seq"] = replay_from_seq
+        result["selected_snapshot_seq"] = selected_snapshot_seq
+        result["state_override_keys"] = override_keys
         return result
 
     def _execute_default(self, run_id: str) -> Any:

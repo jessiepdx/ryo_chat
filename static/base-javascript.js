@@ -27,6 +27,7 @@ function contentLoaded() {
     panelMan.addPanel(leftPanel, "left");
     panelMan.addPanel(centerPanel, "center");
     panelMan.addPanel(rightPanel, "right");
+    panelMan.syncLayoutState();
 
     // Show panels based on uiPrefs
     /*
