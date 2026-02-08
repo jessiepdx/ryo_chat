@@ -692,11 +692,136 @@
     list-style: disc;
 }
 
+.ap-side-inline-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 0.45rem;
+    align-items: center;
+}
+
+.ap-side-action-row {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.45rem;
+}
+
+.ap-side-label {
+    font-size: 0.74rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05rem;
+    color: #bfbfbf;
+}
+
+.ap-side-subhead {
+    font-size: 0.76rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06rem;
+    color: #d3ba83;
+    margin-top: 0.2rem;
+}
+
+.ap-side-json-editor {
+    width: 100%;
+    min-height: 5rem;
+    resize: vertical;
+    background-color: #121820;
+    border: 1px solid var(--accent-border);
+    color: #d8e3ef;
+    border-radius: 0.45rem;
+    padding: 0.5rem 0.6rem;
+    font-family: "Fira Code", monospace;
+    font-size: 0.75rem;
+    line-height: 1.35;
+}
+
+.ap-side-card input[type="text"],
+.ap-side-card input[type="number"],
+.ap-side-card select,
+.ap-side-card textarea {
+    min-height: 2rem;
+    border: 1px solid var(--accent-border);
+    border-radius: 0.45rem;
+    background-color: #191919;
+    color: #f4f4f4;
+    padding: 0.35rem 0.5rem;
+}
+
+.ap-side-card label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.78rem;
+    color: #d9d9d9;
+}
+
+.ap-side-card input[type="checkbox"] {
+    accent-color: var(--accent-primary);
+}
+
+.ap-side-history {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    max-height: 12rem;
+    overflow-y: auto;
+    border: 1px solid var(--accent-border);
+    border-radius: 0.45rem;
+    padding: 0.4rem;
+    background-color: rgba(15, 19, 24, 0.86);
+}
+
+.ap-side-history-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    border: 1px solid rgba(111, 129, 151, 0.35);
+    border-radius: 0.35rem;
+    padding: 0.3rem 0.4rem;
+    background-color: rgba(19, 25, 34, 0.9);
+}
+
+.ap-side-history-row.is-active {
+    border-color: var(--accent-primary);
+}
+
+.ap-side-history-row strong {
+    font-size: 0.74rem;
+    color: #f2f2f2;
+}
+
+.ap-side-history-row span {
+    font-size: 0.7rem;
+    color: #c9c9c9;
+}
+
+.ap-side-history-row em {
+    font-size: 0.72rem;
+    color: #d7bf8e;
+    font-style: normal;
+}
+
+.ap-schema-form-inline {
+    border: 1px solid var(--accent-border);
+    border-radius: 0.45rem;
+    padding: 0.45rem;
+    display: grid;
+    gap: 0.4rem;
+    background-color: rgba(16, 21, 28, 0.9);
+}
+
 .ap-side-muted {
     margin: 0;
     font-size: 0.78rem;
     color: #c8b17a;
     line-height: 1.35;
+}
+
+.ap-side-muted[data-kind="error"] {
+    color: #ffaaaa;
+}
+
+.ap-side-muted[data-kind="success"] {
+    color: #9ceabf;
 }
 
 .ap-model-requested-row {
@@ -751,6 +876,58 @@
     font-family: "Fira Code", monospace;
     font-size: 0.74rem;
     line-height: 1.4;
+}
+
+.ap-approval-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    max-height: 16rem;
+    overflow-y: auto;
+    border: 1px solid var(--accent-border);
+    border-radius: 0.45rem;
+    background-color: rgba(14, 14, 14, 0.85);
+    padding: 0.45rem;
+}
+
+.ap-approval-row {
+    border: 1px solid rgba(124, 143, 162, 0.45);
+    border-radius: 0.45rem;
+    padding: 0.45rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    background-color: rgba(19, 26, 35, 0.88);
+}
+
+.ap-approval-row-empty {
+    color: #b8c5d2;
+    font-size: 0.8rem;
+}
+
+.ap-approval-meta {
+    display: grid;
+    gap: 0.18rem;
+}
+
+.ap-approval-meta strong {
+    color: #f4f4f4;
+    font-size: 0.82rem;
+}
+
+.ap-approval-meta span {
+    color: #d0dbe8;
+    font-size: 0.73rem;
+}
+
+.ap-approval-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 0.35rem;
+}
+
+.ap-approval-reason {
+    min-height: 1.8rem;
 }
 
 @media (max-width: 1100px) {
@@ -829,6 +1006,15 @@
     }
 
     .ap-model-requested-row {
+        grid-template-columns: 1fr;
+    }
+
+    .ap-side-inline-grid,
+    .ap-side-action-row {
+        grid-template-columns: 1fr;
+    }
+
+    .ap-approval-actions {
         grid-template-columns: 1fr;
     }
 }

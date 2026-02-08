@@ -11,6 +11,10 @@ import { TracePane } from "./panes/trace-pane.js";
 import { StatePane } from "./panes/state-pane.js";
 import { ArtifactsPane } from "./panes/artifacts-pane.js";
 import { InspectorPane } from "./panes/inspector-pane.js";
+import { AgentBuilder } from "./agent-builder.js";
+import { ToolRegistryView } from "./tools/tool-registry-view.js";
+import { SandboxPolicyEditor } from "./tools/sandbox-policy-editor.js";
+import { ApprovalQueueView } from "./tools/approval-queue.js";
 
 const modeBuilders = {
     chat: buildChatPayload,
@@ -30,6 +34,28 @@ const fallbackRunModes = [
 
 const workspacePrefsStorageKey = "ryo.agent-playground.workspace-prefs.v1";
 const runModeStorageKey = "ryo.agent-playground.last-mode.v1";
+const modeGuidance = Object.freeze({
+    chat: {
+        helper: "Chat mode: Ask one question and run a single conversational pass.",
+        placeholder: "Enter a user prompt.",
+    },
+    workflow: {
+        helper: "Workflow mode: Use multiple lines to define sequential stage intents.",
+        placeholder: "Enter one workflow step per line (line 1 = step_1, line 2 = step_2, etc).",
+    },
+    batch: {
+        helper: "Batch mode: Submit one input per line and review row-by-row outcomes.",
+        placeholder: "Enter one batch input per line.",
+    },
+    compare: {
+        helper: "Compare mode: Run one prompt across multiple models and inspect output diffs.",
+        placeholder: "Enter one prompt to run across compare models.",
+    },
+    replay: {
+        helper: "Replay mode: Re-run a prior run or replay from a selected step/snapshot.",
+        placeholder: "Optional prompt override for replay context.",
+    },
+});
 const paneDefinitions = Object.freeze([
     { key: "schema", label: "Schema", elementID: "ap-schema-pane" },
     { key: "chat", label: "Chat", elementID: "ap-chat-pane" },
@@ -99,6 +125,7 @@ class AgentPlaygroundApp {
             runStatus: document.getElementById("ap-run-status"),
             runID: document.getElementById("ap-run-id"),
             runModeActive: document.getElementById("ap-run-mode-active"),
+            modeHelper: document.getElementById("ap-mode-helper"),
             input: document.getElementById("ap-input"),
             runBtn: document.getElementById("ap-run-btn"),
             startBtn: document.getElementById("ap-start-btn"),
@@ -129,11 +156,139 @@ class AgentPlaygroundApp {
             metricAvg: document.getElementById("ap-metric-avg"),
             metricCompleted: document.getElementById("ap-metric-completed"),
             metricFailed: document.getElementById("ap-metric-failed"),
+            agentDefinitionSelect: document.getElementById("ap-agent-definition-select"),
+            agentDefinitionVersion: document.getElementById("ap-agent-definition-version"),
+            agentDefinitionName: document.getElementById("ap-agent-definition-name"),
+            agentDefinitionSummary: document.getElementById("ap-agent-change-summary"),
+            agentDefinitionJSON: document.getElementById("ap-agent-definition-json"),
+            agentDefinitionStatus: document.getElementById("ap-agent-definition-status"),
+            agentDefinitionHistory: document.getElementById("ap-agent-definition-history"),
+            agentDefinitionRefresh: document.getElementById("ap-agent-definition-refresh"),
+            agentDefinitionNew: document.getElementById("ap-agent-definition-new"),
+            agentDefinitionSaveVersion: document.getElementById("ap-agent-definition-save-version"),
+            agentDefinitionRollback: document.getElementById("ap-agent-definition-rollback"),
+            agentDefinitionExport: document.getElementById("ap-agent-definition-export"),
+            agentDefinitionImport: document.getElementById("ap-agent-definition-import"),
+            toolRegistrySelect: document.getElementById("ap-tool-registry-select"),
+            toolRegistryStatus: document.getElementById("ap-tool-registry-status"),
+            toolRegistryWriteHint: document.getElementById("ap-tool-registry-write-hint"),
+            toolRegistryRefresh: document.getElementById("ap-tool-registry-refresh"),
+            toolRegistryNew: document.getElementById("ap-tool-registry-new"),
+            toolRegistrySave: document.getElementById("ap-tool-registry-save"),
+            toolRegistryDelete: document.getElementById("ap-tool-registry-delete"),
+            toolRegistrySchema: document.getElementById("ap-tool-input-schema-json"),
+            toolRegistryStaticResult: document.getElementById("ap-tool-static-result-json"),
+            toolRegistryMetadataForm: document.getElementById("ap-tool-metadata-form"),
+            toolRegistryArgPreviewForm: document.getElementById("ap-tool-arg-preview-form"),
+            toolRegistrySelectedSummary: document.getElementById("ap-tool-selected-summary"),
+            sandboxToolSelect: document.getElementById("ap-sandbox-tool-select"),
+            sandboxToolName: document.getElementById("ap-sandbox-tool-name"),
+            sandboxSourceLabel: document.getElementById("ap-sandbox-source-label"),
+            sandboxSideEffect: document.getElementById("ap-sandbox-side-effect"),
+            sandboxApprovalRequired: document.getElementById("ap-sandbox-approval-required"),
+            sandboxDryRun: document.getElementById("ap-sandbox-dry-run"),
+            sandboxApprovalTimeout: document.getElementById("ap-sandbox-approval-timeout"),
+            sandboxTimeoutCeiling: document.getElementById("ap-sandbox-timeout-ceiling"),
+            sandboxMaxMemory: document.getElementById("ap-sandbox-max-memory"),
+            sandboxNetworkEnabled: document.getElementById("ap-sandbox-network-enabled"),
+            sandboxNetworkAllowlist: document.getElementById("ap-sandbox-network-allowlist"),
+            sandboxFilesystemMode: document.getElementById("ap-sandbox-filesystem-mode"),
+            sandboxFilesystemAllowedPaths: document.getElementById("ap-sandbox-filesystem-allowed-paths"),
+            sandboxWriteHint: document.getElementById("ap-sandbox-write-hint"),
+            sandboxStatus: document.getElementById("ap-sandbox-status"),
+            sandboxRefresh: document.getElementById("ap-sandbox-refresh"),
+            sandboxNew: document.getElementById("ap-sandbox-new"),
+            sandboxSave: document.getElementById("ap-sandbox-save"),
+            sandboxDelete: document.getElementById("ap-sandbox-delete"),
+            approvalQueueList: document.getElementById("ap-approval-queue-list"),
+            approvalWriteHint: document.getElementById("ap-approval-write-hint"),
+            approvalStatus: document.getElementById("ap-approval-status"),
+            approvalRefresh: document.getElementById("ap-approval-refresh"),
         };
 
         this.optionsRenderer = null;
         this.schemaSources = new Map();
         this.modelInventory = [];
+        this.agentBuilder = new AgentBuilder(
+            this.apiBase,
+            {
+                definitionSelect: this.refs.agentDefinitionSelect,
+                versionSelect: this.refs.agentDefinitionVersion,
+                nameInput: this.refs.agentDefinitionName,
+                summaryInput: this.refs.agentDefinitionSummary,
+                definitionJSON: this.refs.agentDefinitionJSON,
+                status: this.refs.agentDefinitionStatus,
+                history: this.refs.agentDefinitionHistory,
+                refreshBtn: this.refs.agentDefinitionRefresh,
+                newBtn: this.refs.agentDefinitionNew,
+                saveVersionBtn: this.refs.agentDefinitionSaveVersion,
+                rollbackBtn: this.refs.agentDefinitionRollback,
+                exportBtn: this.refs.agentDefinitionExport,
+                importBtn: this.refs.agentDefinitionImport,
+            },
+            {
+                onStatus: (message) => this.setStatus(message),
+            },
+        );
+        this.toolRegistryView = new ToolRegistryView(
+            this.apiBase,
+            {
+                toolSelect: this.refs.toolRegistrySelect,
+                status: this.refs.toolRegistryStatus,
+                writeHint: this.refs.toolRegistryWriteHint,
+                refreshBtn: this.refs.toolRegistryRefresh,
+                newBtn: this.refs.toolRegistryNew,
+                saveBtn: this.refs.toolRegistrySave,
+                deleteBtn: this.refs.toolRegistryDelete,
+                schemaJSON: this.refs.toolRegistrySchema,
+                staticResultJSON: this.refs.toolRegistryStaticResult,
+                metadataForm: this.refs.toolRegistryMetadataForm,
+                argPreviewForm: this.refs.toolRegistryArgPreviewForm,
+                selectedSummary: this.refs.toolRegistrySelectedSummary,
+            },
+            {
+                onStatus: (message) => this.setStatus(message),
+            },
+        );
+        this.sandboxPolicyEditor = new SandboxPolicyEditor(
+            this.apiBase,
+            {
+                toolSelect: this.refs.sandboxToolSelect,
+                toolNameInput: this.refs.sandboxToolName,
+                sourceLabel: this.refs.sandboxSourceLabel,
+                sideEffectClass: this.refs.sandboxSideEffect,
+                approvalRequired: this.refs.sandboxApprovalRequired,
+                dryRunEnabled: this.refs.sandboxDryRun,
+                approvalTimeoutSeconds: this.refs.sandboxApprovalTimeout,
+                timeoutCeilingSeconds: this.refs.sandboxTimeoutCeiling,
+                maxMemoryMB: this.refs.sandboxMaxMemory,
+                networkEnabled: this.refs.sandboxNetworkEnabled,
+                networkAllowlistDomains: this.refs.sandboxNetworkAllowlist,
+                filesystemMode: this.refs.sandboxFilesystemMode,
+                filesystemAllowedPaths: this.refs.sandboxFilesystemAllowedPaths,
+                writeHint: this.refs.sandboxWriteHint,
+                status: this.refs.sandboxStatus,
+                refreshBtn: this.refs.sandboxRefresh,
+                newBtn: this.refs.sandboxNew,
+                saveBtn: this.refs.sandboxSave,
+                deleteBtn: this.refs.sandboxDelete,
+            },
+            {
+                onStatus: (message) => this.setStatus(message),
+            },
+        );
+        this.approvalQueueView = new ApprovalQueueView(
+            this.apiBase,
+            {
+                list: this.refs.approvalQueueList,
+                writeHint: this.refs.approvalWriteHint,
+                status: this.refs.approvalStatus,
+                refreshBtn: this.refs.approvalRefresh,
+            },
+            {
+                onStatus: (message) => this.setStatus(message),
+            },
+        );
         this.preferredRunMode = this._loadPreferredRunMode();
         this.workspacePrefs = this._loadWorkspacePrefs();
         this._bindPaneCollapseButtons();
@@ -699,6 +854,7 @@ class AgentPlaygroundApp {
             : fallbackMode;
         const hasPreferred = modes.some((mode) => String(mode.id) === preferred);
         this.refs.modeSelect.value = hasPreferred ? preferred : fallbackMode;
+        this.applyModeGuidance(this.refs.modeSelect.value);
     }
 
     configureSchemaForm(manifest) {
@@ -748,6 +904,16 @@ class AgentPlaygroundApp {
             addSource(`tool:${tool.name}`, `Tool Args: ${tool.name}`, tool.input_schema, {});
         }
 
+        const sandboxCapability = capabilities.find((capability) => capability?.id === "tools.sandbox");
+        if (sandboxCapability?.schema) {
+            addSource("tools.sandbox", "Tool Sandbox Policy", sandboxCapability.schema, {});
+        }
+
+        const approvalsCapability = capabilities.find((capability) => capability?.id === "tools.approvals");
+        if (approvalsCapability?.schema) {
+            addSource("tools.approvals", "Tool Approval Queue", approvalsCapability.schema, {});
+        }
+
         if (this.schemaSources.size === 0) {
             return;
         }
@@ -788,6 +954,7 @@ class AgentPlaygroundApp {
         });
         this.refs.modeSelect?.addEventListener("change", () => {
             this._savePreferredRunMode(this.getMode());
+            this.applyModeGuidance(this.getMode());
             if (!this.activeRunID() && this.refs.runModeActive) {
                 this.refs.runModeActive.textContent = this.getMode();
             }
@@ -813,6 +980,18 @@ class AgentPlaygroundApp {
     getMode() {
         const mode = this.refs.modeSelect?.value || "chat";
         return modeBuilders[mode] ? mode : "chat";
+    }
+
+    applyModeGuidance(mode = this.getMode()) {
+        const normalized = modeBuilders[mode] ? mode : "chat";
+        const guidance = modeGuidance[normalized] || modeGuidance.chat;
+
+        if (this.refs.modeHelper) {
+            this.refs.modeHelper.textContent = String(guidance.helper || modeGuidance.chat.helper);
+        }
+        if (this.refs.input) {
+            this.refs.input.placeholder = String(guidance.placeholder || modeGuidance.chat.placeholder);
+        }
     }
 
     optionValues() {
@@ -846,6 +1025,18 @@ class AgentPlaygroundApp {
 
         const builder = modeBuilders[mode] || buildChatPayload;
         const payload = builder(inputText, options);
+        const agentBinding = this.agentBuilder?.getRunBinding ? this.agentBuilder.getRunBinding() : null;
+        if (agentBinding && typeof agentBinding === "object") {
+            if (agentBinding.definition_id) {
+                payload.agent_definition_id = String(agentBinding.definition_id);
+            }
+            if (Number.isInteger(agentBinding.definition_version)) {
+                payload.agent_definition_version = Number(agentBinding.definition_version);
+            }
+            if (agentBinding.definition && typeof agentBinding.definition === "object") {
+                payload.agent_definition = agentBinding.definition;
+            }
+        }
         payload.options = payload.options && typeof payload.options === "object" ? payload.options : {};
         const requestedModel = this.requestedModelValue();
         if (requestedModel) {
@@ -947,6 +1138,9 @@ class AgentPlaygroundApp {
             this.chatPane.addSystemMessage("Run cancelled.");
             this.refreshMetrics();
             this.refreshRunsList(event.run_id);
+        }
+        if (eventType === "run.approval") {
+            this.approvalQueueView?.refresh("pending").catch(() => null);
         }
 
         if (this.store.selectedSeq === null) {
@@ -1135,6 +1329,35 @@ class AgentPlaygroundApp {
             window.panelMan.showPanel("right");
         }
         await this.loadBootstrap();
+        try {
+            await this.agentBuilder.init(this.bootstrapData?.agent_definitions || []);
+        } catch (error) {
+            this.setStatus(`Agent definitions init warning: ${error}`);
+        }
+        try {
+            await this.toolRegistryView.init(
+                this.bootstrapData?.tool_registry || [],
+                Boolean(this.bootstrapData?.can_write_registry),
+            );
+        } catch (error) {
+            this.setStatus(`Tool registry init warning: ${error}`);
+        }
+        try {
+            await this.sandboxPolicyEditor.init(
+                this.bootstrapData?.tool_sandbox_policies || [],
+                Boolean(this.bootstrapData?.can_write_registry),
+            );
+        } catch (error) {
+            this.setStatus(`Sandbox policy init warning: ${error}`);
+        }
+        try {
+            await this.approvalQueueView.init(
+                this.bootstrapData?.approval_queue || [],
+                Boolean(this.bootstrapData?.can_manage_approvals),
+            );
+        } catch (error) {
+            this.setStatus(`Approval queue init warning: ${error}`);
+        }
         await this.loadModelInventory();
     }
 }

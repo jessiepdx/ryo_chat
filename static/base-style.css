@@ -1757,7 +1757,23 @@ select {
 
 @media (max-width: 1180px) {
     #panel-sections {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "center";
+    }
+
+    #panel-sections[data-left-open="1"][data-right-open="0"] {
+        grid-template-columns: minmax(220px, 0.9fr) minmax(0, 1fr);
+        grid-template-areas: "left center";
+    }
+
+    #panel-sections[data-left-open="0"][data-right-open="1"] {
+        grid-template-columns: minmax(0, 1fr) minmax(260px, 0.95fr);
+        grid-template-areas: "center right";
+    }
+
+    #panel-sections[data-left-open="1"][data-right-open="1"] {
         grid-template-columns: minmax(220px, 0.9fr) minmax(0, 1fr) minmax(260px, 0.95fr);
+        grid-template-areas: "left center right";
     }
 }
 

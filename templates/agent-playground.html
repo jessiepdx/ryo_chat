@@ -51,6 +51,123 @@
                 <li>Select a trace step to inspect exact payloads.</li>
             </ul>
         </section>
+
+        <section class="ap-side-card">
+            <h4>Agent Definition Builder</h4>
+            <div class="ap-side-inline-grid">
+                <select id="ap-agent-definition-select">
+                    <option value="">Select definition</option>
+                </select>
+                <select id="ap-agent-definition-version">
+                    <option value="">Version</option>
+                </select>
+            </div>
+            <input id="ap-agent-definition-name" type="text" placeholder="Agent name (metadata)" />
+            <input id="ap-agent-change-summary" type="text" placeholder="Version change summary" />
+            <textarea id="ap-agent-definition-json" class="ap-side-json-editor" rows="12" placeholder="Agent definition JSON"></textarea>
+            <div class="ap-side-action-row">
+                <button id="ap-agent-definition-refresh" type="button">Refresh</button>
+                <button id="ap-agent-definition-new" type="button">Create</button>
+                <button id="ap-agent-definition-save-version" type="button">Save Version</button>
+                <button id="ap-agent-definition-rollback" type="button">Rollback</button>
+                <button id="ap-agent-definition-export" type="button">Copy Export</button>
+                <button id="ap-agent-definition-import" type="button">Import JSON</button>
+            </div>
+            <p id="ap-agent-definition-status" class="ap-side-muted">Definition builder idle.</p>
+            <div id="ap-agent-definition-history" class="ap-side-history">No version history yet.</div>
+        </section>
+
+        <section class="ap-side-card">
+            <h4>Tool Registry</h4>
+            <div class="ap-side-inline-grid">
+                <select id="ap-tool-registry-select">
+                    <option value="">Select tool</option>
+                </select>
+                <div id="ap-tool-selected-summary" class="ap-side-muted">builtin</div>
+            </div>
+            <div id="ap-tool-registry-write-hint" class="ap-side-muted">Checking write access...</div>
+            <div id="ap-tool-metadata-form" class="ap-schema-form-inline"></div>
+            <label class="ap-side-label" for="ap-tool-input-schema-json">Input Schema (JSON)</label>
+            <textarea id="ap-tool-input-schema-json" class="ap-side-json-editor" rows="8" placeholder='{"type":"object","properties":{}}'></textarea>
+            <label class="ap-side-label" for="ap-tool-static-result-json">Static Result (JSON, optional)</label>
+            <textarea id="ap-tool-static-result-json" class="ap-side-json-editor" rows="5" placeholder='{"status":"ok"}'></textarea>
+            <div class="ap-side-subhead">Argument Preview Form</div>
+            <div id="ap-tool-arg-preview-form" class="ap-schema-form-inline"></div>
+            <div class="ap-side-action-row">
+                <button id="ap-tool-registry-refresh" type="button">Refresh</button>
+                <button id="ap-tool-registry-new" type="button">New</button>
+                <button id="ap-tool-registry-save" type="button">Save</button>
+                <button id="ap-tool-registry-delete" type="button">Delete</button>
+            </div>
+            <p id="ap-tool-registry-status" class="ap-side-muted">Tool registry idle.</p>
+        </section>
+
+        <section class="ap-side-card">
+            <h4>Tool Sandbox Policy</h4>
+            <div class="ap-side-inline-grid">
+                <select id="ap-sandbox-tool-select">
+                    <option value="">Select tool</option>
+                </select>
+                <div id="ap-sandbox-source-label" class="ap-side-muted">builtin</div>
+            </div>
+            <input id="ap-sandbox-tool-name" type="text" placeholder="Tool name" />
+            <div class="ap-side-inline-grid">
+                <label class="ap-side-label" for="ap-sandbox-side-effect">Side Effect</label>
+                <select id="ap-sandbox-side-effect">
+                    <option value="read_only">read_only</option>
+                    <option value="mutating">mutating</option>
+                    <option value="sensitive">sensitive</option>
+                </select>
+            </div>
+            <div class="ap-side-inline-grid">
+                <label><input id="ap-sandbox-approval-required" type="checkbox" /> Require approval</label>
+                <label><input id="ap-sandbox-dry-run" type="checkbox" /> Force dry-run</label>
+            </div>
+            <div class="ap-side-inline-grid">
+                <label class="ap-side-label" for="ap-sandbox-approval-timeout">Approval timeout (s)</label>
+                <input id="ap-sandbox-approval-timeout" type="number" min="1" step="1" value="45" />
+            </div>
+            <div class="ap-side-inline-grid">
+                <label class="ap-side-label" for="ap-sandbox-timeout-ceiling">Exec timeout ceiling (s)</label>
+                <input id="ap-sandbox-timeout-ceiling" type="number" min="0.1" step="0.1" value="30" />
+            </div>
+            <div class="ap-side-inline-grid">
+                <label class="ap-side-label" for="ap-sandbox-max-memory">Max memory (MB)</label>
+                <input id="ap-sandbox-max-memory" type="number" min="16" step="1" value="512" />
+            </div>
+            <div class="ap-side-inline-grid">
+                <label><input id="ap-sandbox-network-enabled" type="checkbox" checked /> Network enabled</label>
+                <select id="ap-sandbox-filesystem-mode">
+                    <option value="none">fs:none</option>
+                    <option value="read_only">fs:read_only</option>
+                    <option value="read_write">fs:read_write</option>
+                </select>
+            </div>
+            <label class="ap-side-label" for="ap-sandbox-network-allowlist">Network allowlist domains</label>
+            <input id="ap-sandbox-network-allowlist" type="text" placeholder="api.search.brave.com, example.com" />
+            <label class="ap-side-label" for="ap-sandbox-filesystem-allowed-paths">Filesystem allowed paths (one per line)</label>
+            <textarea id="ap-sandbox-filesystem-allowed-paths" class="ap-side-json-editor" rows="4" placeholder="/tmp/safe-path"></textarea>
+            <div id="ap-sandbox-write-hint" class="ap-side-muted">Checking write access...</div>
+            <div class="ap-side-action-row">
+                <button id="ap-sandbox-refresh" type="button">Refresh</button>
+                <button id="ap-sandbox-new" type="button">New</button>
+                <button id="ap-sandbox-save" type="button">Save</button>
+                <button id="ap-sandbox-delete" type="button">Delete</button>
+            </div>
+            <p id="ap-sandbox-status" class="ap-side-muted">Sandbox policy idle.</p>
+        </section>
+
+        <section class="ap-side-card">
+            <h4>Approval Queue</h4>
+            <div id="ap-approval-write-hint" class="ap-side-muted">Loading approval permissions...</div>
+            <div class="ap-side-action-row">
+                <button id="ap-approval-refresh" type="button">Refresh Queue</button>
+            </div>
+            <div id="ap-approval-queue-list" class="ap-approval-list">
+                <div class="ap-approval-row ap-approval-row-empty">No pending approvals.</div>
+            </div>
+            <p id="ap-approval-status" class="ap-side-muted">Approval queue idle.</p>
+        </section>
     </div>
     <div class="panel-footer button-bar">
         <div class="button-text">Run Setup</div>

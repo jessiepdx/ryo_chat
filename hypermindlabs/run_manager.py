@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from hypermindlabs.agent_definitions import runtime_options_from_agent_definition
 from hypermindlabs.run_events import TERMINAL_STATUSES, make_event
 from hypermindlabs.run_mode_handlers import normalize_run_mode
 from hypermindlabs.state_snapshot_store import build_replay_state_plan
@@ -694,11 +695,13 @@ class RunManager:
             self._assert_not_cancelled(run_id)
             payload = _coerce_dict(event)
             stage_name = f"{prefix}{payload.get('stage', 'runtime')}"
+            event_type = str(payload.get("event_type") or "run.stage")
+            status = str(payload.get("status") or "running")
             event_record = self.append_event(
                 run_id,
-                event_type="run.stage",
+                event_type=event_type,
                 stage=stage_name,
-                status="running",
+                status=status,
                 payload=payload,
             )
             self.append_snapshot(
@@ -714,6 +717,10 @@ class RunManager:
 
         merged_options = _coerce_dict(options)
         merged_options["stage_callback"] = stage_callback
+        existing_context = _coerce_dict(merged_options.get("run_context"))
+        existing_context.setdefault("run_id", run_id)
+        existing_context.setdefault("member_id", int(member_id))
+        merged_options["run_context"] = existing_context
 
         from hypermindlabs.agents import ConversationOrchestrator
 
@@ -782,7 +789,13 @@ class RunManager:
 
     def _resolved_options(self, run: dict[str, Any]) -> dict[str, Any]:
         payload = _coerce_dict(run.get("request"))
-        return _coerce_dict(payload.get("options"))
+        explicit_options = _coerce_dict(payload.get("options"))
+        agent_definition = _coerce_dict(payload.get("agent_definition"))
+        definition_options = runtime_options_from_agent_definition(agent_definition) if agent_definition else {}
+        # Agent definitions provide defaults; explicit run options still take precedence.
+        merged = _coerce_dict(definition_options)
+        merged.update(explicit_options)
+        return merged
 
     async def _execute_chat(self, run: dict[str, Any]) -> dict[str, Any]:
         payload = _coerce_dict(run.get("request"))

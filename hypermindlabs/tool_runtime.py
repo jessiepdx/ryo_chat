@@ -7,12 +7,15 @@
 
 from __future__ import annotations
 
+import copy
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 import json
 from typing import Any, Callable
 
+from hypermindlabs.approval_manager import ApprovalManager, ApprovalValidationError
 from hypermindlabs.runtime_settings import DEFAULT_RUNTIME_SETTINGS
+from hypermindlabs.tool_sandbox import ToolSandboxEnforcer, resolve_tool_sandbox_policy
 
 
 DEFAULT_TOOL_TIMEOUT_SECONDS = float(
@@ -21,6 +24,13 @@ DEFAULT_TOOL_TIMEOUT_SECONDS = float(
 DEFAULT_TOOL_MAX_RETRIES = int(
     DEFAULT_RUNTIME_SETTINGS.get("tool_runtime", {}).get("default_max_retries", 1)
 )
+
+
+def _as_int(value: Any, fallback: int | None = None) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 @dataclass
@@ -34,17 +44,71 @@ class ToolDefinition:
     required_api_key: str | None = None
     timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_TOOL_MAX_RETRIES
+    side_effect_class: str = "read_only"
+    sandbox_policy: dict[str, Any] = field(default_factory=dict)
+    mock_result: Any = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class ToolRuntime:
     """Validates and executes tool calls with bounded retry/timeout behavior."""
 
-    def __init__(self, api_keys: dict[str, str] | None = None):
+    def __init__(
+        self,
+        api_keys: dict[str, str] | None = None,
+        *,
+        sandbox_enforcer: ToolSandboxEnforcer | None = None,
+        approval_manager: ApprovalManager | None = None,
+        runtime_context: dict[str, Any] | None = None,
+        decision_callback: Callable[[dict[str, Any]], None] | None = None,
+        enable_human_approval: bool = True,
+        default_approval_timeout_seconds: float = 45.0,
+        approval_poll_interval_seconds: float = 0.25,
+        default_dry_run: bool = False,
+    ):
         self._registry: dict[str, ToolDefinition] = {}
         self._api_keys = api_keys or {}
+        self._sandbox = sandbox_enforcer or ToolSandboxEnforcer()
+        self._approvals = approval_manager or ApprovalManager()
+        self._context = runtime_context if isinstance(runtime_context, dict) else {}
+        self._decision_callback = decision_callback if callable(decision_callback) else None
+        self._enable_human_approval = bool(enable_human_approval)
+        self._default_approval_timeout_seconds = max(1.0, float(default_approval_timeout_seconds))
+        self._approval_poll_interval_seconds = max(0.05, float(approval_poll_interval_seconds))
+        self._default_dry_run = bool(default_dry_run)
 
     def register_tool(self, tool: ToolDefinition) -> None:
         self._registry[tool.name] = tool
+
+    def set_runtime_context(self, context: dict[str, Any] | None) -> None:
+        self._context = context if isinstance(context, dict) else {}
+
+    def _emit_decision(self, event: dict[str, Any]) -> None:
+        if not callable(self._decision_callback):
+            return
+        try:
+            self._decision_callback(copy.deepcopy(event))
+        except Exception:  # noqa: BLE001
+            return
+
+    def _audit_event(
+        self,
+        *,
+        event_type: str,
+        stage: str,
+        status: str,
+        detail: str,
+        meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "event_type": str(event_type or "run.stage"),
+            "stage": str(stage or "tools.runtime"),
+            "status": str(status or "info"),
+            "detail": str(detail or ""),
+            "meta": meta if isinstance(meta, dict) else {},
+        }
+        self._emit_decision(payload)
+        return payload
 
     @staticmethod
     def _error_result(
@@ -53,12 +117,14 @@ class ToolRuntime:
         message: str,
         attempts: int = 0,
         details: dict[str, Any] | None = None,
+        audit: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         return {
             "tool_name": tool_name,
             "status": "error",
             "tool_results": None,
             "attempts": attempts,
+            "audit": audit if isinstance(audit, list) else [],
             "error": {
                 "code": code,
                 "message": message,
@@ -68,13 +134,19 @@ class ToolRuntime:
         }
 
     @staticmethod
-    def _success_result(tool_name: str, output: Any, attempts: int = 1) -> dict[str, Any]:
+    def _success_result(
+        tool_name: str,
+        output: Any,
+        attempts: int = 1,
+        audit: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         return {
             "tool_name": tool_name,
             "status": "success",
             "tool_results": output,
             "error": None,
             "attempts": attempts,
+            "audit": audit if isinstance(audit, list) else [],
         }
 
     @staticmethod
@@ -239,12 +311,14 @@ class ToolRuntime:
         return self.execute(tool_name=tool_name, raw_args=tool_args)
 
     def execute(self, tool_name: str, raw_args: Any) -> dict[str, Any]:
+        audit: list[dict[str, Any]] = []
         tool = self._registry.get(tool_name)
         if tool is None:
             return self._error_result(
                 tool_name=tool_name,
                 code="tool_not_registered",
                 message=f"Tool '{tool_name}' is not registered.",
+                audit=audit,
             )
 
         if tool.required_api_key:
@@ -254,6 +328,7 @@ class ToolRuntime:
                     tool_name=tool_name,
                     code="missing_api_key",
                     message=f"Required API key '{tool.required_api_key}' is missing.",
+                    audit=audit,
                 )
 
         prepared_args, arg_error = self._validate_and_prepare_args(tool, raw_args)
@@ -263,7 +338,162 @@ class ToolRuntime:
                 code=arg_error["code"],
                 message=arg_error["message"],
                 details=arg_error["details"],
+                audit=audit,
             )
+
+        sandbox_decision = self._sandbox.evaluate(
+            tool_name=tool_name,
+            prepared_args=prepared_args,
+            tool_policy=tool.sandbox_policy,
+            tool_metadata={
+                "side_effect_class": tool.side_effect_class,
+                "sandbox_policy": tool.sandbox_policy,
+                **(tool.metadata if isinstance(tool.metadata, dict) else {}),
+            },
+        )
+        sandbox_allowed = str(sandbox_decision.get("status")) == "allow"
+        audit.append(
+            self._audit_event(
+                event_type="run.sandbox",
+                stage="tools.sandbox.decision",
+                status="info" if sandbox_allowed else "error",
+                detail=str(sandbox_decision.get("message") or "Sandbox decision recorded."),
+                meta={
+                    "tool_name": tool_name,
+                    "code": sandbox_decision.get("code"),
+                    "decision": sandbox_decision.get("status"),
+                    "policy": sandbox_decision.get("effective_policy", {}),
+                    "details": sandbox_decision.get("details", {}),
+                },
+            )
+        )
+        if not sandbox_allowed:
+            return self._error_result(
+                tool_name=tool_name,
+                code="sandbox_blocked",
+                message=str(sandbox_decision.get("message") or "Sandbox policy blocked this tool."),
+                details={
+                    "decision_code": sandbox_decision.get("code"),
+                    "policy": sandbox_decision.get("effective_policy", {}),
+                    "details": sandbox_decision.get("details", {}),
+                },
+                audit=audit,
+            )
+
+        effective_policy = resolve_tool_sandbox_policy(
+            tool.sandbox_policy,
+            sandbox_decision.get("effective_policy"),
+        )
+        requires_approval = bool(effective_policy.get("require_approval"))
+        dry_run_enabled = self._default_dry_run or bool(effective_policy.get("dry_run"))
+        approval_timeout_seconds = max(
+            1.0,
+            float(
+                effective_policy.get("approval_timeout_seconds")
+                or self._default_approval_timeout_seconds
+            ),
+        )
+
+        if dry_run_enabled:
+            mock_output = copy.deepcopy(tool.mock_result)
+            if mock_output is None:
+                mock_output = {
+                    "tool": tool_name,
+                    "status": "dry_run",
+                    "arguments": copy.deepcopy(prepared_args),
+                }
+            audit.append(
+                self._audit_event(
+                    event_type="run.sandbox",
+                    stage="tools.sandbox.dry_run",
+                    status="info",
+                    detail=f"Dry-run enabled for tool '{tool_name}'.",
+                    meta={"tool_name": tool_name},
+                )
+            )
+            return self._success_result(
+                tool_name=tool_name,
+                output=mock_output,
+                attempts=0,
+                audit=audit,
+            )
+
+        if requires_approval:
+            if not self._enable_human_approval:
+                return self._error_result(
+                    tool_name=tool_name,
+                    code="approval_required",
+                    message="Tool requires human approval but approval workflow is disabled.",
+                    details={"tool_name": tool_name},
+                    audit=audit,
+                )
+
+            request_record = self._approvals.request_approval(
+                run_id=str(self._context.get("run_id") or "unknown"),
+                tool_name=tool_name,
+                tool_args=prepared_args,
+                requested_by_member_id=_as_int(self._context.get("member_id"), None),
+                run_owner_member_id=_as_int(self._context.get("member_id"), None),
+                reason=f"Tool '{tool_name}' requires approval before execution.",
+                timeout_seconds=approval_timeout_seconds,
+                meta={
+                    "side_effect_class": tool.side_effect_class,
+                    "run_id": self._context.get("run_id"),
+                },
+            )
+            audit.append(
+                self._audit_event(
+                    event_type="run.approval",
+                    stage="tools.approval.pending",
+                    status="waiting",
+                    detail=f"Approval required for tool '{tool_name}'.",
+                    meta={
+                        "tool_name": tool_name,
+                        "request_id": request_record.get("request_id"),
+                        "expires_at": request_record.get("expires_at"),
+                    },
+                )
+            )
+            try:
+                decision = self._approvals.wait_for_decision(
+                    str(request_record.get("request_id")),
+                    timeout_seconds=approval_timeout_seconds,
+                    poll_interval_seconds=self._approval_poll_interval_seconds,
+                )
+            except ApprovalValidationError as error:
+                return self._error_result(
+                    tool_name=tool_name,
+                    code="approval_failed",
+                    message=str(error),
+                    details={"tool_name": tool_name},
+                    audit=audit,
+                )
+
+            decision_status = str(decision.get("status") or "pending").lower()
+            decision_reason = str(decision.get("reason") or "").strip()
+            audit.append(
+                self._audit_event(
+                    event_type="run.approval",
+                    stage="tools.approval.decision",
+                    status="info" if decision_status == "approved" else "error",
+                    detail=f"Approval decision for '{tool_name}': {decision_status}.",
+                    meta={
+                        "tool_name": tool_name,
+                        "request_id": decision.get("request_id"),
+                        "decision": decision_status,
+                        "reason": decision_reason,
+                    },
+                )
+            )
+            if decision_status != "approved":
+                code = "approval_timeout" if decision_status == "expired" else "approval_denied"
+                return self._error_result(
+                    tool_name=tool_name,
+                    code=code,
+                    message=decision_reason or f"Tool '{tool_name}' was not approved.",
+                    details={"decision": decision_status, "request_id": decision.get("request_id")},
+                    audit=audit,
+                )
 
         attempts = 0
         last_error: Exception | None = None
@@ -277,7 +507,12 @@ class ToolRuntime:
             try:
                 future = executor.submit(tool.function, **prepared_args)
                 output = future.result(timeout=tool.timeout_seconds)
-                return self._success_result(tool_name=tool_name, output=output, attempts=attempts)
+                return self._success_result(
+                    tool_name=tool_name,
+                    output=output,
+                    attempts=attempts,
+                    audit=audit,
+                )
             except FuturesTimeoutError as error:
                 if future is not None:
                     future.cancel()
@@ -294,4 +529,5 @@ class ToolRuntime:
             message=f"Tool '{tool_name}' failed after {attempts} attempt(s).",
             attempts=attempts,
             details={"last_error": str(last_error)},
+            audit=audit,
         )

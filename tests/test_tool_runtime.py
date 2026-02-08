@@ -1,6 +1,8 @@
 import time
+import tempfile
 import unittest
 
+from hypermindlabs.approval_manager import ApprovalManager
 from hypermindlabs.tool_runtime import ToolDefinition, ToolRuntime
 
 
@@ -97,6 +99,64 @@ class TestToolRuntime(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["tool_results"]["query"], "hello")
         self.assertEqual(result["tool_results"]["count"], 2)
+
+    def test_sandbox_blocks_network_when_disabled(self):
+        runtime = ToolRuntime()
+        runtime.register_tool(
+            ToolDefinition(
+                name="httpFetch",
+                function=_echo_tool,
+                required_args=("queryString",),
+                sandbox_policy={
+                    "tool_name": "httpFetch",
+                    "network": {"enabled": False},
+                },
+            )
+        )
+        result = runtime.execute("httpFetch", {"queryString": "https://example.com"})
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error"]["code"], "sandbox_blocked")
+
+    def test_dry_run_returns_mock_without_execution(self):
+        runtime = ToolRuntime(default_dry_run=True)
+        runtime.register_tool(
+            ToolDefinition(
+                name="mutableTool",
+                function=_error_tool,
+                required_args=("queryString",),
+                mock_result={"status": "mocked"},
+            )
+        )
+        result = runtime.execute("mutableTool", {"queryString": "ignored"})
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["tool_results"]["status"], "mocked")
+        self.assertEqual(result["attempts"], 0)
+
+    def test_approval_timeout_returns_structured_error(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            approval_manager = ApprovalManager(storage_path=f"{tempdir}/approvals.json")
+            runtime = ToolRuntime(
+                approval_manager=approval_manager,
+                default_approval_timeout_seconds=1,
+                approval_poll_interval_seconds=0.05,
+            )
+            runtime.set_runtime_context({"run_id": "run-1", "member_id": 1})
+            runtime.register_tool(
+                ToolDefinition(
+                    name="dangerousTool",
+                    function=_echo_tool,
+                    required_args=("queryString",),
+                    side_effect_class="mutating",
+                    sandbox_policy={
+                        "tool_name": "dangerousTool",
+                        "require_approval": True,
+                        "approval_timeout_seconds": 1,
+                    },
+                )
+            )
+            result = runtime.execute("dangerousTool", {"queryString": "hello"})
+            self.assertEqual(result["status"], "error")
+            self.assertIn(result["error"]["code"], {"approval_denied", "approval_timeout"})
 
 
 if __name__ == "__main__":

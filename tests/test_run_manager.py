@@ -122,6 +122,33 @@ class RunManagerTests(unittest.TestCase):
         self.assertGreaterEqual(metrics["total_runs"], 1)
         self.assertIn("completed", metrics["status_counts"])
 
+    def test_agent_definition_defaults_merge_with_explicit_options(self):
+        manager = RunManager(execute_fn=lambda _m, _r: {"response": "ok"}, enable_db=False)
+        run = manager.create_run(
+            member_id=21,
+            mode="chat",
+            request_payload={
+                "message": "merge options",
+                "options": {"model_requested": "explicit-model", "temperature": 0.7},
+                "agent_definition": {
+                    "identity": {"name": "merge-agent"},
+                    "model_policy": {
+                        "default_model": "definition-model",
+                        "temperature": 0.2,
+                    },
+                    "tool_access_policy": {
+                        "enabled_tools": ["skipTools"],
+                    },
+                },
+            },
+            auto_start=False,
+        )
+
+        merged = manager._resolved_options(run)  # noqa: SLF001
+        self.assertEqual(merged.get("model_requested"), "explicit-model")
+        self.assertEqual(float(merged.get("temperature")), 0.7)
+        self.assertIn("skipTools", merged.get("enabled_tools", []))
+
 
 if __name__ == "__main__":
     unittest.main()

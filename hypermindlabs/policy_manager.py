@@ -212,7 +212,19 @@ class PolicyManager:
             "allowed_models": [self._default_model_for_policy(policy_name)],
         }
         if policy_name == "tool_calling":
-            fallback["tool_runtime"] = {}
+            runtime_defaults = DEFAULT_RUNTIME_SETTINGS.get("tool_runtime", {})
+            fallback["tool_runtime"] = {
+                "default_timeout_seconds": float(runtime_defaults.get("default_timeout_seconds", 8.0)),
+                "default_max_retries": int(runtime_defaults.get("default_max_retries", 1)),
+                "reject_unknown_args": False,
+                "unknown_tool_behavior": "structured_error",
+                "enable_human_approval": bool(runtime_defaults.get("enable_human_approval", True)),
+                "default_approval_timeout_seconds": float(runtime_defaults.get("default_approval_timeout_seconds", 45.0)),
+                "approval_poll_interval_seconds": float(runtime_defaults.get("approval_poll_interval_seconds", 0.25)),
+                "default_dry_run": bool(runtime_defaults.get("default_dry_run", False)),
+                "sandbox": copy.deepcopy(runtime_defaults.get("sandbox", {})),
+                "tools": {},
+            }
         return fallback
 
     def _validate_schema(
@@ -256,6 +268,33 @@ class PolicyManager:
 
         if "tool_runtime" in normalized and not isinstance(normalized.get("tool_runtime"), dict):
             errors.append("Policy key 'tool_runtime' must be a JSON object when present.")
+        elif isinstance(normalized.get("tool_runtime"), dict):
+            runtime_payload = copy.deepcopy(normalized.get("tool_runtime"))
+            if "tools" in runtime_payload and not isinstance(runtime_payload.get("tools"), dict):
+                errors.append("Policy key 'tool_runtime.tools' must be a JSON object when present.")
+                runtime_payload["tools"] = {}
+            if "sandbox" in runtime_payload and not isinstance(runtime_payload.get("sandbox"), dict):
+                errors.append("Policy key 'tool_runtime.sandbox' must be a JSON object when present.")
+                runtime_payload["sandbox"] = {}
+            for numeric_key in (
+                "default_timeout_seconds",
+                "default_approval_timeout_seconds",
+                "approval_poll_interval_seconds",
+            ):
+                if numeric_key in runtime_payload:
+                    try:
+                        runtime_payload[numeric_key] = float(runtime_payload[numeric_key])
+                    except (TypeError, ValueError):
+                        warnings.append(f"Ignored invalid numeric value for 'tool_runtime.{numeric_key}'.")
+                        runtime_payload.pop(numeric_key, None)
+            for int_key in ("default_max_retries",):
+                if int_key in runtime_payload:
+                    try:
+                        runtime_payload[int_key] = int(runtime_payload[int_key])
+                    except (TypeError, ValueError):
+                        warnings.append(f"Ignored invalid integer value for 'tool_runtime.{int_key}'.")
+                        runtime_payload.pop(int_key, None)
+            normalized["tool_runtime"] = runtime_payload
 
         return normalized, errors, warnings
 

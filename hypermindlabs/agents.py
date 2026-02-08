@@ -24,6 +24,7 @@ import re
 import requests
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
+from hypermindlabs.approval_manager import ApprovalManager
 from hypermindlabs.model_router import ModelExecutionError, ModelRouter
 from hypermindlabs.policy_manager import PolicyManager, PolicyValidationError
 from hypermindlabs.temporal_context import (
@@ -32,9 +33,17 @@ from hypermindlabs.temporal_context import (
     utc_now_iso,
 )
 from hypermindlabs.tool_registry import (
+    ToolRegistryStore,
     build_tool_specs,
     model_tool_definitions,
+    normalize_custom_tool_payload,
     register_runtime_tools,
+)
+from hypermindlabs.tool_sandbox import (
+    ToolSandboxEnforcer,
+    ToolSandboxPolicyStore,
+    merge_sandbox_policies,
+    normalize_tool_sandbox_policy,
 )
 from hypermindlabs.tool_runtime import ToolRuntime
 from hypermindlabs.utils import (
@@ -188,6 +197,12 @@ def _as_string_list(value: Any) -> list[str]:
         if cleaned and cleaned not in output:
             output.append(cleaned)
     return output
+
+
+def _coerce_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
 
 
 def _normalize_analysis_payload(raw_analysis_text: str, known_context: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -714,6 +729,8 @@ class ToolCallingAgent():
         toolPolicies = toolRuntimePolicy.get("tools", {})
         if not isinstance(toolPolicies, dict):
             toolPolicies = {}
+        else:
+            toolPolicies = _coerce_dict(toolPolicies)
 
         def _float_value(value: Any, default: float) -> float:
             try:
@@ -742,20 +759,110 @@ class ToolCallingAgent():
         self._unknownToolBehavior = unknownToolBehavior
 
         # Check for options passed and if policy allows for those options
+        optionMap = options if isinstance(options, dict) else {}
+        stageCallback = optionMap.get("stage_callback")
+        self._stageCallback = stageCallback if callable(stageCallback) else None
+        runContext = _coerce_dict(optionMap.get("run_context"))
+        self._runContext = {
+            "run_id": str(runContext.get("run_id") or "").strip() or None,
+            "member_id": runContext.get("member_id"),
+        }
         if options:
             modelRequested = options.get("model_requested")
             if modelRequested in self._allowed_models:
                 self._model = modelRequested
+        optionToolPolicy = optionMap.get("tool_policy")
+        if isinstance(optionToolPolicy, dict):
+            for toolName, overrides in optionToolPolicy.items():
+                if not isinstance(overrides, dict):
+                    continue
+                existing = toolPolicies.get(toolName)
+                existingMap = _coerce_dict(existing)
+                existingMap.update(_coerce_dict(overrides))
+                toolPolicies[toolName] = existingMap
+
+        sandboxPolicyMap: dict[str, dict[str, Any]] = {}
+        try:
+            sandboxStore = ToolSandboxPolicyStore()
+            sandboxPolicyMap = sandboxStore.policy_map()
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Unable to load persisted tool sandbox policies: {error}")
+
+        optionSandboxPolicy = optionMap.get("tool_sandbox_policy")
+        if isinstance(optionSandboxPolicy, dict):
+            for toolName, rawPolicy in optionSandboxPolicy.items():
+                if not isinstance(rawPolicy, dict):
+                    continue
+                existingPolicy = _coerce_dict(sandboxPolicyMap.get(str(toolName)))
+                mergedPolicy = merge_sandbox_policies(existingPolicy, rawPolicy)
+                try:
+                    sandboxPolicyMap[str(toolName)] = normalize_tool_sandbox_policy(
+                        mergedPolicy,
+                        default_tool_name=str(toolName),
+                    )
+                except Exception as error:  # noqa: BLE001
+                    logger.warning(f"Ignoring invalid sandbox policy override for {toolName}: {error}")
+
+        for toolName, sandboxPolicy in sandboxPolicyMap.items():
+            existing = _coerce_dict(toolPolicies.get(toolName))
+            existingSandbox = _coerce_dict(existing.get("sandbox_policy"))
+            existing["sandbox_policy"] = merge_sandbox_policies(sandboxPolicy, existingSandbox)
+            if "side_effect_class" in sandboxPolicy and "side_effect_class" not in existing:
+                existing["side_effect_class"] = sandboxPolicy.get("side_effect_class")
+            if "require_approval" in sandboxPolicy and "require_approval" not in existing:
+                existing["require_approval"] = sandboxPolicy.get("require_approval")
+            if "dry_run" in sandboxPolicy and "dry_run" not in existing:
+                existing["dry_run"] = sandboxPolicy.get("dry_run")
+            toolPolicies[toolName] = existing
+
+        enabledTools = set(_as_string_list(optionMap.get("enabled_tools")))
+        deniedTools = set(_as_string_list(optionMap.get("denied_tools")))
 
         self._modelRouter = ModelRouter(
             inference_config=config._instance.inference,
             endpoint_override=endpointOverride,
         )
 
+        sandboxDefaultsRaw = _runtime_value("tool_runtime.sandbox", {})
+        sandboxDefaults = sandboxDefaultsRaw if isinstance(sandboxDefaultsRaw, dict) else {}
+        runtimeDryRun = bool(
+            optionMap.get(
+                "tool_dry_run",
+                _runtime_bool("tool_runtime.default_dry_run", False),
+            )
+        )
+        approvalEnabled = bool(
+            optionMap.get(
+                "tool_human_approval",
+                _runtime_bool("tool_runtime.enable_human_approval", True),
+            )
+        )
+        approvalTimeoutSeconds = _float_value(
+            optionMap.get("tool_approval_timeout_seconds"),
+            _runtime_float("tool_runtime.default_approval_timeout_seconds", 45.0),
+        )
+        approvalPollIntervalSeconds = _float_value(
+            optionMap.get("tool_approval_poll_interval_seconds"),
+            _runtime_float("tool_runtime.approval_poll_interval_seconds", 0.25),
+        )
+        runtimeContext = {
+            "run_id": self._runContext.get("run_id"),
+            "member_id": self._runContext.get("member_id"),
+        }
+        sandboxEnforcer = ToolSandboxEnforcer(default_policy=sandboxDefaults)
+        approvalManager = ApprovalManager()
+
         self._toolRuntime = ToolRuntime(
             api_keys={
                 "brave_search": config._instance.brave_keys,
-            }
+            },
+            sandbox_enforcer=sandboxEnforcer,
+            approval_manager=approvalManager,
+            runtime_context=runtimeContext,
+            enable_human_approval=approvalEnabled,
+            default_approval_timeout_seconds=approvalTimeoutSeconds,
+            approval_poll_interval_seconds=approvalPollIntervalSeconds,
+            default_dry_run=runtimeDryRun,
         )
         self._toolSpecs = build_tool_specs(
             brave_search_fn=braveSearch,
@@ -763,7 +870,41 @@ class ToolCallingAgent():
             knowledge_search_fn=knowledgeSearch,
             skip_tools_fn=skipTools,
             knowledge_domains=config.knowledgeDomains,
+            custom_tool_entries=[],
         )
+        customToolIndex: dict[str, dict[str, Any]] = {}
+        try:
+            customStore = ToolRegistryStore()
+            for customTool in customStore.list_custom_tools(include_disabled=False):
+                customToolIndex[str(customTool.get("name"))] = customTool
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Unable to load custom tool registry entries: {error}")
+
+        optionCustomTools = optionMap.get("custom_tools")
+        if isinstance(optionCustomTools, list):
+            for rawCustomTool in optionCustomTools:
+                try:
+                    normalized = normalize_custom_tool_payload(_coerce_dict(rawCustomTool))
+                except Exception as error:  # noqa: BLE001
+                    logger.warning(f"Ignoring invalid custom tool in options: {error}")
+                    continue
+                customToolIndex[normalized["name"]] = normalized
+
+        if customToolIndex:
+            self._toolSpecs = build_tool_specs(
+                brave_search_fn=braveSearch,
+                chat_history_search_fn=chatHistorySearch,
+                knowledge_search_fn=knowledgeSearch,
+                skip_tools_fn=skipTools,
+                knowledge_domains=config.knowledgeDomains,
+                custom_tool_entries=list(customToolIndex.values()),
+            )
+
+        if enabledTools:
+            self._toolSpecs = {name: spec for name, spec in self._toolSpecs.items() if name in enabledTools}
+        if deniedTools:
+            self._toolSpecs = {name: spec for name, spec in self._toolSpecs.items() if name not in deniedTools}
+
         self._modelTools = model_tool_definitions(self._toolSpecs)
         register_runtime_tools(
             runtime=self._toolRuntime,
@@ -783,6 +924,27 @@ class ToolCallingAgent():
         else:
             histMessage: Message
             self._messages += [histMessage for histMessage in messages if histMessage.role != "system"]   
+
+    async def _emit_tool_runtime_event(self, event: dict[str, Any] | None) -> None:
+        if not callable(self._stageCallback):
+            return
+        payload = _coerce_dict(event)
+        if not payload:
+            return
+        record = {
+            "event_type": str(payload.get("event_type") or "run.stage"),
+            "stage": str(payload.get("stage") or "tools.runtime"),
+            "status": str(payload.get("status") or "info"),
+            "detail": str(payload.get("detail") or ""),
+            "meta": _coerce_dict(payload.get("meta")),
+            "timestamp": utc_now_iso(),
+        }
+        try:
+            maybeAwaitable = self._stageCallback(record)
+            if inspect.isawaitable(maybeAwaitable):
+                await maybeAwaitable
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Tool runtime stage callback failed [{record['stage']}]: {error}")
 
     async def generateResponse(self):
         logger.info(f"Generate a response for the tool calling agent.")
@@ -829,6 +991,10 @@ class ToolCallingAgent():
                     f"Arguments: {toolArgs}"
                 )
                 toolResult = self._toolRuntime.execute_tool_call(tool)
+                auditEvents = toolResult.get("audit")
+                if isinstance(auditEvents, list):
+                    for auditEvent in auditEvents:
+                        await self._emit_tool_runtime_event(_coerce_dict(auditEvent))
                 if (
                     self._unknownToolBehavior == "ignore"
                     and toolResult.get("status") == "error"

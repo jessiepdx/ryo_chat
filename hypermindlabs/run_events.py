@@ -9,6 +9,8 @@ EVENT_TYPES: tuple[str, ...] = (
     "run.created",
     "run.started",
     "run.stage",
+    "run.sandbox",
+    "run.approval",
     "run.token",
     "run.snapshot",
     "run.artifact",

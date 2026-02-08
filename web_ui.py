@@ -42,10 +42,27 @@ from flask import (
     stream_with_context,
     url_for,
 )
+from hypermindlabs.approval_manager import ApprovalManager, ApprovalValidationError
+from hypermindlabs.agent_definitions import (
+    AgentDefinitionStore,
+    AgentDefinitionValidationError,
+    normalize_agent_definition,
+)
 from hypermindlabs.capability_manifest import build_capability_manifest, find_capability
 from hypermindlabs.replay_manager import ReplayManager
 from hypermindlabs.run_manager import RunManager
 from hypermindlabs.run_mode_handlers import normalize_run_mode, run_modes_manifest
+from hypermindlabs.tool_registry import (
+    ToolRegistryStore,
+    ToolRegistryValidationError,
+    build_tool_specs,
+    tool_catalog_entries,
+)
+from hypermindlabs.tool_sandbox import (
+    ToolSandboxPolicyStore,
+    ToolSandboxPolicyValidationError,
+    normalize_tool_sandbox_policy,
+)
 from hypermindlabs.utils import ConfigManager, CustomFormatter, MemberManager, KnowledgeManager
 from urllib.parse import parse_qs
 
@@ -108,6 +125,10 @@ config = ConfigManager()
 members = MemberManager()
 playgroundRuns = RunManager(enable_db=True)
 playgroundReplay = ReplayManager(playgroundRuns)
+agentDefinitions = AgentDefinitionStore()
+toolRegistry = ToolRegistryStore()
+toolSandboxPolicies = ToolSandboxPolicyStore()
+toolApprovals = ApprovalManager()
 
 logger.info(f"Database route status: {config.databaseRoute}")
 miniappConfigIssues = config.getTelegramConfigIssues(require_owner=False, require_web_ui_url=False)
@@ -247,9 +268,76 @@ def _require_member_api() -> dict | None:
     return g.memberData
 
 
+def _member_roles(member: dict | None) -> list[str]:
+    if not isinstance(member, dict):
+        return []
+    roles = member.get("roles")
+    if not isinstance(roles, list):
+        return []
+    return [str(role).strip() for role in roles if str(role).strip()]
+
+
+def _member_can_write_playground_registry(member: dict | None) -> bool:
+    roles = set(_member_roles(member))
+    return "admin" in roles or "owner" in roles
+
+
+def _member_can_manage_tool_approvals(member: dict | None, approval_record: dict | None = None) -> bool:
+    if _member_can_write_playground_registry(member):
+        return True
+    if not isinstance(member, dict) or not isinstance(approval_record, dict):
+        return False
+    member_id = int(member.get("member_id", 0))
+    owner_id = approval_record.get("run_owner_member_id")
+    requester_id = approval_record.get("requested_by_member_id")
+    try:
+        if owner_id is not None and int(owner_id) == member_id:
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        if requester_id is not None and int(requester_id) == member_id:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def _api_forbidden(message: str = "Forbidden.") -> tuple[Response, int]:
+    return jsonify({"status": "error", "message": message}), 403
+
+
 def _request_json_dict() -> dict:
     payload = request.get_json(silent=True)
     return payload if isinstance(payload, dict) else {}
+
+
+def _tool_sandbox_items() -> list[dict[str, Any]]:
+    policies_by_tool = {
+        str(item.get("tool_name")): item
+        for item in toolSandboxPolicies.list_policies()
+        if str(item.get("tool_name") or "").strip()
+    }
+    catalog = _tool_catalog_items()
+    output: list[dict[str, Any]] = []
+    for tool in catalog:
+        name = str(tool.get("name") or "").strip()
+        persisted = policies_by_tool.get(name)
+        policy = normalize_tool_sandbox_policy(
+            persisted if isinstance(persisted, dict) else tool.get("sandbox_policy"),
+            default_tool_name=name,
+        )
+        output.append(
+            {
+                "tool_name": name,
+                "source": tool.get("source"),
+                "side_effect_class": str(tool.get("side_effect_class") or policy.get("side_effect_class") or "read_only"),
+                "approval_required": bool(tool.get("approval_required", policy.get("require_approval", False))),
+                "dry_run": bool(tool.get("dry_run", policy.get("dry_run", False))),
+                "sandbox_policy": policy,
+            }
+        )
+    return output
 
 
 def _lineage_from_request(payload: dict) -> dict[str, Any]:
@@ -301,6 +389,35 @@ def _fetch_ollama_models(host: str, timeout_seconds: float = 3.0) -> tuple[list[
         if cleaned and cleaned not in discovered:
             discovered.append(cleaned)
     return discovered, None
+
+
+def _noop_tool(**_: Any) -> dict[str, Any]:
+    return {"status": "noop"}
+
+
+def _tool_catalog_items() -> list[dict[str, Any]]:
+    custom_tools = toolRegistry.list_custom_tools(include_disabled=True)
+    specs = build_tool_specs(
+        brave_search_fn=_noop_tool,
+        chat_history_search_fn=_noop_tool,
+        knowledge_search_fn=_noop_tool,
+        skip_tools_fn=_noop_tool,
+        knowledge_domains=config.knowledgeDomains,
+        custom_tool_entries=custom_tools,
+    )
+    return tool_catalog_entries(specs, custom_entries=custom_tools)
+
+
+def _builtin_tool_names() -> set[str]:
+    specs = build_tool_specs(
+        brave_search_fn=_noop_tool,
+        chat_history_search_fn=_noop_tool,
+        knowledge_search_fn=_noop_tool,
+        skip_tools_fn=_noop_tool,
+        knowledge_domains=config.knowledgeDomains,
+        custom_tool_entries=[],
+    )
+    return set(specs.keys())
 
 
 availableMenu = [
@@ -733,6 +850,16 @@ def playgroundBootstrapAPI():
         "manifest": manifest,
         "runs": playgroundRuns.list_runs(limit=15, member_id=memberID),
         "metrics": playgroundRuns.metrics_summary(),
+        "agent_definitions": agentDefinitions.list_definitions(owner_member_id=memberID),
+        "tool_registry": _tool_catalog_items(),
+        "tool_sandbox_policies": _tool_sandbox_items(),
+        "approval_queue": toolApprovals.list_requests(
+            status="pending",
+            member_id=None if _member_can_write_playground_registry(member) else memberID,
+            limit=100,
+        ),
+        "can_write_registry": _member_can_write_playground_registry(member),
+        "can_manage_approvals": _member_can_write_playground_registry(member),
     }
     return jsonify(response)
 
@@ -793,6 +920,443 @@ def playgroundModelsAPI():
     )
 
 
+def _can_access_definition(member: dict, detail: dict) -> bool:
+    memberID = int(member.get("member_id", 0))
+    ownerID = int(detail.get("owner_member_id", -1))
+    if ownerID == memberID:
+        return True
+    return _member_can_write_playground_registry(member)
+
+
+@app.get("/api/agent-playground/agent-definitions")
+def playgroundAgentDefinitionsListAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    includeAll = str(request.args.get("all", "")).strip().lower() in {"1", "true", "yes"}
+    ownerFilter = None if includeAll and _member_can_write_playground_registry(member) else memberID
+    definitions = agentDefinitions.list_definitions(owner_member_id=ownerFilter)
+    return jsonify(
+        {
+            "status": "ok",
+            "definitions": definitions,
+            "can_write": True,
+        }
+    )
+
+
+@app.get("/api/agent-playground/agent-definitions/<definition_id>")
+def playgroundAgentDefinitionsGetAPI(definition_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    versionRaw = request.args.get("version")
+    versionValue: int | None
+    try:
+        versionValue = int(versionRaw) if versionRaw is not None else None
+    except (TypeError, ValueError):
+        versionValue = None
+
+    detail = agentDefinitions.get_definition(definition_id, version=versionValue)
+    if detail is None:
+        return jsonify({"status": "error", "message": "Agent definition not found."}), 404
+    if not _can_access_definition(member, detail):
+        return _api_forbidden("Access denied for this agent definition.")
+    return jsonify({"status": "ok", "definition": detail})
+
+
+@app.post("/api/agent-playground/agent-definitions")
+def playgroundAgentDefinitionsCreateAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    payload = _request_json_dict()
+    definitionPayload = payload.get("definition")
+    if not isinstance(definitionPayload, dict):
+        definitionPayload = payload
+    changeSummary = str(payload.get("change_summary") or "Initial definition").strip()
+    try:
+        detail = agentDefinitions.create_definition(
+            definitionPayload,
+            author_member_id=int(member.get("member_id", 0)),
+            change_summary=changeSummary,
+        )
+    except AgentDefinitionValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    return jsonify({"status": "ok", "definition": detail}), 201
+
+
+@app.post("/api/agent-playground/agent-definitions/<definition_id>/versions")
+def playgroundAgentDefinitionsVersionCreateAPI(definition_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    current = agentDefinitions.get_definition(definition_id)
+    if current is None:
+        return jsonify({"status": "error", "message": "Agent definition not found."}), 404
+    if not _can_access_definition(member, current):
+        return _api_forbidden("Access denied for this agent definition.")
+
+    payload = _request_json_dict()
+    definitionPayload = payload.get("definition")
+    if not isinstance(definitionPayload, dict):
+        return jsonify({"status": "error", "message": "definition object is required."}), 400
+    changeSummary = str(payload.get("change_summary") or "Updated definition").strip()
+
+    try:
+        detail = agentDefinitions.create_version(
+            definition_id,
+            definitionPayload,
+            author_member_id=int(member.get("member_id", 0)),
+            change_summary=changeSummary,
+        )
+    except AgentDefinitionValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    return jsonify({"status": "ok", "definition": detail})
+
+
+@app.post("/api/agent-playground/agent-definitions/<definition_id>/rollback")
+def playgroundAgentDefinitionsRollbackAPI(definition_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    current = agentDefinitions.get_definition(definition_id)
+    if current is None:
+        return jsonify({"status": "error", "message": "Agent definition not found."}), 404
+    if not _can_access_definition(member, current):
+        return _api_forbidden("Access denied for this agent definition.")
+
+    payload = _request_json_dict()
+    targetVersionRaw = payload.get("target_version")
+    try:
+        targetVersion = int(targetVersionRaw)
+    except (TypeError, ValueError):
+        targetVersion = 0
+    if targetVersion <= 0:
+        return jsonify({"status": "error", "message": "target_version must be a positive integer."}), 400
+
+    changeSummary = str(payload.get("change_summary") or f"Rollback to v{targetVersion}").strip()
+    try:
+        detail = agentDefinitions.rollback(
+            definition_id,
+            target_version=targetVersion,
+            author_member_id=int(member.get("member_id", 0)),
+            change_summary=changeSummary,
+        )
+    except AgentDefinitionValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+    return jsonify({"status": "ok", "definition": detail})
+
+
+@app.get("/api/agent-playground/agent-definitions/<definition_id>/export")
+def playgroundAgentDefinitionsExportAPI(definition_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    detail = agentDefinitions.get_definition(definition_id)
+    if detail is None:
+        return jsonify({"status": "error", "message": "Agent definition not found."}), 404
+    if not _can_access_definition(member, detail):
+        return _api_forbidden("Access denied for this agent definition.")
+
+    fmt = str(request.args.get("format") or "json").strip().lower()
+    versionRaw = request.args.get("version")
+    try:
+        versionValue = int(versionRaw) if versionRaw is not None else None
+    except (TypeError, ValueError):
+        versionValue = None
+    try:
+        text = agentDefinitions.export_definition(definition_id, version=versionValue, fmt=fmt)
+    except AgentDefinitionValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    return jsonify(
+        {
+            "status": "ok",
+            "definition_id": definition_id,
+            "format": fmt,
+            "payload": text,
+        }
+    )
+
+
+@app.post("/api/agent-playground/agent-definitions/import")
+def playgroundAgentDefinitionsImportAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    payload = _request_json_dict()
+    rawPayload = str(payload.get("raw_payload") or payload.get("payload") or "").strip()
+    fmt = str(payload.get("format") or "json").strip().lower()
+    changeSummary = str(payload.get("change_summary") or "Imported definition").strip()
+    try:
+        detail = agentDefinitions.import_definition(
+            raw_payload=rawPayload,
+            fmt=fmt,
+            author_member_id=int(member.get("member_id", 0)),
+            change_summary=changeSummary,
+        )
+    except AgentDefinitionValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+    return jsonify({"status": "ok", "definition": detail}), 201
+
+
+@app.get("/api/agent-playground/tools")
+def playgroundToolsListAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    return jsonify(
+        {
+            "status": "ok",
+            "tools": _tool_catalog_items(),
+            "can_write": _member_can_write_playground_registry(member),
+        }
+    )
+
+
+@app.post("/api/agent-playground/tools")
+def playgroundToolsUpsertAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    if not _member_can_write_playground_registry(member):
+        return _api_forbidden("Tool registry writes require admin or owner role.")
+
+    payload = _request_json_dict()
+    toolPayload = payload.get("tool")
+    if not isinstance(toolPayload, dict):
+        toolPayload = payload
+    toolName = str(toolPayload.get("name") or "").strip()
+    if toolName in _builtin_tool_names():
+        return jsonify({"status": "error", "message": "Builtin tool names cannot be overridden."}), 400
+
+    try:
+        normalized = toolRegistry.upsert_custom_tool(
+            toolPayload,
+            actor_member_id=int(member.get("member_id", 0)),
+        )
+    except ToolRegistryValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+    return jsonify({"status": "ok", "tool": normalized, "tools": _tool_catalog_items()})
+
+
+@app.post("/api/agent-playground/tools/<tool_name>")
+def playgroundToolsUpdateAPI(tool_name: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    if not _member_can_write_playground_registry(member):
+        return _api_forbidden("Tool registry writes require admin or owner role.")
+
+    payload = _request_json_dict()
+    toolPayload = payload.get("tool")
+    if not isinstance(toolPayload, dict):
+        toolPayload = payload
+    toolPayload = dict(toolPayload)
+    toolPayload["name"] = tool_name
+    if tool_name in _builtin_tool_names():
+        return jsonify({"status": "error", "message": "Builtin tool names cannot be edited here."}), 400
+
+    try:
+        normalized = toolRegistry.upsert_custom_tool(
+            toolPayload,
+            actor_member_id=int(member.get("member_id", 0)),
+        )
+    except ToolRegistryValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+    return jsonify({"status": "ok", "tool": normalized, "tools": _tool_catalog_items()})
+
+
+@app.delete("/api/agent-playground/tools/<tool_name>")
+def playgroundToolsDeleteAPI(tool_name: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    if not _member_can_write_playground_registry(member):
+        return _api_forbidden("Tool registry writes require admin or owner role.")
+    if tool_name in _builtin_tool_names():
+        return jsonify({"status": "error", "message": "Builtin tools cannot be removed."}), 400
+    try:
+        removed = toolRegistry.remove_custom_tool(tool_name)
+    except ToolRegistryValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+    if not removed:
+        return jsonify({"status": "error", "message": "Custom tool not found."}), 404
+    return jsonify({"status": "ok", "tools": _tool_catalog_items()})
+
+
+@app.get("/api/agent-playground/tools/sandbox-policies")
+def playgroundToolSandboxPoliciesListAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    return jsonify(
+        {
+            "status": "ok",
+            "policies": _tool_sandbox_items(),
+            "can_write": _member_can_write_playground_registry(member),
+        }
+    )
+
+
+@app.get("/api/agent-playground/tools/sandbox-policies/<tool_name>")
+def playgroundToolSandboxPolicyGetAPI(tool_name: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    policy = toolSandboxPolicies.get_policy(tool_name)
+    if policy is None:
+        return jsonify({"status": "error", "message": "Sandbox policy not found."}), 404
+    return jsonify({"status": "ok", "policy": policy})
+
+
+@app.post("/api/agent-playground/tools/sandbox-policies")
+def playgroundToolSandboxPolicyUpsertAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    if not _member_can_write_playground_registry(member):
+        return _api_forbidden("Tool sandbox writes require admin or owner role.")
+
+    payload = _request_json_dict()
+    policyPayload = payload.get("policy")
+    if not isinstance(policyPayload, dict):
+        policyPayload = payload
+
+    try:
+        policy = toolSandboxPolicies.upsert_policy(
+            policyPayload,
+            actor_member_id=int(member.get("member_id", 0)),
+        )
+    except ToolSandboxPolicyValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+    return jsonify({"status": "ok", "policy": policy, "policies": _tool_sandbox_items()})
+
+
+@app.post("/api/agent-playground/tools/sandbox-policies/<tool_name>")
+def playgroundToolSandboxPolicyUpdateAPI(tool_name: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    if not _member_can_write_playground_registry(member):
+        return _api_forbidden("Tool sandbox writes require admin or owner role.")
+
+    payload = _request_json_dict()
+    policyPayload = payload.get("policy")
+    if not isinstance(policyPayload, dict):
+        policyPayload = payload
+    policyPayload = dict(policyPayload)
+    policyPayload["tool_name"] = tool_name
+
+    try:
+        policy = toolSandboxPolicies.upsert_policy(
+            policyPayload,
+            actor_member_id=int(member.get("member_id", 0)),
+        )
+    except ToolSandboxPolicyValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+    return jsonify({"status": "ok", "policy": policy, "policies": _tool_sandbox_items()})
+
+
+@app.delete("/api/agent-playground/tools/sandbox-policies/<tool_name>")
+def playgroundToolSandboxPolicyDeleteAPI(tool_name: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+    if not _member_can_write_playground_registry(member):
+        return _api_forbidden("Tool sandbox writes require admin or owner role.")
+    try:
+        removed = toolSandboxPolicies.remove_policy(tool_name)
+    except ToolSandboxPolicyValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+    if not removed:
+        return jsonify({"status": "error", "message": "Sandbox policy not found."}), 404
+    return jsonify({"status": "ok", "policies": _tool_sandbox_items()})
+
+
+@app.get("/api/agent-playground/tool-approvals")
+def playgroundToolApprovalsListAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    statusFilter = str(request.args.get("status") or "").strip().lower() or None
+    runID = str(request.args.get("run_id") or "").strip() or None
+    try:
+        limit = int(request.args.get("limit", "100"))
+    except ValueError:
+        limit = 100
+    memberID = int(member.get("member_id", 0))
+
+    approvals = toolApprovals.list_requests(
+        status=statusFilter,
+        run_id=runID,
+        member_id=None if _member_can_write_playground_registry(member) else memberID,
+        limit=max(1, min(limit, 500)),
+    )
+    return jsonify(
+        {
+            "status": "ok",
+            "approvals": approvals,
+            "can_decide": _member_can_write_playground_registry(member),
+        }
+    )
+
+
+@app.get("/api/agent-playground/tool-approvals/<request_id>")
+def playgroundToolApprovalGetAPI(request_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    approval = toolApprovals.get_request(request_id)
+    if approval is None:
+        return jsonify({"status": "error", "message": "Approval request not found."}), 404
+    if not _member_can_manage_tool_approvals(member, approval):
+        return _api_forbidden("Access denied for this approval request.")
+    return jsonify({"status": "ok", "approval": approval})
+
+
+@app.post("/api/agent-playground/tool-approvals/<request_id>/decision")
+def playgroundToolApprovalDecisionAPI(request_id: str):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    existing = toolApprovals.get_request(request_id)
+    if existing is None:
+        return jsonify({"status": "error", "message": "Approval request not found."}), 404
+    if not _member_can_manage_tool_approvals(member, existing):
+        return _api_forbidden("You cannot decide this approval request.")
+
+    payload = _request_json_dict()
+    decision = str(payload.get("decision") or "").strip().lower()
+    reason = str(payload.get("reason") or "").strip()
+    try:
+        updated = toolApprovals.decide_request(
+            request_id,
+            decision=decision,
+            actor_member_id=int(member.get("member_id", 0)),
+            reason=reason,
+            meta={"source": "agent_playground"},
+        )
+    except ApprovalValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+    return jsonify({"status": "ok", "approval": updated})
+
+
 @app.get("/api/agent-playground/runs")
 def playgroundRunsListAPI():
     member = _require_member_api()
@@ -840,6 +1404,7 @@ def playgroundRunsCreateAPI():
             return jsonify({"status": "error", "message": "compare_models requires at least two models."}), 400
 
     memberID = int(member.get("member_id", 0))
+    memberCanWrite = _member_can_write_playground_registry(member)
     contextPayload = payload.get("context")
     if not isinstance(contextPayload, dict):
         contextPayload = {}
@@ -849,6 +1414,37 @@ def playgroundRunsCreateAPI():
     contextPayload.setdefault("topic_id", None)
     contextPayload.setdefault("chat_type", "member")
     contextPayload.setdefault("message_timestamp", datetime.now().isoformat(timespec="seconds"))
+
+    agentDefinitionPayload = payload.get("agent_definition") if isinstance(payload.get("agent_definition"), dict) else {}
+    agentDefinitionRef: dict[str, Any] = {}
+    agentDefinitionID = str(payload.get("agent_definition_id") or "").strip()
+    agentDefinitionVersionRaw = payload.get("agent_definition_version")
+    try:
+        agentDefinitionVersion = int(agentDefinitionVersionRaw) if agentDefinitionVersionRaw is not None else None
+    except (TypeError, ValueError):
+        agentDefinitionVersion = None
+
+    if agentDefinitionID:
+        resolvedDefinition = agentDefinitions.get_definition(agentDefinitionID, version=agentDefinitionVersion)
+        if resolvedDefinition is None:
+            return jsonify({"status": "error", "message": "Selected agent definition was not found."}), 404
+        ownerID = int(resolvedDefinition.get("owner_member_id", -1))
+        if ownerID != memberID and not memberCanWrite:
+            return _api_forbidden("Access denied for selected agent definition.")
+        if isinstance(resolvedDefinition.get("definition"), dict):
+            agentDefinitionPayload = resolvedDefinition["definition"]
+            agentDefinitionRef = {
+                "definition_id": resolvedDefinition.get("definition_id"),
+                "version": resolvedDefinition.get("selected_version"),
+                "name": resolvedDefinition.get("name"),
+            }
+    elif agentDefinitionPayload:
+        agentDefinitionPayload = normalize_agent_definition(agentDefinitionPayload)
+        agentDefinitionRef = {
+            "definition_id": str(payload.get("agent_definition_id") or "").strip() or None,
+            "version": agentDefinitionVersion,
+            "name": agentDefinitionPayload.get("identity", {}).get("name"),
+        }
 
     requestPayload = {
         "mode": mode,
@@ -862,7 +1458,8 @@ def playgroundRunsCreateAPI():
         "source_run_id": payload.get("source_run_id"),
         "replay_from_seq": payload.get("replay_from_seq"),
         "state_overrides": payload.get("state_overrides") if isinstance(payload.get("state_overrides"), dict) else {},
-        "agent_definition": payload.get("agent_definition") if isinstance(payload.get("agent_definition"), dict) else {},
+        "agent_definition": agentDefinitionPayload if isinstance(agentDefinitionPayload, dict) else {},
+        "agent_definition_ref": agentDefinitionRef,
     }
 
     autoStart = bool(payload.get("auto_start", True))

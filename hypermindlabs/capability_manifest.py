@@ -5,10 +5,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from hypermindlabs.agent_definitions import AgentDefinitionStore
 from hypermindlabs.run_events import event_schema
 from hypermindlabs.run_mode_handlers import run_modes_manifest
 from hypermindlabs.runtime_settings import DEFAULT_RUNTIME_SETTINGS
-from hypermindlabs.tool_registry import build_tool_specs
+from hypermindlabs.approval_manager import ApprovalManager
+from hypermindlabs.tool_registry import ToolRegistryStore
+from hypermindlabs.tool_sandbox import ToolSandboxPolicyStore
 from hypermindlabs.utils import ConfigManager
 
 
@@ -23,27 +26,14 @@ def _noop_tool(**_: Any) -> dict[str, Any]:
 
 
 def _tool_capability() -> dict[str, Any]:
-    specs = build_tool_specs(
+    registry = ToolRegistryStore()
+    items = registry.list_catalog(
         brave_search_fn=_noop_tool,
         chat_history_search_fn=_noop_tool,
         knowledge_search_fn=_noop_tool,
         skip_tools_fn=_noop_tool,
         knowledge_domains=[],
     )
-    items: list[dict[str, Any]] = []
-    for spec in specs.values():
-        model_tool = spec.to_model_tool()
-        function = model_tool.get("function", {})
-        items.append(
-            {
-                "name": spec.name,
-                "description": spec.description,
-                "required_api_key": spec.required_api_key,
-                "timeout_seconds": float(spec.default_timeout_seconds),
-                "max_retries": int(spec.default_max_retries),
-                "input_schema": function.get("parameters", {"type": "object", "properties": {}}),
-            }
-        )
 
     return {
         "id": "tools.list",
@@ -57,9 +47,20 @@ def _tool_capability() -> dict[str, Any]:
                 "properties": {
                     "name": {"type": "string"},
                     "description": {"type": "string"},
+                    "source": {"type": "string"},
+                    "enabled": {"type": "boolean"},
                     "required_api_key": {"type": ["string", "null"]},
                     "timeout_seconds": {"type": "number"},
                     "max_retries": {"type": "integer"},
+                    "auth_requirements": {"type": "string"},
+                    "side_effect_class": {"type": "string"},
+                    "approval_required": {"type": "boolean"},
+                    "dry_run": {"type": "boolean"},
+                    "rate_limit_per_minute": {"type": "integer"},
+                    "handler_mode": {"type": "string"},
+                    "static_result": {"type": ["object", "array", "string", "number", "boolean", "null"]},
+                    "dry_run_result": {"type": ["object", "array", "string", "number", "boolean", "null"]},
+                    "sandbox_policy": {"type": "object"},
                     "input_schema": {"type": "object"},
                 },
             },
@@ -110,8 +111,9 @@ def _models_capability(config: ConfigManager) -> dict[str, Any]:
 
 
 def _agents_capability() -> dict[str, Any]:
+    store = AgentDefinitionStore()
     policy_dir = Path(__file__).resolve().parent.parent / "policies" / "agent"
-    agent_entries: list[dict[str, Any]] = []
+    policy_entries: list[dict[str, Any]] = []
     if policy_dir.exists():
         for policy_file in sorted(policy_dir.glob("*_policy.json")):
             policy_name = policy_file.stem.replace("_policy", "")
@@ -123,13 +125,27 @@ def _agents_capability() -> dict[str, Any]:
                     allowed_models = [str(item).strip() for item in maybe_models if str(item).strip()]
             except Exception:  # noqa: BLE001
                 allowed_models = []
-            agent_entries.append(
+            policy_entries.append(
                 {
                     "name": policy_name,
                     "policy_file": str(policy_file.name),
                     "allowed_models": allowed_models,
+                    "source": "policy",
                 }
             )
+    saved_definitions = store.list_definitions(owner_member_id=None)
+    definition_entries = [
+        {
+            "definition_id": item.get("definition_id"),
+            "name": item.get("name"),
+            "description": item.get("description"),
+            "tags": item.get("tags"),
+            "active_version": item.get("active_version"),
+            "version_count": item.get("version_count"),
+            "source": "definition",
+        }
+        for item in saved_definitions
+    ]
 
     return {
         "id": "agents.list",
@@ -138,12 +154,18 @@ def _agents_capability() -> dict[str, Any]:
         "schema": {
             "type": "object",
             "properties": {
+                "definition_id": {"type": "string"},
                 "name": {"type": "string"},
+                "description": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "active_version": {"type": "integer"},
+                "version_count": {"type": "integer"},
                 "policy_file": {"type": "string"},
                 "allowed_models": {"type": "array", "items": {"type": "string"}},
+                "source": {"type": "string"},
             },
         },
-        "items": agent_entries,
+        "items": definition_entries + policy_entries,
     }
 
 
@@ -251,6 +273,58 @@ def _run_lifecycle_capability() -> dict[str, Any]:
     }
 
 
+def _tool_sandbox_capability() -> dict[str, Any]:
+    store = ToolSandboxPolicyStore()
+    return {
+        "id": "tools.sandbox",
+        "title": "Tool Sandbox Policies",
+        "permissions": {"read": ["user", "admin", "owner"], "write": ["admin", "owner"]},
+        "schema": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["tool_name", "sandbox_policy"],
+                "properties": {
+                    "tool_name": {"type": "string"},
+                    "source": {"type": "string"},
+                    "side_effect_class": {"type": "string"},
+                    "approval_required": {"type": "boolean"},
+                    "dry_run": {"type": "boolean"},
+                    "sandbox_policy": {"type": "object"},
+                },
+            },
+        },
+        "items": store.list_policies(),
+    }
+
+
+def _tool_approvals_capability() -> dict[str, Any]:
+    queue = ApprovalManager()
+    return {
+        "id": "tools.approvals",
+        "title": "Tool Approval Queue",
+        "permissions": {"read": ["user", "admin", "owner"], "write": ["user", "admin", "owner"]},
+        "schema": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["request_id", "run_id", "tool_name", "status"],
+                "properties": {
+                    "request_id": {"type": "string"},
+                    "run_id": {"type": "string"},
+                    "tool_name": {"type": "string"},
+                    "status": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "requested_at": {"type": "string"},
+                    "expires_at": {"type": "string"},
+                    "decided_at": {"type": ["string", "null"]},
+                },
+            },
+        },
+        "items": queue.list_requests(limit=50),
+    }
+
+
 
 def build_capability_manifest(member_roles: list[str] | None = None) -> dict[str, Any]:
     roles = [str(role).strip() for role in (member_roles or []) if str(role).strip()]
@@ -260,6 +334,8 @@ def build_capability_manifest(member_roles: list[str] | None = None) -> dict[str
         _run_lifecycle_capability(),
         _models_capability(config),
         _tool_capability(),
+        _tool_sandbox_capability(),
+        _tool_approvals_capability(),
         _agents_capability(),
         _memory_capability(),
         _evals_capability(),

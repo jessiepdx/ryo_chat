@@ -93,7 +93,28 @@
       "brave_timeout_seconds": 10.0,
       "chat_history_timeout_seconds": 6.0,
       "knowledge_timeout_seconds": 6.0,
-      "skip_tools_timeout_seconds": 2.0
+      "skip_tools_timeout_seconds": 2.0,
+      "enable_human_approval": true,
+      "default_approval_timeout_seconds": 45.0,
+      "approval_poll_interval_seconds": 0.25,
+      "default_dry_run": false,
+      "sandbox": {
+        "enabled": true,
+        "side_effect_class": "read_only",
+        "require_approval": false,
+        "dry_run": false,
+        "approval_timeout_seconds": 45.0,
+        "execution_timeout_ceiling": 30.0,
+        "max_memory_mb": 512,
+        "network": {
+          "enabled": true,
+          "allowlist_domains": []
+        },
+        "filesystem": {
+          "mode": "none",
+          "allowed_paths": []
+        }
+      }
     },
     "telegram": {
       "minimum_community_score_private_chat": 50,
