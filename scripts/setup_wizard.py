@@ -1258,6 +1258,7 @@ def main() -> int:
     print("  python3 telegram_ui.py")
     print("  python3 web_ui.py")
     print("  python3 cli_ui.py")
+    print("  python3 scripts/policy_wizard.py --validate-only")
     return 0
 
 

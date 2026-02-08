@@ -32,7 +32,7 @@ This document covers:
 3. Complete documentation and master engineering documentation maintenance: Implemented in this cycle (checklist, changelog, and sync workflow artifacts added).
 4. Graceful degradation for tools with missing APIs: Implemented (structured tool runtime added with missing-key handling, arg validation, timeout/retry bounds, and error envelopes).
 5. Curses walkthrough for key ingress and model selection: Implemented (curses wizard with endpoint probing, model mapping, validation, optional `.env` updates, and resumable partial-state flow).
-6. Policy walkthrough and setup: Planned.
+6. Policy walkthrough and setup: Implemented (`PolicyManager` added with schema/prompt/model validation, warning/strict model compatibility checks, and guided CLI editor in `scripts/policy_wizard.py`).
 7. Tool-calling stack review and improvements: Planned.
 8. Automatic ingress of Telegram keys: Planned.
 9. Master engineering documentation and prerequisite explainer: In progress.

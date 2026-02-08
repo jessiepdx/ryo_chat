@@ -11,6 +11,7 @@ For the full engineering baseline and upgrade roadmap, see:
 - `docs/master-engineering.md`
 - `docs/CHANGELOG_ENGINEERING.md`
 - `docs/DOC_UPDATE_CHECKLIST.md`
+- `docs/policy-guide.md`
 
 ## References
 - Ollama: https://ollama.com/
@@ -144,9 +145,17 @@ Agent policies and system prompts live in:
 - `policies/agent/system_prompt/*.txt`
 
 Current behavior:
-- Policies and prompts are loaded from disk at runtime.
-- Missing policy/prompt files are not yet gracefully handled; keep these files present.
+- Policies are validated before agent execution.
+- Missing/invalid policy data degrades to safe defaults with warnings.
+- Missing/unreadable prompt files degrade to a fallback system prompt with warnings.
 - `policies/agent/tool_calling_policy.json` supports optional `tool_runtime` timeout/retry settings per tool.
+
+Policy walkthrough and validation:
+```bash
+python3 scripts/policy_wizard.py
+python3 scripts/policy_wizard.py --policy tool_calling --validate-only
+python3 scripts/policy_wizard.py --policy tool_calling --validate-only --strict-models
+```
 
 ## Known Operational Prerequisites
 - `logs/` directory must exist before starting `telegram_ui.py`, `web_ui.py`, or `x_ui.py`.

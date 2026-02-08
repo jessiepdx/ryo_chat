@@ -70,3 +70,19 @@ Implemented:
 4. Added cancellation-safe behavior so user cancellation exits cleanly without writing `config.json`.
 5. Added wizard validation/unit tests in `tests/test_setup_wizard_validation.py`.
 6. Updated setup documentation in `readme.md` and engineering status snapshot in `docs/master-engineering.md`.
+
+### WO-006: Policy Walkthrough and Setup
+Status: Implemented
+
+Implemented:
+1. Added centralized policy/prompt validation and safe update management in `hypermindlabs/policy_manager.py`.
+2. Added schema checks for `allow_custom_system_prompt` and `allowed_models` (plus optional `tool_runtime` shape validation).
+3. Added prompt-file existence/readability validation before runtime execution.
+4. Added endpoint-aware model compatibility validation with deterministic host precedence:
+   - explicit override
+   - configured `inference.*.url`
+   - default local host
+5. Added guided policy editing/validation workflow in `scripts/policy_wizard.py`.
+6. Integrated runtime policy loading in `hypermindlabs/agents.py` through `PolicyManager`, including graceful defaults on invalid policy artifacts.
+7. Added tests in `tests/test_policy_manager.py`.
+8. Added operator-facing policy documentation in `docs/policy-guide.md` and updated README policy instructions.

@@ -20,7 +20,9 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 import requests
+from typing import Any
 from hypermindlabs.model_router import ModelExecutionError, ModelRouter
+from hypermindlabs.policy_manager import PolicyManager, PolicyValidationError
 from hypermindlabs.tool_runtime import ToolDefinition, ToolRuntime
 from hypermindlabs.utils import (
     ChatHistoryManager, 
@@ -420,11 +422,12 @@ class ToolCallingAgent():
         
         # Over write defaults with loaded policy
         agentName = "tool_calling"
+        endpointOverride = None if options is None else options.get("ollama_host")
         # TODO have defaults to use if policy fails to load or missing key values
-        policy = loadAgentPolicy(agentName)
+        policy = loadAgentPolicy(agentName, endpointOverride=endpointOverride)
         self._systemPrompt = loadAgentSystemPrompt(agentName)
         self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
-        self._allowed_models = policy.get("allowed_models")
+        self._allowed_models = resolveAllowedModels(agentName, policy)
         self._model = self._allowed_models[0]
 
         toolRuntimePolicy = policy.get("tool_runtime", {})
@@ -462,7 +465,6 @@ class ToolCallingAgent():
             if modelRequested in self._allowed_models:
                 self._model = modelRequested
 
-        endpointOverride = None if options is None else options.get("ollama_host")
         self._modelRouter = ModelRouter(
             inference_config=config._instance.inference,
             endpoint_override=endpointOverride,
@@ -577,11 +579,12 @@ class MessageAnalysisAgent():
         
         # Over write defaults with loaded policy
         agentName = "message_analysis"
+        endpointOverride = None if options is None else options.get("ollama_host")
         # TODO have defaults to use if policy fails to load or missing key values
-        policy = loadAgentPolicy(agentName)
+        policy = loadAgentPolicy(agentName, endpointOverride=endpointOverride)
         self._systemPrompt = loadAgentSystemPrompt(agentName)
         self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
-        self._allowed_models = policy.get("allowed_models")
+        self._allowed_models = resolveAllowedModels(agentName, policy)
         self._model = self._allowed_models[0]
 
         # Check for options passed and if policy allows for those options
@@ -590,7 +593,6 @@ class MessageAnalysisAgent():
             if modelRequested in self._allowed_models:
                 self._model = modelRequested
 
-        endpointOverride = None if options is None else options.get("ollama_host")
         self._modelRouter = ModelRouter(
             inference_config=config._instance.inference,
             endpoint_override=endpointOverride,
@@ -630,11 +632,12 @@ class DevTestAgent():
         
         # Over write defaults with loaded policy
         agentName = "dev_test"
+        endpointOverride = None if options is None else options.get("ollama_host")
         # TODO have defaults to use if policy fails to load or missing key values
-        policy = loadAgentPolicy(agentName)
+        policy = loadAgentPolicy(agentName, endpointOverride=endpointOverride)
         self._systemPrompt = loadAgentSystemPrompt(agentName)
         self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
-        self._allowed_models = policy.get("allowed_models")
+        self._allowed_models = resolveAllowedModels(agentName, policy)
         self._model = self._allowed_models[0]
 
         # Check for options passed and if policy allows for those options
@@ -643,7 +646,6 @@ class DevTestAgent():
             if modelRequested in self._allowed_models:
                 self._model = modelRequested
 
-        endpointOverride = None if options is None else options.get("ollama_host")
         self._modelRouter = ModelRouter(
             inference_config=config._instance.inference,
             endpoint_override=endpointOverride,
@@ -684,11 +686,12 @@ class ChatConversationAgent():
         
         # Over write defaults with loaded policy
         agentName = "chat_conversation"
+        endpointOverride = None if options is None else options.get("ollama_host")
         # TODO have defaults to use if policy fails to load or missing key values
-        policy = loadAgentPolicy(agentName)
+        policy = loadAgentPolicy(agentName, endpointOverride=endpointOverride)
         self._systemPrompt = loadAgentSystemPrompt(agentName)
         self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
-        self._allowed_models = policy.get("allowed_models")
+        self._allowed_models = resolveAllowedModels(agentName, policy)
         self._model = self._allowed_models[0]
 
         # Check for options passed and if policy allows for those options
@@ -697,7 +700,6 @@ class ChatConversationAgent():
             if modelRequested in self._allowed_models:
                 self._model = modelRequested
 
-        endpointOverride = None if options is None else options.get("ollama_host")
         self._modelRouter = ModelRouter(
             inference_config=config._instance.inference,
             endpoint_override=endpointOverride,
@@ -1110,22 +1112,65 @@ DO NOT put quotes around the tweet."""
 # HELPER FUNCTIONS #
 ####################
 
-def loadAgentPolicy(policyName: str) -> dict:
-    logger.info(f"Loading agent policy for:  {policyName}")
-    policiesDir = "policies/agent/"
-    f = open(policiesDir + policyName + "_policy.json", "r")
-    policy_json = json.load(f)
+def _policyManager(endpointOverride: str | None = None) -> PolicyManager:
+    inference = config._instance.inference if hasattr(config, "_instance") else {}
+    return PolicyManager(
+        inference_config=inference,
+        endpoint_override=endpointOverride,
+    )
 
-    return policy_json
+
+def resolveAllowedModels(policyName: str, policy: dict) -> list[str]:
+    allowed = policy.get("allowed_models")
+    models: list[str] = []
+    if isinstance(allowed, list):
+        for modelName in allowed:
+            if isinstance(modelName, str):
+                cleaned = modelName.strip()
+                if cleaned and cleaned not in models:
+                    models.append(cleaned)
+
+    if models:
+        return models
+
+    fallbackPolicy = _policyManager().default_policy(policyName)
+    fallbackModels = fallbackPolicy.get("allowed_models", [])
+    if isinstance(fallbackModels, list):
+        for modelName in fallbackModels:
+            if isinstance(modelName, str) and modelName.strip():
+                models.append(modelName.strip())
+
+    if models:
+        return models
+
+    return ["llama3.2:latest"]
+
+
+def loadAgentPolicy(policyName: str, endpointOverride: str | None = None) -> dict:
+    logger.info(f"Loading agent policy for: {policyName}")
+    manager = _policyManager(endpointOverride=endpointOverride)
+    report = manager.validate_policy(policyName=policyName, strict_model_check=False)
+
+    for warning in report.warnings:
+        logger.warning(f"Policy validation warning [{policyName}]: {warning}")
+    for error in report.errors:
+        logger.error(f"Policy validation error [{policyName}]: {error}")
+
+    if report.errors:
+        return manager.default_policy(policyName)
+    if isinstance(report.normalized_policy, dict):
+        return report.normalized_policy
+    return manager.default_policy(policyName)
 
 
 def loadAgentSystemPrompt(policyName: str) -> str:
-    logger.info(f"Loading agent system prompt for:  {policyName}")
-    systemPromptDir = "policies/agent/system_prompt/"
-    f = open(systemPromptDir + policyName + "_sp.txt", "r")
-    systemPrompt_txt = f.read()
-
-    return systemPrompt_txt
+    logger.info(f"Loading agent system prompt for: {policyName}")
+    manager = _policyManager()
+    try:
+        return manager.load_system_prompt(policy_name=policyName, strict=True)
+    except PolicyValidationError as error:
+        logger.error(f"System prompt load failed [{policyName}]: {error}")
+        return manager.load_system_prompt(policy_name=policyName, strict=False)
 
 
 def toolCaller(toolName: str, toolArgs: dict) -> dict:
