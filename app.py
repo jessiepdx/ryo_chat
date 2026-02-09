@@ -1545,6 +1545,23 @@ ROUTE_CONFIG_SPECS: dict[str, RouteConfigSpec] = {
                         env_override_keys=("RYO_TELEGRAM_STAGE_DETAIL_LEVEL",),
                     ),
                     RouteSettingSpec(
+                        id="get_updates_write_timeout",
+                        label="Updates Write Timeout",
+                        path="runtime.telegram.get_updates_write_timeout",
+                        value_type="int",
+                        description="Telegram polling write timeout in seconds.",
+                        default_runtime_path="telegram.get_updates_write_timeout",
+                        min_value=1,
+                        max_value=3600,
+                        env_override_keys=("RYO_TELEGRAM_GET_UPDATES_WRITE_TIMEOUT",),
+                    ),
+                ),
+            ),
+            RouteCategorySpec(
+                id="brevity",
+                label="Brevity / Topic Shift",
+                settings=(
+                    RouteSettingSpec(
                         id="fast_path_small_talk_enabled",
                         label="Fast Path Brevity",
                         path="runtime.orchestrator.fast_path_small_talk_enabled",
@@ -1598,15 +1615,46 @@ ROUTE_CONFIG_SPECS: dict[str, RouteConfigSpec] = {
                         env_override_keys=("RYO_ORCHESTRATOR_ANALYSIS_CONTEXT_SUMMARY_MAX_CHARS",),
                     ),
                     RouteSettingSpec(
-                        id="get_updates_write_timeout",
-                        label="Updates Write Timeout",
-                        path="runtime.telegram.get_updates_write_timeout",
+                        id="topic_shift_trim_temporal_on_small_talk",
+                        label="Trim Temporal On Small Talk",
+                        path="runtime.topic_shift.trim_temporal_history_on_small_talk",
+                        value_type="bool",
+                        description="When true, reduce temporal timeline payload during short social turns.",
+                        default_runtime_path="topic_shift.trim_temporal_history_on_small_talk",
+                        env_override_keys=("RYO_TOPIC_SHIFT_TRIM_TEMPORAL_ON_SMALL_TALK",),
+                    ),
+                    RouteSettingSpec(
+                        id="topic_shift_small_talk_history_limit",
+                        label="Small Talk History Limit",
+                        path="runtime.topic_shift.small_talk_history_limit",
                         value_type="int",
-                        description="Telegram polling write timeout in seconds.",
-                        default_runtime_path="telegram.get_updates_write_timeout",
+                        description="History items retained during small-talk turns.",
+                        default_runtime_path="topic_shift.small_talk_history_limit",
+                        min_value=0,
+                        max_value=50,
+                        env_override_keys=("RYO_TOPIC_SHIFT_SMALL_TALK_HISTORY_LIMIT",),
+                    ),
+                    RouteSettingSpec(
+                        id="topic_shift_min_token_count",
+                        label="Topic Shift Min Token Count",
+                        path="runtime.topic_shift.min_token_count",
+                        value_type="int",
+                        description="Minimum token count before lexical topic-switch logic engages.",
+                        default_runtime_path="topic_shift.min_token_count",
                         min_value=1,
-                        max_value=3600,
-                        env_override_keys=("RYO_TELEGRAM_GET_UPDATES_WRITE_TIMEOUT",),
+                        max_value=100,
+                        env_override_keys=("RYO_TOPIC_SHIFT_MIN_TOKEN_COUNT",),
+                    ),
+                    RouteSettingSpec(
+                        id="topic_shift_recent_user_messages",
+                        label="Recent User Messages Window",
+                        path="runtime.topic_shift.recent_user_messages",
+                        value_type="int",
+                        description="How many recent user turns are considered when building topic memory circuit.",
+                        default_runtime_path="topic_shift.recent_user_messages",
+                        min_value=1,
+                        max_value=100,
+                        env_override_keys=("RYO_TOPIC_SHIFT_RECENT_USER_MESSAGES",),
                     ),
                 ),
             ),
@@ -3727,6 +3775,91 @@ def _curses_select_option(
             return None
 
 
+def _is_ollama_model_field(path: str) -> bool:
+    normalized = str(path or "").strip()
+    return normalized.startswith("inference.") and normalized.endswith(".model")
+
+
+def _discover_ollama_models_for_editor(
+    *,
+    config_data: dict[str, Any],
+    runtime_settings: dict[str, Any],
+) -> tuple[list[str], str | None]:
+    host = resolve_ollama_host(config_data, runtime_settings=runtime_settings)
+    probe_timeout = float(get_runtime_setting(runtime_settings, "inference.probe_timeout_seconds", 3.0))
+    return fetch_ollama_models(host, timeout=probe_timeout)
+
+
+def _curses_select_model_chain(
+    stdscr: Any,
+    *,
+    title: str,
+    body_lines: list[str],
+    options: list[str],
+    current_selected: list[str] | None = None,
+) -> list[str] | None:
+    if not options:
+        return None
+
+    selected_order = _dedupe_models(list(current_selected or []))
+    display_options = _dedupe_models(selected_order + list(options))
+    selected_set = set(selected_order)
+
+    index = 0
+    if selected_order:
+        try:
+            index = display_options.index(selected_order[0])
+        except ValueError:
+            index = 0
+
+    while True:
+        stdscr.erase()
+        _safe_addstr(stdscr, 0, 0, title, curses.A_BOLD if curses else 0)
+        row = 2
+        for line in body_lines:
+            _safe_addstr(stdscr, row, 0, line)
+            row += 1
+        selected_preview = ", ".join(selected_order) if selected_order else "(none)"
+        _safe_addstr(stdscr, row + 1, 0, f"Selected order: {selected_preview}")
+        _safe_addstr(
+            stdscr,
+            row + 2,
+            0,
+            "Use up/down to move, Space to toggle, Enter to confirm, q/Esc to cancel.",
+        )
+        row += 4
+        start = max(0, index - 8)
+        end = min(len(display_options), start + 16)
+        for option_idx in range(start, end):
+            model_name = display_options[option_idx]
+            marker = "[x]" if model_name in selected_set else "[ ]"
+            attr = curses.A_REVERSE if (curses and option_idx == index) else 0
+            _safe_addstr(stdscr, row, 0, f"{marker} {model_name}", attr)
+            row += 1
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (curses.KEY_UP if curses else -1, ord("k")):
+            index = max(0, index - 1)
+            continue
+        if key in (curses.KEY_DOWN if curses else -1, ord("j")):
+            index = min(len(display_options) - 1, index + 1)
+            continue
+        if key == ord(" "):
+            model_name = display_options[index]
+            if model_name in selected_set:
+                selected_set.remove(model_name)
+                selected_order = [item for item in selected_order if item != model_name]
+            else:
+                selected_set.add(model_name)
+                selected_order.append(model_name)
+            continue
+        if key in (10, 13):
+            return list(selected_order)
+        if key in (27, ord("q")):
+            return None
+
+
 def _edit_route_setting_curses(
     stdscr: Any,
     *,
@@ -3784,17 +3917,12 @@ def _edit_route_setting_curses(
             return False, current_value, error
         return True, parsed, "updated"
 
-    if type_label == "model-list":
-        current_models = current_value if isinstance(current_value, list) else []
-        default_text = ", ".join([str(item) for item in current_models if str(item).strip()])
-        if default_text == "":
-            fallback_default = _default_value_for_setting(setting)
-            if isinstance(fallback_default, list):
-                default_text = ", ".join([str(item) for item in fallback_default if str(item).strip()])
-
-        host = resolve_ollama_host(config_data, runtime_settings=runtime_settings)
-        probe_timeout = float(get_runtime_setting(runtime_settings, "inference.probe_timeout_seconds", 3.0))
-        available_models, discovery_error = fetch_ollama_models(host, timeout=probe_timeout)
+    uses_model_picker = _is_ollama_model_field(setting.path) or type_label == "model-list"
+    if uses_model_picker:
+        available_models, discovery_error = _discover_ollama_models_for_editor(
+            config_data=config_data,
+            runtime_settings=runtime_settings,
+        )
         if available_models:
             preview = ", ".join(available_models[:8])
             suffix = " ..." if len(available_models) > 8 else ""
@@ -3802,11 +3930,60 @@ def _edit_route_setting_curses(
         elif discovery_error:
             details.append(f"Model discovery warning: {discovery_error}")
 
+        if type_label == "model-list":
+            current_models = current_value if isinstance(current_value, list) else []
+            if available_models:
+                selected_models = _curses_select_model_chain(
+                    stdscr,
+                    title=title,
+                    body_lines=details,
+                    options=available_models,
+                    current_selected=current_models,
+                )
+                if selected_models is None:
+                    return False, current_value, "cancelled"
+                ok, parsed, error = _coerce_setting_value(setting, selected_models)
+                if not ok:
+                    return False, current_value, error
+                return True, parsed, "updated"
+
+            default_text = ", ".join([str(item) for item in current_models if str(item).strip()])
+            if default_text == "":
+                fallback_default = _default_value_for_setting(setting)
+                if isinstance(fallback_default, list):
+                    default_text = ", ".join([str(item) for item in fallback_default if str(item).strip()])
+            raw_value = _curses_prompt_text(
+                stdscr,
+                title,
+                "No models discovered. Enter comma-separated model chain:",
+                default=default_text,
+                allow_empty=not setting.required,
+            )
+            ok, parsed, error = _coerce_setting_value(setting, raw_value)
+            if not ok:
+                return False, current_value, error
+            return True, parsed, "updated"
+
+        if available_models:
+            selected_model = _curses_select_option(
+                stdscr,
+                title=title,
+                body_lines=details,
+                options=available_models,
+                current=str(current_value) if current_value is not None else None,
+            )
+            if selected_model is None:
+                return False, current_value, "cancelled"
+            ok, parsed, error = _coerce_setting_value(setting, selected_model)
+            if not ok:
+                return False, current_value, error
+            return True, parsed, "updated"
+
         raw_value = _curses_prompt_text(
             stdscr,
             title,
-            "Enter comma-separated model chain (priority order):",
-            default=default_text,
+            "No models discovered. Enter model name:",
+            default=str(current_value or ""),
             allow_empty=not setting.required,
         )
         ok, parsed, error = _coerce_setting_value(setting, raw_value)
