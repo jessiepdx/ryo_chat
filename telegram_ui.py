@@ -18,6 +18,7 @@
 ###########
 
 import base64
+import asyncio
 from datetime import datetime, timedelta, timezone
 import html
 import json
@@ -130,6 +131,10 @@ usage = UsageManager()
 
 logger.info(f"Database route status: {config.databaseRoute}")
 
+_TELEGRAM_MESSAGE_GUARD_LOCK = asyncio.Lock()
+_TELEGRAM_INFLIGHT_MESSAGE_KEYS: set[str] = set()
+_TELEGRAM_COMPLETED_MESSAGE_KEYS: dict[str, float] = {}
+
 
 def _runtime_int(path: str, default: int) -> int:
     return config.runtimeInt(path, default)
@@ -207,6 +212,66 @@ def _database_unavailable_message() -> str:
         "connection/authentication failed. Run setup to fix PostgreSQL "
         "credentials, then send /start again."
     )
+
+
+def _message_guard_key(chat_id: int, message_id: int) -> str:
+    return f"{int(chat_id)}:{int(message_id)}"
+
+
+async def _claim_message_processing(chat_id: int, message_id: int) -> bool:
+    key = _message_guard_key(chat_id, message_id)
+    now = time.monotonic()
+    ttl_seconds = max(30, _runtime_int("telegram.message_guard_completed_ttl_seconds", 180))
+    async with _TELEGRAM_MESSAGE_GUARD_LOCK:
+        stale_keys = [
+            stale_key
+            for stale_key, completed_at in _TELEGRAM_COMPLETED_MESSAGE_KEYS.items()
+            if (now - completed_at) > float(ttl_seconds)
+        ]
+        for stale_key in stale_keys:
+            _TELEGRAM_COMPLETED_MESSAGE_KEYS.pop(stale_key, None)
+
+        if key in _TELEGRAM_INFLIGHT_MESSAGE_KEYS:
+            return False
+        if key in _TELEGRAM_COMPLETED_MESSAGE_KEYS:
+            return False
+
+        _TELEGRAM_INFLIGHT_MESSAGE_KEYS.add(key)
+        return True
+
+
+async def _release_message_processing(chat_id: int, message_id: int) -> None:
+    key = _message_guard_key(chat_id, message_id)
+    async with _TELEGRAM_MESSAGE_GUARD_LOCK:
+        _TELEGRAM_INFLIGHT_MESSAGE_KEYS.discard(key)
+        _TELEGRAM_COMPLETED_MESSAGE_KEYS[key] = time.monotonic()
+
+
+def _guard_message_handler(handler):
+    async def _wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.effective_message
+        chat = update.effective_chat
+        message_id = getattr(message, "message_id", None)
+        chat_id = getattr(chat, "id", None)
+        if message_id is None or chat_id is None:
+            return await handler(update, context)
+
+        claimed = await _claim_message_processing(chat_id=int(chat_id), message_id=int(message_id))
+        if not claimed:
+            logger.info(
+                "Skipping duplicate/replayed telegram update (chat_id=%s, message_id=%s).",
+                chat_id,
+                message_id,
+            )
+            return
+
+        try:
+            return await handler(update, context)
+        finally:
+            await _release_message_processing(chat_id=int(chat_id), message_id=int(message_id))
+
+    _wrapped.__name__ = f"{getattr(handler, '__name__', 'handler')}_guarded"
+    return _wrapped
 
 
 _ORCHESTRATION_STAGE_LABELS = {
@@ -3629,19 +3694,49 @@ def main() -> None:
 
     application.add_handler(MessageReactionHandler(reactionsHandler))
     # Add spam checks
-    application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS & filters.FORWARDED, handleForwardedMessage))
-    application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS & (filters.Entity("url") | filters.Entity("text_link")), linkHandler))
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.ChatType.GROUPS & filters.FORWARDED,
+            _guard_message_handler(handleForwardedMessage),
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.ChatType.GROUPS & (filters.Entity("url") | filters.Entity("text_link")),
+            _guard_message_handler(linkHandler),
+        )
+    )
     
     # Add conversational chains
     application.add_handlers([generateHandler, knowledgeHandler, newsletterHandler, promoteHandler, proposalsHandler, tweetHandler])
 
 
     # Add message handlers
-    application.add_handler(MessageHandler(filters.Mention(config.botName) & filters.ChatType.GROUPS & ~filters.COMMAND, directChatGroup))
-    application.add_handler(MessageHandler(filters.REPLY & filters.ChatType.GROUPS & ~filters.COMMAND, replyToBot))
-    application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, directChatPrivate))
-    application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND, otherGroupChat))
-    application.add_handler(MessageHandler(filters.PHOTO, handleImage))
+    application.add_handler(
+        MessageHandler(
+            filters.Mention(config.botName) & filters.ChatType.GROUPS & ~filters.COMMAND,
+            _guard_message_handler(directChatGroup),
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.REPLY & filters.ChatType.GROUPS & ~filters.COMMAND,
+            _guard_message_handler(replyToBot),
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+            _guard_message_handler(directChatPrivate),
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND,
+            _guard_message_handler(otherGroupChat),
+        )
+    )
+    application.add_handler(MessageHandler(filters.PHOTO, _guard_message_handler(handleImage)))
     application.add_handler(MessageHandler(filters.ALL, catchAllMessages))
 
     # Other update type handlers
