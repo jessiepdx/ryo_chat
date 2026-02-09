@@ -134,6 +134,10 @@ logger.info(f"Database route status: {config.databaseRoute}")
 _TELEGRAM_MESSAGE_GUARD_LOCK = asyncio.Lock()
 _TELEGRAM_INFLIGHT_MESSAGE_KEYS: set[str] = set()
 _TELEGRAM_COMPLETED_MESSAGE_KEYS: dict[str, float] = {}
+_TELEGRAM_INSPECTOR_LOCK = asyncio.Lock()
+_TELEGRAM_RUN_INSPECTOR_CACHE: dict[str, dict[str, Any]] = {}
+_TELEGRAM_RUN_INSPECTOR_TTL_SECONDS = 6 * 60 * 60
+_TELEGRAM_RUN_INSPECTOR_MAX_RECORDS = 512
 
 
 def _runtime_int(path: str, default: int) -> int:
@@ -312,6 +316,273 @@ _MINIMAL_VISIBLE_STAGES = {
 _NORMAL_HIDDEN_STAGES = {
     "analysis.payload",
 }
+
+
+def _inspector_json_safe(value: Any) -> Any:
+    try:
+        serialized = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        return str(value)
+    try:
+        return json.loads(serialized)
+    except Exception:  # noqa: BLE001
+        return serialized
+
+
+def _inspector_trim_text(text: str, max_chars: int = 3900) -> str:
+    cleaned = str(text or "").strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    suffix = "\n\n... (truncated)"
+    keep = max(1, int(max_chars) - len(suffix))
+    return cleaned[:keep].rstrip() + suffix
+
+
+def _inspector_json_block(payload: Any, max_chars: int = 2800) -> str:
+    text = json.dumps(_inspector_json_safe(payload), ensure_ascii=False, indent=2, default=str)
+    if len(text) > max_chars:
+        text = _inspector_trim_text(text, max_chars=max_chars)
+    return text
+
+
+def _stage_event_snapshot(event: dict[str, Any] | None) -> dict[str, Any]:
+    payload = event if isinstance(event, dict) else {}
+    snapshot = {
+        "stage": str(payload.get("stage") or ""),
+        "detail": str(payload.get("detail") or ""),
+        "timestamp": str(payload.get("timestamp") or _utc_now().isoformat().replace("+00:00", "Z")),
+        "meta": _inspector_json_safe(payload.get("meta") if isinstance(payload.get("meta"), dict) else {}),
+    }
+    return snapshot
+
+
+def _append_stage_event(stage_events: list[dict[str, Any]], event: dict[str, Any] | None) -> None:
+    stage_events.append(_stage_event_snapshot(event))
+    if len(stage_events) > 200:
+        del stage_events[: len(stage_events) - 200]
+
+
+def _tool_entries_from_summary(run_summary: dict[str, Any]) -> list[dict[str, Any]]:
+    summary = run_summary if isinstance(run_summary, dict) else {}
+    tool_summary = summary.get("tool_summary")
+    tool_summary = tool_summary if isinstance(tool_summary, dict) else {}
+    requested = tool_summary.get("requested_tools")
+    requested_tools = requested if isinstance(requested, list) else []
+    results = summary.get("tool_results")
+    tool_results = results if isinstance(results, list) else []
+    max_len = max(len(requested_tools), len(tool_results))
+    entries: list[dict[str, Any]] = []
+    for idx in range(max_len):
+        request_item = requested_tools[idx] if idx < len(requested_tools) and isinstance(requested_tools[idx], dict) else {}
+        result_item = tool_results[idx] if idx < len(tool_results) and isinstance(tool_results[idx], dict) else {}
+        tool_name = str(request_item.get("name") or result_item.get("tool_name") or f"tool_{idx + 1}")
+        entries.append(
+            {
+                "tool_name": tool_name,
+                "arguments": _inspector_json_safe(request_item.get("arguments", {})),
+                "status": str(result_item.get("status") or "unknown"),
+                "tool_results": _inspector_json_safe(result_item.get("tool_results")),
+                "error": _inspector_json_safe(result_item.get("error")),
+            }
+        )
+    return entries
+
+
+def _render_tool_page_text(
+    *,
+    tool_entry: dict[str, Any],
+    tool_index: int,
+    total_tools: int,
+) -> str:
+    title = f"Tool Call {tool_index + 1}/{max(1, total_tools)}"
+    lines = [
+        title,
+        f"Tool: {tool_entry.get('tool_name', 'unknown')}",
+        f"Status: {tool_entry.get('status', 'unknown')}",
+        "",
+        "Arguments:",
+        _inspector_json_block(tool_entry.get("arguments", {}), max_chars=1200),
+    ]
+    error_payload = tool_entry.get("error")
+    if isinstance(error_payload, dict) and error_payload:
+        lines.extend(["", "Error:", _inspector_json_block(error_payload, max_chars=1000)])
+    else:
+        lines.extend(
+            [
+                "",
+                "Response:",
+                _inspector_json_block(tool_entry.get("tool_results"), max_chars=1600),
+            ]
+        )
+    return _inspector_trim_text("\n".join(lines), max_chars=_TELEGRAM_MAX_MESSAGE_CHARS - 32)
+
+
+def _render_stage_page_text(
+    *,
+    stage_entry: dict[str, Any],
+    stage_index: int,
+    total_stages: int,
+) -> str:
+    stage_key = str(stage_entry.get("stage") or "")
+    stage_label = _ORCHESTRATION_STAGE_LABELS.get(stage_key, stage_key or "stage")
+    stage_detail = str(stage_entry.get("detail") or "")
+    timestamp = str(stage_entry.get("timestamp") or "")
+    lines = [
+        f"Context Stage {stage_index + 1}/{max(1, total_stages)}",
+        f"Stage: {stage_label}",
+        f"Key: {stage_key}",
+        f"Time: {timestamp}",
+    ]
+    if stage_detail:
+        lines.extend(["", "Detail:", stage_detail])
+
+    meta_payload = stage_entry.get("meta")
+    if isinstance(meta_payload, dict) and meta_payload:
+        lines.extend(["", "Meta:", _inspector_json_block(meta_payload, max_chars=2200)])
+    return _inspector_trim_text("\n".join(lines), max_chars=_TELEGRAM_MAX_MESSAGE_CHARS - 32)
+
+
+async def _cleanup_run_inspector_cache() -> None:
+    now = time.time()
+    stale_keys = [
+        key
+        for key, payload in _TELEGRAM_RUN_INSPECTOR_CACHE.items()
+        if now - float(payload.get("created_at", now)) > _TELEGRAM_RUN_INSPECTOR_TTL_SECONDS
+    ]
+    for key in stale_keys:
+        _TELEGRAM_RUN_INSPECTOR_CACHE.pop(key, None)
+    if len(_TELEGRAM_RUN_INSPECTOR_CACHE) > _TELEGRAM_RUN_INSPECTOR_MAX_RECORDS:
+        overflow = len(_TELEGRAM_RUN_INSPECTOR_CACHE) - _TELEGRAM_RUN_INSPECTOR_MAX_RECORDS
+        ordered_keys = sorted(
+            _TELEGRAM_RUN_INSPECTOR_CACHE.keys(),
+            key=lambda item: float(_TELEGRAM_RUN_INSPECTOR_CACHE[item].get("created_at", 0.0)),
+        )
+        for key in ordered_keys[:overflow]:
+            _TELEGRAM_RUN_INSPECTOR_CACHE.pop(key, None)
+
+
+def _build_run_inspector_keyboard(token: str, payload: dict[str, Any]) -> InlineKeyboardMarkup | None:
+    tool_entries = payload.get("tool_entries")
+    tools = tool_entries if isinstance(tool_entries, list) else []
+    rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
+    for idx, entry in enumerate(tools):
+        tool_name = str((entry if isinstance(entry, dict) else {}).get("tool_name") or f"tool_{idx + 1}")
+        label = f"Tool {idx + 1}: {tool_name}"
+        label = label if len(label) <= 28 else f"Tool {idx + 1}: {tool_name[:24]}..."
+        current_row.append(InlineKeyboardButton(label, callback_data=f"diag:{token}:tool:{idx}"))
+        if len(current_row) == 2:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+    rows.append([InlineKeyboardButton("Context", callback_data=f"diag:{token}:ctx:0")])
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_tool_view_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Back", callback_data=f"diag:{token}:back"),
+                InlineKeyboardButton("Context", callback_data=f"diag:{token}:ctx:0"),
+            ]
+        ]
+    )
+
+
+def _build_context_view_keyboard(token: str, stage_index: int, total_stages: int) -> InlineKeyboardMarkup:
+    left_index = stage_index - 1
+    right_index = stage_index + 1
+    left_data = f"diag:{token}:ctx:{left_index}" if left_index >= 0 else f"diag:{token}:noop"
+    right_data = (
+        f"diag:{token}:ctx:{right_index}"
+        if right_index < max(0, total_stages)
+        else f"diag:{token}:noop"
+    )
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("◀", callback_data=left_data),
+                InlineKeyboardButton("▶", callback_data=right_data),
+            ],
+            [InlineKeyboardButton("Back", callback_data=f"diag:{token}:back")],
+        ]
+    )
+
+
+async def _register_run_inspector_payload(
+    *,
+    chat_id: int,
+    message_id: int,
+    final_text: str,
+    run_summary: dict[str, Any] | None,
+    stage_events: list[dict[str, Any]] | None,
+) -> str | None:
+    summary = run_summary if isinstance(run_summary, dict) else {}
+    events = stage_events if isinstance(stage_events, list) else []
+    tool_entries = _tool_entries_from_summary(summary)
+    stage_entries = [entry for entry in events if isinstance(entry, dict)]
+    if not tool_entries and not stage_entries:
+        return None
+
+    token = os.urandom(6).hex()
+    async with _TELEGRAM_INSPECTOR_LOCK:
+        await _cleanup_run_inspector_cache()
+        _TELEGRAM_RUN_INSPECTOR_CACHE[token] = {
+            "created_at": time.time(),
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "final_text": str(final_text or ""),
+            "tool_entries": tool_entries,
+            "stage_entries": stage_entries,
+        }
+    return token
+
+
+async def _lookup_run_inspector_payload(token: str) -> dict[str, Any] | None:
+    async with _TELEGRAM_INSPECTOR_LOCK:
+        await _cleanup_run_inspector_cache()
+        payload = _TELEGRAM_RUN_INSPECTOR_CACHE.get(token)
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+async def _attach_run_inspector_controls(
+    *,
+    response_message,
+    final_text: str,
+    run_summary: dict[str, Any] | None,
+    stage_events: list[dict[str, Any]] | None,
+) -> None:
+    if response_message is None:
+        return
+    chat = getattr(response_message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(response_message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return
+
+    token = await _register_run_inspector_payload(
+        chat_id=int(chat_id),
+        message_id=int(message_id),
+        final_text=final_text,
+        run_summary=run_summary,
+        stage_events=stage_events,
+    )
+    if not token:
+        return
+
+    keyboard = _build_run_inspector_keyboard(token, await _lookup_run_inspector_payload(token) or {})
+    if keyboard is None:
+        return
+    try:
+        await response_message.edit_reply_markup(reply_markup=keyboard)
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"Unable to attach inspector controls to telegram message {message_id}: {error}")
 
 
 class TelegramStageStatus:
@@ -2587,6 +2858,110 @@ async def catchAllMessages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"A message was captured by the catch all function.")
 
 
+async def runInspectorView(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    data = str(query.data or "")
+    if not data.startswith("diag:"):
+        return
+
+    parts = data.split(":", 3)
+    if len(parts) < 3:
+        await query.answer("Invalid inspector action.", show_alert=False)
+        return
+
+    token = parts[1]
+    action = parts[2]
+    raw_arg = parts[3] if len(parts) > 3 else ""
+    if action == "noop":
+        await query.answer()
+        return
+
+    payload = await _lookup_run_inspector_payload(token)
+    if payload is None:
+        await query.answer("Inspector session expired.", show_alert=False)
+        return
+
+    message = query.message
+    message_chat_id = getattr(getattr(message, "chat", None), "id", None)
+    message_id = getattr(message, "message_id", None)
+    if message_chat_id is None or message_id is None:
+        await query.answer("Inspector unavailable for this message.", show_alert=False)
+        return
+
+    if int(payload.get("chat_id", -1)) != int(message_chat_id) or int(payload.get("message_id", -1)) != int(message_id):
+        await query.answer("Inspector data does not match this message.", show_alert=False)
+        return
+
+    try:
+        if action == "back":
+            final_text = str(payload.get("final_text") or _TELEGRAM_FALLBACK_FINAL_REPLY)
+            keyboard = _build_run_inspector_keyboard(token, payload)
+            await query.edit_message_text(
+                text=_inspector_trim_text(final_text, max_chars=_TELEGRAM_MAX_MESSAGE_CHARS - 8),
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            await query.answer()
+            return
+
+        if action == "tool":
+            tool_entries = payload.get("tool_entries")
+            tools = tool_entries if isinstance(tool_entries, list) else []
+            try:
+                tool_index = int(raw_arg)
+            except ValueError:
+                tool_index = 0
+            if tool_index < 0 or tool_index >= len(tools):
+                await query.answer("Tool view is out of range.", show_alert=False)
+                return
+            tool_entry = tools[tool_index] if isinstance(tools[tool_index], dict) else {}
+            tool_text = _render_tool_page_text(
+                tool_entry=tool_entry,
+                tool_index=tool_index,
+                total_tools=len(tools),
+            )
+            await query.edit_message_text(
+                text=tool_text,
+                reply_markup=_build_tool_view_keyboard(token),
+                disable_web_page_preview=True,
+            )
+            await query.answer()
+            return
+
+        if action == "ctx":
+            stage_entries = payload.get("stage_entries")
+            stages = stage_entries if isinstance(stage_entries, list) else []
+            if not stages:
+                await query.answer("No stage context captured for this run.", show_alert=False)
+                return
+            try:
+                stage_index = int(raw_arg)
+            except ValueError:
+                stage_index = 0
+            stage_index = max(0, min(stage_index, len(stages) - 1))
+            stage_entry = stages[stage_index] if isinstance(stages[stage_index], dict) else {}
+            stage_text = _render_stage_page_text(
+                stage_entry=stage_entry,
+                stage_index=stage_index,
+                total_stages=len(stages),
+            )
+            await query.edit_message_text(
+                text=stage_text,
+                reply_markup=_build_context_view_keyboard(token, stage_index, len(stages)),
+                disable_web_page_preview=True,
+            )
+            await query.answer()
+            return
+
+        await query.answer("Unknown inspector action.", show_alert=False)
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"Inspector callback failed: {error}")
+        await query.answer("Unable to update inspector view.", show_alert=False)
+
+
 async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Bot messaged in group chat.")
     chat = update.effective_chat
@@ -2659,6 +3034,11 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_min_interval_seconds=_runtime_float("telegram.stage_update_min_interval_seconds", 1.0),
     )
     await stageStatus.start()
+    stageEvents: list[dict[str, Any]] = []
+
+    async def _stage_callback(event: dict[str, Any]) -> None:
+        _append_stage_event(stageEvents, event)
+        await stageStatus.emit(event)
 
     # Create the conversational agent instance
     conversation = ConversationOrchestrator(
@@ -2666,7 +3046,7 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         memberID,
         messageContext,
         message.message_id,
-        options={"stage_callback": stageStatus.emit},
+        options={"stage_callback": _stage_callback},
     )
 
     try:
@@ -2689,8 +3069,16 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         # Send the conversational agent response
-        responseMessage = await stageStatus.finalize(
-            f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
+        finalText = (
+            f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. "
+            "Responses may or may not be factually correct."
+        )
+        responseMessage = await stageStatus.finalize(finalText)
+        await _attach_run_inspector_controls(
+            response_message=responseMessage,
+            final_text=finalText,
+            run_summary=conversation.run_summary,
+            stage_events=stageEvents,
         )
     except Exception as err:
         logger.error(f"Exception while sending a telegram message:\n{err}")
@@ -2806,13 +3194,18 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_min_interval_seconds=_runtime_float("telegram.stage_update_min_interval_seconds", 1.0),
     )
     await stageStatus.start()
+    stageEvents: list[dict[str, Any]] = []
+
+    async def _stage_callback(event: dict[str, Any]) -> None:
+        _append_stage_event(stageEvents, event)
+        await stageStatus.emit(event)
 
     conversation = ConversationOrchestrator(
         message.text,
         memberID,
         messageData,
         message.message_id,
-        options={"stage_callback": stageStatus.emit},
+        options={"stage_callback": _stage_callback},
     )
 
     try:
@@ -2833,7 +3226,14 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        responseMessage = await stageStatus.finalize(response)
+        finalText = str(response)
+        responseMessage = await stageStatus.finalize(finalText)
+        await _attach_run_inspector_controls(
+            response_message=responseMessage,
+            final_text=finalText,
+            run_summary=conversation.run_summary,
+            stage_events=stageEvents,
+        )
     except Exception as err:
         logger.error(f"Exception while replying to a telegram message:\n{err}")
         # Error is critical to the remaining functionality, exit
@@ -3165,6 +3565,11 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_min_interval_seconds=_runtime_float("telegram.stage_update_min_interval_seconds", 1.0),
     )
     await stageStatus.start()
+    stageEvents: list[dict[str, Any]] = []
+
+    async def _stage_callback(event: dict[str, Any]) -> None:
+        _append_stage_event(stageEvents, event)
+        await stageStatus.emit(event)
 
     # Create the conversational agent instance
     conversation = ConversationOrchestrator(
@@ -3172,7 +3577,7 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         memberID,
         messageData,
         message.message_id,
-        options={"stage_callback": stageStatus.emit},
+        options={"stage_callback": _stage_callback},
     )
     # Shows the bot as "typing"
     try:
@@ -3194,8 +3599,16 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Send the conversational agent response
     try:
-        responseMessage = await stageStatus.finalize(
-            f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
+        finalText = (
+            f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. "
+            "Responses may or may not be factually correct."
+        )
+        responseMessage = await stageStatus.finalize(finalText)
+        await _attach_run_inspector_controls(
+            response_message=responseMessage,
+            final_text=finalText,
+            run_summary=conversation.run_summary,
+            stage_events=stageEvents,
         )
     except Exception as err:
         logger.error(f"Exception while sending a telegram message:\n{err}")
@@ -3738,6 +4151,7 @@ def main() -> None:
     application.add_handler(CommandHandler("userid", userID))
     application.add_handler(CommandHandler("statistics", statisticsManager))
     application.add_handler(CommandHandler("password", setPassword, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CallbackQueryHandler(runInspectorView, pattern=r"^diag:"))
 
     application.add_handler(MessageReactionHandler(reactionsHandler))
     # Add spam checks

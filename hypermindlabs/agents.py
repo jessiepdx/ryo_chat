@@ -1222,6 +1222,7 @@ class ConversationOrchestrator:
         self._analysisStats: dict[str, Any] = {}
         self._devStats: dict[str, Any] = {}
         self._chatResponseMessage = ""
+        self._runSummary: dict[str, Any] = {}
 
         self._message = message
         self._messageID = messageID
@@ -1613,6 +1614,7 @@ class ConversationOrchestrator:
         )
 
         toolResponses: list[dict[str, Any]] = []
+        toolSummary: dict[str, Any] = {}
         toolExecutionMode = "skipped_fast_path" if fastPathActive else "native_tools"
         if fastPathActive:
             await self._emit_stage(
@@ -1831,6 +1833,23 @@ class ConversationOrchestrator:
         assistantMessage = Message(role="assistant", content=sanitizedResponseMessage)
         # Add the final response to the overall chat history (role ASSISTANT)
         self._messages.append(assistantMessage)
+        self._runSummary = {
+            "known_context": _coerce_dict(knownContext.get("tool_results")),
+            "topic_transition": _coerce_dict(topicTransition),
+            "memory_circuit": _coerce_dict(memoryCircuit),
+            "analysis_payload": _coerce_dict(normalizedAnalysis),
+            "analysis_routing": _coerce_dict(getattr(self._analysisAgent, "routing", {})),
+            "analysis_stats": analysisStatsSummary,
+            "tool_execution_mode": toolExecutionMode,
+            "tool_summary": _coerce_dict(toolSummary),
+            "tool_results": toolResponses if isinstance(toolResponses, list) else [],
+            "response": {
+                "text": sanitizedResponseMessage,
+                "sanitized": bool(sanitizedResponseMessage != responseMessage),
+            },
+            "chat_routing": _coerce_dict(getattr(self._chatConversationAgent, "routing", {})),
+            "response_stats": responseStatsSummary,
+        }
         await self._emit_stage(
             "orchestrator.complete",
             "Completed end-to-end orchestration.",
@@ -1885,6 +1904,10 @@ class ConversationOrchestrator:
     def stats(self):
         # Eventually add up the stats from all agents
         return self._devStats
+
+    @property
+    def run_summary(self) -> dict[str, Any]:
+        return copy.deepcopy(_coerce_dict(self._runSummary))
 
 
 
