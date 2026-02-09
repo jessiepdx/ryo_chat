@@ -188,6 +188,34 @@ def _fallback_stream(message_text: str) -> AsyncIterator[Any]:
     return _stream()
 
 
+def _timeout_seconds(path: str, default: float) -> float | None:
+    timeout = _runtime_float(path, default)
+    if timeout <= 0:
+        return None
+    return float(timeout)
+
+
+async def _next_stream_chunk(
+    stream_iterator: AsyncIterator[Any],
+    *,
+    idle_timeout_seconds: float | None = None,
+    deadline_monotonic: float | None = None,
+) -> Any:
+    timeout_seconds = idle_timeout_seconds if isinstance(idle_timeout_seconds, (int, float)) else None
+    if isinstance(timeout_seconds, (int, float)) and timeout_seconds <= 0:
+        timeout_seconds = None
+
+    if isinstance(deadline_monotonic, (int, float)):
+        remaining = float(deadline_monotonic) - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Stream total timeout exceeded.")
+        timeout_seconds = min(timeout_seconds, remaining) if timeout_seconds else remaining
+
+    if timeout_seconds:
+        return await asyncio.wait_for(anext(stream_iterator), timeout=timeout_seconds)
+    return await anext(stream_iterator)
+
+
 def _routing_from_error(error: Exception) -> dict[str, Any]:
     if isinstance(error, ModelExecutionError):
         metadata = getattr(error, "metadata", None)
@@ -2129,9 +2157,39 @@ class ConversationOrchestrator:
             analysisLastProgressLog = time.monotonic()
             analysisLastProgressEmit = time.monotonic()
             analysisLatestPreview = ""
+            analysisChunkTimeout = _timeout_seconds("inference.stream_chunk_timeout_seconds", 45.0)
+            analysisTotalTimeout = _timeout_seconds("inference.stream_total_timeout_seconds", 240.0)
+            analysisDeadline = (
+                time.monotonic() + float(analysisTotalTimeout)
+                if isinstance(analysisTotalTimeout, (int, float))
+                else None
+            )
+            analysisIterator = self._analysisResponse.__aiter__()
 
             chunk: ChatResponse
-            async for chunk in self._analysisResponse:
+            while True:
+                try:
+                    chunk = await _next_stream_chunk(
+                        analysisIterator,
+                        idle_timeout_seconds=analysisChunkTimeout,
+                        deadline_monotonic=analysisDeadline,
+                    )
+                except StopAsyncIteration:
+                    break
+                except TimeoutError as error:
+                    logger.warning(
+                        "[stream.analysis] stream timeout; "
+                        f"using conservative parse fallback (chunks={analysisChunkCount}, chars={analysisCharCount}): {error}"
+                    )
+                    await self._emit_stage(
+                        "analysis.timeout",
+                        "Analysis stream timed out; using conservative parse fallback.",
+                        chunks=analysisChunkCount,
+                        chars=analysisCharCount,
+                        timeout_seconds=analysisChunkTimeout,
+                        total_timeout_seconds=analysisTotalTimeout,
+                    )
+                    break
                 chunkContent = str(getattr(getattr(chunk, "message", None), "content", "") or "")
                 # Call the streaming response method. This is intended to be over written by the UI for cutom handling
                 self.streamingResponse(streamingChunk=chunkContent)
@@ -2450,13 +2508,45 @@ class ConversationOrchestrator:
         responseChunkCount = 0
         responseCharCount = 0
         responseDoneSeen = False
+        responseTimedOut = False
         responseLastProgressLog = time.monotonic()
         responseLastProgressEmit = time.monotonic()
         responseLatestPreview = ""
+        responseChunkTimeout = _timeout_seconds("inference.stream_chunk_timeout_seconds", 45.0)
+        responseTotalTimeout = _timeout_seconds("inference.stream_total_timeout_seconds", 240.0)
+        responseDeadline = (
+            time.monotonic() + float(responseTotalTimeout)
+            if isinstance(responseTotalTimeout, (int, float))
+            else None
+        )
+        responseIterator = response.__aiter__()
         
         #print(f"{ConsoleColors["blue"]}Assistant > ", end="")
         chunk: ChatResponse
-        async for chunk in response:
+        while True:
+            try:
+                chunk = await _next_stream_chunk(
+                    responseIterator,
+                    idle_timeout_seconds=responseChunkTimeout,
+                    deadline_monotonic=responseDeadline,
+                )
+            except StopAsyncIteration:
+                break
+            except TimeoutError as error:
+                responseTimedOut = True
+                logger.warning(
+                    "[stream.response] stream timeout; "
+                    f"finalizing with available content (chunks={responseChunkCount}, chars={responseCharCount}): {error}"
+                )
+                await self._emit_stage(
+                    "response.timeout",
+                    "Response stream timed out; finalizing with available content.",
+                    chunks=responseChunkCount,
+                    chars=responseCharCount,
+                    timeout_seconds=responseChunkTimeout,
+                    total_timeout_seconds=responseTotalTimeout,
+                )
+                break
             chunkContent = str(getattr(getattr(chunk, "message", None), "content", "") or "")
             self.streamingResponse(streamingChunk=chunkContent)
             responseMessage = responseMessage + chunkContent
@@ -2531,7 +2621,7 @@ class ConversationOrchestrator:
             user_message=self._message,
             allow_internal_diagnostics=allowDiagnostics,
         )
-        if _is_low_signal_response(sanitizedResponseMessage):
+        if _is_low_signal_response(sanitizedResponseMessage) and not responseTimedOut:
             await self._emit_stage(
                 "response.repair",
                 "Primary response was low-signal; running recovery generation.",

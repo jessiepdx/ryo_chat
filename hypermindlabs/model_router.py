@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict, dataclass, field
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
@@ -17,6 +18,9 @@ from ollama import AsyncClient
 
 DEFAULT_OLLAMA_HOST = str(
     DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_ollama_host", "http://127.0.0.1:11434")
+)
+DEFAULT_STREAM_FIRST_TOKEN_TIMEOUT_SECONDS = float(
+    DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("stream_first_token_timeout_seconds", 25.0)
 )
 
 
@@ -204,15 +208,34 @@ class ModelRouter:
             return metadata
 
     @staticmethod
-    async def _prime_stream(stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
+    async def _prime_stream(
+        stream: AsyncIterator[Any],
+        *,
+        first_token_timeout_seconds: float | None = None,
+    ) -> AsyncIterator[Any]:
+        timeout_seconds: float | None = None
         try:
-            first_chunk = await anext(stream)
+            if first_token_timeout_seconds is not None:
+                timeout_seconds = max(0.0, float(first_token_timeout_seconds))
+        except (TypeError, ValueError):
+            timeout_seconds = None
+        try:
+            if timeout_seconds and timeout_seconds > 0:
+                first_chunk = await asyncio.wait_for(anext(stream), timeout=timeout_seconds)
+            else:
+                first_chunk = await anext(stream)
         except StopAsyncIteration:
             async def _empty() -> AsyncIterator[Any]:
                 if False:
                     yield None
 
             return _empty()
+        except asyncio.TimeoutError as error:
+            if timeout_seconds and timeout_seconds > 0:
+                raise TimeoutError(
+                    f"Timed out waiting for first stream token after {timeout_seconds:.1f}s."
+                ) from error
+            raise
 
         async def _forward() -> AsyncIterator[Any]:
             yield first_chunk
@@ -228,6 +251,7 @@ class ModelRouter:
         requested_model: str | None = None,
         allowed_models: list[str] | None = None,
         stream: bool = False,
+        first_token_timeout_seconds: float | None = None,
         **chat_kwargs: Any,
     ) -> tuple[Any, dict[str, Any]]:
         metadata = await self.resolve(
@@ -246,13 +270,21 @@ class ModelRouter:
             client = AsyncClient(host=metadata.host)
             try:
                 if stream:
+                    effective_first_token_timeout = (
+                        first_token_timeout_seconds
+                        if first_token_timeout_seconds is not None
+                        else DEFAULT_STREAM_FIRST_TOKEN_TIMEOUT_SECONDS
+                    )
                     raw_stream = await client.chat(
                         model=candidate,
                         messages=messages,
                         stream=True,
                         **chat_kwargs,
                     )
-                    response = await self._prime_stream(raw_stream)
+                    response = await self._prime_stream(
+                        raw_stream,
+                        first_token_timeout_seconds=effective_first_token_timeout,
+                    )
                 else:
                     response = await client.chat(
                         model=candidate,

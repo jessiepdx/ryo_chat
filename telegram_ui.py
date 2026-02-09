@@ -286,6 +286,7 @@ _ORCHESTRATION_STAGE_LABELS = {
     "analysis.start": "Analyzing message",
     "analysis.progress": "Analyzing message",
     "analysis.complete": "Analysis complete",
+    "analysis.timeout": "Analysis timeout",
     "analysis.payload": "Analysis payload",
     "tools.suggested": "Tool suggestions",
     "process.directive": "Process directive",
@@ -295,6 +296,7 @@ _ORCHESTRATION_STAGE_LABELS = {
     "process.state": "Process state",
     "response.start": "Generating response",
     "response.progress": "Generating response",
+    "response.timeout": "Response timeout",
     "response.complete": "Response generated",
     "response.fallback": "Fallback response",
     "response.sanitized": "Sanitized response",
@@ -311,6 +313,7 @@ _MINIMAL_VISIBLE_STAGES = {
     "analysis.start",
     "analysis.progress",
     "analysis.complete",
+    "analysis.timeout",
     "tools.suggested",
     "process.directive",
     "tools.start",
@@ -319,6 +322,7 @@ _MINIMAL_VISIBLE_STAGES = {
     "process.state",
     "response.start",
     "response.progress",
+    "response.timeout",
     "response.complete",
 }
 _NORMAL_HIDDEN_STAGES = {
