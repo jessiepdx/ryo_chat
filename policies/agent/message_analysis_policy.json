@@ -1,6 +1,6 @@
 {
   "allow_custom_system_prompt": false,
   "allowed_models": [
-    "llama3.2:latest"
+    "qwen3-vl:4b"
   ]
 }

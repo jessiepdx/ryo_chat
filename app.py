@@ -1900,6 +1900,16 @@ ROUTE_CONFIG_SPECS: dict[str, RouteConfigSpec] = {
                         env_override_keys=("OLLAMA_MULTIMODAL_MODEL", "RYO_DEFAULT_MULTIMODAL_MODEL"),
                     ),
                     RouteSettingSpec(
+                        id="runtime_tool_capable_models",
+                        label="Runtime Tool-Capable Models",
+                        path="runtime.inference.tool_capable_models",
+                        value_type="model_list",
+                        description="Ordered fallback pool reserved for native tool-calling stage candidates.",
+                        default_runtime_path="inference.tool_capable_models",
+                        required=False,
+                        env_override_keys=("RYO_TOOL_CAPABLE_MODELS",),
+                    ),
+                    RouteSettingSpec(
                         id="profile_message_analysis_models",
                         label="Profile: message_analysis",
                         path="policy_models.message_analysis.allowed_models",
@@ -3876,7 +3886,7 @@ def _curses_select_model_chain(
             stdscr,
             row + 2,
             0,
-            "Use up/down to move, Space to toggle, Enter to confirm, q/Esc to cancel.",
+            "Use up/down to move, Enter/Space to toggle, s to save, q/Esc to cancel.",
         )
         row += 4
         start = max(0, index - 8)
@@ -3896,7 +3906,7 @@ def _curses_select_model_chain(
         if key in (curses.KEY_DOWN if curses else -1, ord("j")):
             index = min(len(display_options) - 1, index + 1)
             continue
-        if key == ord(" "):
+        if key in (ord(" "), 10, 13):
             model_name = display_options[index]
             if model_name in selected_set:
                 selected_set.remove(model_name)
@@ -3905,7 +3915,7 @@ def _curses_select_model_chain(
                 selected_set.add(model_name)
                 selected_order.append(model_name)
             continue
-        if key in (10, 13):
+        if key == ord("s"):
             return list(selected_order)
         if key in (27, ord("q")):
             return None
@@ -3997,6 +4007,14 @@ def _edit_route_setting_curses(
                 if not ok:
                     return False, current_value, error
                 return True, parsed, "updated"
+
+            if setting.path == "runtime.inference.tool_capable_models":
+                reason = (
+                    f"model discovery failed: {discovery_error}"
+                    if discovery_error
+                    else "model discovery failed: no Ollama models found"
+                )
+                return False, current_value, reason
 
             default_text = ", ".join([str(item) for item in current_models if str(item).strip()])
             if default_text == "":
