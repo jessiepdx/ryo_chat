@@ -29,6 +29,8 @@ _TOOL_RUNTIME_DEFAULTS = DEFAULT_RUNTIME_SETTINGS.get("tool_runtime", {})
 DEFAULT_TIMEOUT_SECONDS = float(_TOOL_RUNTIME_DEFAULTS.get("default_timeout_seconds", 8.0))
 DEFAULT_MAX_RETRIES = int(_TOOL_RUNTIME_DEFAULTS.get("default_max_retries", 1))
 BRAVE_TIMEOUT_SECONDS = float(_TOOL_RUNTIME_DEFAULTS.get("brave_timeout_seconds", 10.0))
+CURL_TIMEOUT_SECONDS = float(_TOOL_RUNTIME_DEFAULTS.get("curl_timeout_seconds", 12.0))
+CURL_MAX_RESPONSE_CHARS = int(_TOOL_RUNTIME_DEFAULTS.get("curl_max_response_chars", 3500))
 CHAT_HISTORY_TIMEOUT_SECONDS = float(_TOOL_RUNTIME_DEFAULTS.get("chat_history_timeout_seconds", 6.0))
 KNOWLEDGE_TIMEOUT_SECONDS = float(_TOOL_RUNTIME_DEFAULTS.get("knowledge_timeout_seconds", 6.0))
 SKIP_TOOLS_TIMEOUT_SECONDS = float(_TOOL_RUNTIME_DEFAULTS.get("skip_tools_timeout_seconds", 2.0))
@@ -52,6 +54,30 @@ def _coerce_non_empty_text(value: Any, field_name: str = "value") -> str:
     if cleaned == "":
         raise ValueError(f"{field_name} cannot be empty.")
     return cleaned
+
+
+def _coerce_http_url(value: Any) -> str:
+    url = _coerce_non_empty_text(value, "url")
+    lowered = url.lower()
+    if not (lowered.startswith("http://") or lowered.startswith("https://")):
+        raise ValueError("url must start with http:// or https://")
+    return url
+
+
+def _coerce_http_method(value: Any) -> str:
+    method = _coerce_non_empty_text(value, "method").upper()
+    allowed = {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}
+    if method not in allowed:
+        raise ValueError(f"Unsupported method '{method}'. Allowed: {', '.join(sorted(allowed))}")
+    return method
+
+
+def _coerce_json_object(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return copy.deepcopy(value)
+    raise ValueError("value must be an object.")
 
 
 def _coerce_positive_int(value: Any) -> int:
@@ -386,6 +412,7 @@ def build_tool_specs(
     chat_history_search_fn: Callable[..., Any],
     knowledge_search_fn: Callable[..., Any],
     skip_tools_fn: Callable[..., Any],
+    curl_request_fn: Callable[..., Any] | None = None,
     known_users_list_fn: Callable[..., Any] | None = None,
     message_known_user_fn: Callable[..., Any] | None = None,
     process_workspace_upsert_fn: Callable[..., Any] | None = None,
@@ -431,6 +458,19 @@ def build_tool_specs(
             "network": {
                 "enabled": True,
                 "allowlist_domains": ["api.search.brave.com"],
+            },
+            "filesystem": {"mode": "none"},
+        }
+    )
+    curl_allowlist = _coerce_list(_TOOL_RUNTIME_DEFAULTS.get("curl_allowlist_domains"))
+    curl_allowlist_domains = [str(item).strip().lower() for item in curl_allowlist if str(item).strip()]
+    curl_sandbox = resolve_tool_sandbox_policy(
+        {
+            "tool_name": "curlRequest",
+            "side_effect_class": "read_only",
+            "network": {
+                "enabled": True,
+                "allowlist_domains": curl_allowlist_domains,
             },
             "filesystem": {"mode": "none"},
         }
@@ -611,6 +651,60 @@ def build_tool_specs(
         required=False,
         default="",
     )
+    curl_url_arg = ToolArgSpec(
+        name="url",
+        json_type="string",
+        description="HTTP/HTTPS URL to fetch.",
+        required=True,
+        coercer=_coerce_http_url,
+    )
+    curl_method_arg = ToolArgSpec(
+        name="method",
+        json_type="string",
+        description="HTTP method for the request.",
+        required=False,
+        default="GET",
+        coercer=_coerce_http_method,
+    )
+    curl_headers_arg = ToolArgSpec(
+        name="headers",
+        json_type="object",
+        description="Optional request headers as a JSON object.",
+        required=False,
+        default={},
+        coercer=_coerce_json_object,
+    )
+    curl_body_text_arg = ToolArgSpec(
+        name="bodyText",
+        json_type="string",
+        description="Optional request body text.",
+        required=False,
+        default="",
+    )
+    curl_timeout_arg = ToolArgSpec(
+        name="timeoutSeconds",
+        json_type="integer",
+        description="Request timeout in seconds.",
+        required=False,
+        default=max(1, int(CURL_TIMEOUT_SECONDS)),
+        coercer=_coerce_positive_int,
+    )
+    curl_follow_redirects_arg = ToolArgSpec(
+        name="followRedirects",
+        json_type="boolean",
+        description="When true, follow HTTP redirects.",
+        required=False,
+        default=True,
+        coercer=_coerce_bool,
+    )
+    curl_max_chars_arg = ToolArgSpec(
+        name="maxResponseChars",
+        json_type="integer",
+        description="Maximum response characters returned in preview.",
+        required=False,
+        default=max(256, int(CURL_MAX_RESPONSE_CHARS)),
+        coercer=_coerce_positive_int,
+    )
 
     specs = {
         "braveSearch": ToolSpec(
@@ -658,6 +752,26 @@ def build_tool_specs(
             sandbox_policy=merge_sandbox_policies(local_read_sandbox, {"tool_name": "skipTools"}),
         ),
     }
+
+    if callable(curl_request_fn):
+        specs["curlRequest"] = ToolSpec(
+            name="curlRequest",
+            description="Fetch an HTTP/HTTPS endpoint using a curl-style request and return structured response details.",
+            function=curl_request_fn,
+            args=(
+                curl_url_arg,
+                curl_method_arg,
+                curl_headers_arg,
+                curl_body_text_arg,
+                curl_timeout_arg,
+                curl_follow_redirects_arg,
+                curl_max_chars_arg,
+            ),
+            default_timeout_seconds=CURL_TIMEOUT_SECONDS,
+            default_max_retries=0,
+            side_effect_class="read_only",
+            sandbox_policy=curl_sandbox,
+        )
 
     if callable(known_users_list_fn):
         specs["knownUsersList"] = ToolSpec(
@@ -738,6 +852,7 @@ def build_tool_specs(
 def ordered_tool_names(specs: dict[str, ToolSpec]) -> list[str]:
     builtins = (
         "braveSearch",
+        "curlRequest",
         "chatHistorySearch",
         "knowledgeSearch",
         "skipTools",
@@ -1032,6 +1147,7 @@ class ToolRegistryStore:
         chat_history_search_fn: Callable[..., Any],
         knowledge_search_fn: Callable[..., Any],
         skip_tools_fn: Callable[..., Any],
+        curl_request_fn: Callable[..., Any] | None = None,
         known_users_list_fn: Callable[..., Any] | None = None,
         message_known_user_fn: Callable[..., Any] | None = None,
         process_workspace_upsert_fn: Callable[..., Any] | None = None,
@@ -1043,6 +1159,7 @@ class ToolRegistryStore:
         custom_tools = self.list_custom_tools(include_disabled=True)
         specs = build_tool_specs(
             brave_search_fn=brave_search_fn,
+            curl_request_fn=curl_request_fn,
             chat_history_search_fn=chat_history_search_fn,
             knowledge_search_fn=knowledge_search_fn,
             skip_tools_fn=skip_tools_fn,

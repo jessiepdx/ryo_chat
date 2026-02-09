@@ -422,6 +422,7 @@ def _tool_catalog_items() -> list[dict[str, Any]]:
     custom_tools = toolRegistry.list_custom_tools(include_disabled=True)
     specs = build_tool_specs(
         brave_search_fn=_noop_tool,
+        curl_request_fn=_noop_tool,
         chat_history_search_fn=_noop_tool,
         knowledge_search_fn=_noop_tool,
         skip_tools_fn=_noop_tool,
@@ -440,6 +441,7 @@ def _tool_catalog_items() -> list[dict[str, Any]]:
 def _builtin_tool_names() -> set[str]:
     specs = build_tool_specs(
         brave_search_fn=_noop_tool,
+        curl_request_fn=_noop_tool,
         chat_history_search_fn=_noop_tool,
         knowledge_search_fn=_noop_tool,
         skip_tools_fn=_noop_tool,
@@ -503,6 +505,7 @@ def _harness_tool_specs() -> dict[str, Any]:
     custom_tools = toolRegistry.list_custom_tools(include_disabled=False)
     return build_tool_specs(
         brave_search_fn=_harness_brave_search,
+        curl_request_fn=_noop_tool,
         chat_history_search_fn=_harness_chat_history_search,
         knowledge_search_fn=_harness_knowledge_search,
         skip_tools_fn=_harness_skip_tools,

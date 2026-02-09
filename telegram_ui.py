@@ -287,6 +287,7 @@ _ORCHESTRATION_STAGE_LABELS = {
     "analysis.progress": "Analyzing message",
     "analysis.complete": "Analysis complete",
     "analysis.payload": "Analysis payload",
+    "tools.suggested": "Tool suggestions",
     "process.directive": "Process directive",
     "tools.start": "Evaluating tools",
     "tools.model_output": "Tool model output",
@@ -310,6 +311,7 @@ _MINIMAL_VISIBLE_STAGES = {
     "analysis.start",
     "analysis.progress",
     "analysis.complete",
+    "tools.suggested",
     "process.directive",
     "tools.start",
     "tools.model_output",
@@ -751,6 +753,13 @@ class TelegramStageStatus:
         pending_outbox_count = meta.get("pending_outbox_count")
         if isinstance(pending_outbox_count, int):
             pieces.append(f"pending_outbox={pending_outbox_count}")
+        suggestion_count = meta.get("suggestion_count")
+        if not isinstance(suggestion_count, int):
+            nested_suggestion_count = self._extract_from_meta_json(meta, "suggestion_count")
+            if isinstance(nested_suggestion_count, int):
+                suggestion_count = nested_suggestion_count
+        if isinstance(suggestion_count, int):
+            pieces.append(f"suggestions={suggestion_count}")
 
         stats = self._extract_stats_payload(meta)
         total_tps = self._coerce_float(stats.get("total_tokens_per_second"))
@@ -871,6 +880,22 @@ class TelegramStageStatus:
             if selected_model:
                 return f"Analysis model: {selected_model}"
             return "Analysis complete."
+
+        if stage == "tools.suggested":
+            suggested = self._extract_from_meta_json(meta, "suggested_tools")
+            if isinstance(suggested, list) and suggested:
+                tool_names = [
+                    str(_inspector_json_safe(entry).get("tool_name") or "")
+                    for entry in suggested
+                    if isinstance(entry, dict)
+                ]
+                tool_names = [name for name in tool_names if name]
+                if tool_names:
+                    return self._truncate_text(
+                        "Suggested tools: " + ", ".join(tool_names[:4]),
+                        320,
+                    )
+            return "Prepared a suggested tool sequence before execution."
 
         if stage == "response.start":
             return "Generating final response."

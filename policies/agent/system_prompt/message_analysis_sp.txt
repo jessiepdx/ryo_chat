@@ -55,7 +55,7 @@ Output requirements:
 }
 
 Rules:
-1. "tool_hints" may only include: braveSearch, chatHistorySearch, knowledgeSearch, skipTools, knownUsersList, messageKnownUser, upsertProcessWorkspace, listProcessWorkspace, updateProcessWorkspaceStep, listOutboxMessages.
+1. "tool_hints" may only include: braveSearch, curlRequest, chatHistorySearch, knowledgeSearch, skipTools, knownUsersList, messageKnownUser, upsertProcessWorkspace, listProcessWorkspace, updateProcessWorkspaceStep, listOutboxMessages.
 2. "risk_flags" should be a list of short labels such as: none, policy, safety, pii, abuse, uncertain.
 3. Keep "context_summary" short and factual.
 4. Do not include internal reasoning, chain-of-thought, or references to future agents/stages.
@@ -68,7 +68,11 @@ Rules:
 11. Use "process_directive" when the user is coordinating multi-turn work, asking about known users, asking to message another user, asking to continue/resume/update a process, or asking about sent/queued messages.
 12. If Known Context includes workspace_context.active_processes and the user is continuing prior work, set process_directive.action to "resume_process" or "update_process_step" instead of starting a new process.
 13. If process_directive.action is not "none", set needs_tools=true and include matching tool_hints for that action.
-14. Enforce brevity limits:
+14. For web/API investigation:
+   - If user provides a direct URL, include "curlRequest" in tool_hints.
+   - If user needs external information but no URL is provided, include "braveSearch" first; include "curlRequest" only when deeper fetch from discovered URL is likely needed.
+15. Do not reveal chain-of-thought. Keep context_summary and reasons factual/brief.
+16. Enforce brevity limits:
    - topic: <= 4 words
    - intent: <= 5 words
    - tool_hints: <= 3 items
@@ -78,4 +82,4 @@ Rules:
    - memory_directive.reason: <= 120 chars
    - brevity_directive.reason: <= 80 chars
    - context_summary: <= 160 chars, one sentence
-15. If unsure, choose concise defaults over explanation. Do not elaborate.
+17. If unsure, choose concise defaults over explanation. Do not elaborate.

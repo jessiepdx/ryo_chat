@@ -19,14 +19,18 @@
 import asyncio
 import copy
 from datetime import datetime, timedelta, timezone
+import ipaddress
 import inspect
 import json
 import logging
 import re
 import requests
+import shlex
+import subprocess
 import time
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
+from urllib.parse import urlparse
 from hypermindlabs.approval_manager import ApprovalManager
 from hypermindlabs.model_router import ModelExecutionError, ModelRouter
 from hypermindlabs.policy_manager import PolicyManager, PolicyValidationError
@@ -194,6 +198,7 @@ def _routing_from_error(error: Exception) -> dict[str, Any]:
 
 _ALLOWED_TOOL_HINTS = {
     "braveSearch",
+    "curlRequest",
     "chatHistorySearch",
     "knowledgeSearch",
     "skipTools",
@@ -481,6 +486,8 @@ def _stage_meta_log_summary(meta: dict[str, Any] | None) -> dict[str, Any]:
         summary["json_keys"] = list(json_payload.keys())[:8]
         if "selected_count" in json_payload:
             summary["selected_count"] = json_payload.get("selected_count")
+        if "suggestion_count" in json_payload:
+            summary["suggestion_count"] = json_payload.get("suggestion_count")
     return summary
 
 
@@ -1613,6 +1620,114 @@ def _process_tool_stage_summary(tool_results: list[dict[str, Any]] | None) -> di
     }
 
 
+def _tool_suggestion_plan(
+    *,
+    analysis_payload: dict[str, Any] | None,
+    current_message: str,
+) -> dict[str, Any]:
+    payload = _coerce_dict(analysis_payload)
+    hints = [hint for hint in _as_string_list(payload.get("tool_hints")) if hint and hint != "skipTools"]
+    needs_tools = _as_bool(payload.get("needs_tools"), False)
+    process_directive = _coerce_dict(payload.get("process_directive"))
+    process_action = _as_text(process_directive.get("action"), "none")
+    first_url = _extract_first_url(current_message)
+
+    suggestions: list[dict[str, Any]] = []
+
+    def add_suggestion(tool_name: str, reason: str, priority: int) -> None:
+        if any(_as_text(item.get("tool_name")) == tool_name for item in suggestions):
+            return
+        suggestions.append(
+            {
+                "tool_name": tool_name,
+                "reason": _truncate_for_prompt(reason, 160),
+                "priority": int(priority),
+            }
+        )
+
+    process_action_map = {
+        "list_users": [("knownUsersList", "Resolve known users before inter-user actions.")],
+        "send_message": [
+            ("knownUsersList", "Resolve recipient identity before sending."),
+            ("messageKnownUser", "Deliver or queue the inter-user message."),
+        ],
+        "start_process": [("upsertProcessWorkspace", "Create a persisted multi-step process workspace.")],
+        "resume_process": [("listProcessWorkspace", "Load active process state for continuity.")],
+        "update_process_step": [
+            ("listProcessWorkspace", "Load process context before applying step updates."),
+            ("updateProcessWorkspaceStep", "Write the new step status and progress."),
+        ],
+        "list_outbox": [("listOutboxMessages", "Inspect queued/sent inter-user messages.")],
+    }
+    for idx, (tool_name, reason) in enumerate(process_action_map.get(process_action, []), start=1):
+        add_suggestion(tool_name, reason, idx)
+
+    for idx, hint in enumerate(hints, start=1):
+        if hint == "braveSearch":
+            add_suggestion(
+                "braveSearch",
+                "Gather candidate sources and current web facts quickly before deeper fetches.",
+                idx,
+            )
+            if first_url:
+                add_suggestion(
+                    "curlRequest",
+                    "A direct URL is present; fetch the endpoint content to ground the final answer.",
+                    idx + 1,
+                )
+            else:
+                add_suggestion(
+                    "curlRequest",
+                    "After web search identifies a target URL, fetch that page/API directly for precise details.",
+                    idx + 2,
+                )
+        elif hint == "curlRequest":
+            if first_url:
+                add_suggestion(
+                    "curlRequest",
+                    "Direct URL detected in user request; fetch endpoint data directly.",
+                    idx,
+                )
+            else:
+                add_suggestion(
+                    "braveSearch",
+                    "No explicit URL provided; discover candidate URL(s) before HTTP fetch.",
+                    idx,
+                )
+                add_suggestion(
+                    "curlRequest",
+                    "Fetch best candidate URL discovered by search to validate details.",
+                    idx + 1,
+                )
+        elif hint == "chatHistorySearch":
+            add_suggestion("chatHistorySearch", "Recover relevant prior chat context for grounding.", idx)
+        elif hint == "knowledgeSearch":
+            add_suggestion("knowledgeSearch", "Retrieve project-specific indexed knowledge context.", idx)
+        elif hint == "knownUsersList":
+            add_suggestion("knownUsersList", "Resolve users for communication workflows.", idx)
+        elif hint == "listProcessWorkspace":
+            add_suggestion("listProcessWorkspace", "Load current process state before continuing steps.", idx)
+        elif hint == "updateProcessWorkspaceStep":
+            add_suggestion("updateProcessWorkspaceStep", "Persist step completion/progress updates.", idx)
+        elif hint == "listOutboxMessages":
+            add_suggestion("listOutboxMessages", "Inspect queued/sent message delivery state.", idx)
+
+    if needs_tools and not suggestions:
+        if first_url:
+            add_suggestion("curlRequest", "Direct URL available for immediate retrieval.", 1)
+        else:
+            add_suggestion("braveSearch", "Start with web retrieval to gather grounding context.", 1)
+
+    suggestions.sort(key=lambda item: (_safe_int(item.get("priority"), 1000), _as_text(item.get("tool_name"))))
+    return {
+        "needs_tools": needs_tools,
+        "process_action": process_action,
+        "suggested_tools": suggestions[:6],
+        "suggestion_count": len(suggestions[:6]),
+        "has_direct_url": bool(first_url),
+    }
+
+
 
 ################
 # ORCHESTRATOR #
@@ -2118,6 +2233,23 @@ class ConversationOrchestrator:
             "tool_results": normalizedAnalysis,
         }
         self._messages.append(Message(role="tool", content=json.dumps(analysisMessagePayload, ensure_ascii=False)))
+        toolSuggestionPlan = _tool_suggestion_plan(
+            analysis_payload=normalizedAnalysis,
+            current_message=self._message,
+        )
+        toolSuggestionPayload = {
+            "tool_name": "Tool Suggestions",
+            "tool_results": toolSuggestionPlan,
+        }
+        if _safe_int(toolSuggestionPlan.get("suggestion_count"), 0) > 0:
+            await self._emit_stage(
+                "tools.suggested",
+                "Prepared suggested tool sequence before execution.",
+                json=toolSuggestionPlan,
+            )
+            self._messages.append(
+                Message(role="tool", content=json.dumps(toolSuggestionPayload, ensure_ascii=False))
+            )
 
         memorySelection = _select_memory_recall(
             current_message=self._message,
@@ -2175,6 +2307,8 @@ class ConversationOrchestrator:
             stageMessages = _recent_dialogue_messages(toolHistoryLimit)
             stageMessages.append(Message(role="tool", content=json.dumps(knownContextPrompt, ensure_ascii=False)))
             stageMessages.append(Message(role="tool", content=json.dumps(analysisMessagePayload, ensure_ascii=False)))
+            if _safe_int(toolSuggestionPlan.get("suggestion_count"), 0) > 0:
+                stageMessages.append(Message(role="tool", content=json.dumps(toolSuggestionPayload, ensure_ascii=False)))
             if memorySelectionPreview.get("selected_count", 0):
                 stageMessages.append(Message(role="tool", content=json.dumps(memoryMessagePayload, ensure_ascii=False)))
             return stageMessages
@@ -2463,6 +2597,7 @@ class ConversationOrchestrator:
             "memory_circuit": _coerce_dict(memoryCircuit),
             "memory_recall": memorySelectionPreview,
             "analysis_payload": _coerce_dict(normalizedAnalysis),
+            "tool_suggestions": _coerce_dict(toolSuggestionPlan),
             "analysis_routing": _coerce_dict(getattr(self._analysisAgent, "routing", {})),
             "analysis_stats": analysisStatsSummary,
             "tool_execution_mode": toolExecutionMode,
@@ -2549,6 +2684,322 @@ class ConversationOrchestrator:
 ###############
 # AGENT TOOLS #
 ###############
+
+_SENSITIVE_HEADER_NAMES = {
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "cookie",
+    "set-cookie",
+}
+_READ_ONLY_HTTP_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _extract_first_url(text: Any) -> str:
+    raw = _as_text(text)
+    if not raw:
+        return ""
+    match = re.search(r"https?://[^\s<>\"]+", raw, flags=re.IGNORECASE)
+    if match is None:
+        return ""
+    return _as_text(match.group(0))
+
+
+def _sanitize_header_map(headers: Any) -> dict[str, str]:
+    if not isinstance(headers, dict):
+        return {}
+    output: dict[str, str] = {}
+    for raw_key, raw_value in headers.items():
+        key = _as_text(raw_key)
+        value = _as_text(raw_value)
+        if not key:
+            continue
+        output[key] = value
+    return output
+
+
+def _redact_headers(headers: dict[str, str]) -> dict[str, str]:
+    output: dict[str, str] = {}
+    for key, value in headers.items():
+        if _as_text(key).lower() in _SENSITIVE_HEADER_NAMES and value:
+            output[key] = "***REDACTED***"
+        else:
+            output[key] = value
+    return output
+
+
+def _hostname_allowed(hostname: str, allowlist: list[str]) -> bool:
+    host = _as_text(hostname).lower().strip(".")
+    if not host:
+        return False
+    if not allowlist:
+        return True
+    for allowed_raw in allowlist:
+        allowed = _as_text(allowed_raw).lower().strip(".")
+        if not allowed:
+            continue
+        if allowed.startswith("*."):
+            allowed = allowed[2:]
+        if host == allowed or host.endswith(f".{allowed}"):
+            return True
+    return False
+
+
+def _is_private_network_hostname(hostname: str) -> bool:
+    host = _as_text(hostname).strip("[]")
+    if not host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host.lower() in {"localhost"}
+    return bool(
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+    )
+
+
+def curlRequest(
+    url: str,
+    method: str = "GET",
+    headers: dict | None = None,
+    bodyText: str = "",
+    timeoutSeconds: int | None = None,
+    followRedirects: bool = True,
+    maxResponseChars: int | None = None,
+) -> dict:
+    """Execute a curl-style HTTP request and return structured response details."""
+    request_url = _as_text(url)
+    parsed = urlparse(request_url)
+    scheme = _as_text(parsed.scheme).lower()
+    hostname = _as_text(parsed.hostname).lower()
+    if scheme not in {"http", "https"}:
+        return {"status": "error", "error": "unsupported_url_scheme", "detail": "Only http/https URLs are supported."}
+    if not hostname:
+        return {"status": "error", "error": "missing_hostname", "detail": "URL hostname is required."}
+
+    allowlist = _runtime_model_list("tool_runtime.curl_allowlist_domains", [])
+    if not _hostname_allowed(hostname, allowlist):
+        return {
+            "status": "error",
+            "error": "domain_not_allowlisted",
+            "detail": f"Hostname '{hostname}' is not in curl allowlist.",
+            "allowlist": allowlist,
+        }
+
+    allow_private_network = _runtime_bool("tool_runtime.curl_allow_private_network", False)
+    if _is_private_network_hostname(hostname) and not allow_private_network:
+        return {
+            "status": "error",
+            "error": "private_network_blocked",
+            "detail": f"Private/local hostname '{hostname}' is blocked by runtime policy.",
+        }
+
+    normalized_method = _as_text(method, "GET").upper()
+    if normalized_method not in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}:
+        return {
+            "status": "error",
+            "error": "unsupported_method",
+            "detail": f"HTTP method '{normalized_method}' is unsupported.",
+        }
+
+    allow_mutating_methods = _runtime_bool("tool_runtime.curl_allow_mutating_methods", False)
+    if normalized_method not in _READ_ONLY_HTTP_METHODS and not allow_mutating_methods:
+        return {
+            "status": "error",
+            "error": "mutating_method_blocked",
+            "detail": (
+                f"Method '{normalized_method}' is disabled by runtime policy. "
+                "Enable tool_runtime.curl_allow_mutating_methods to permit it."
+            ),
+        }
+
+    timeout_seconds = _safe_int(timeoutSeconds, int(_runtime_float("tool_runtime.curl_timeout_seconds", 12.0)))
+    if timeout_seconds <= 0:
+        timeout_seconds = 12
+    timeout_seconds = min(120, timeout_seconds)
+    max_response_chars = _safe_int(
+        maxResponseChars,
+        max(256, _runtime_int("tool_runtime.curl_max_response_chars", 3500)),
+    )
+    if max_response_chars <= 0:
+        max_response_chars = 3500
+
+    request_headers = _sanitize_header_map(headers)
+    body_text = _as_text(bodyText)
+
+    curl_cmd: list[str] = [
+        "curl",
+        "--silent",
+        "--show-error",
+        "--request",
+        normalized_method,
+        "--max-time",
+        str(timeout_seconds),
+        "--connect-timeout",
+        str(min(10, timeout_seconds)),
+    ]
+    if followRedirects:
+        curl_cmd.append("--location")
+    else:
+        curl_cmd.extend(["--max-redirs", "0"])
+    for key, value in request_headers.items():
+        curl_cmd.extend(["--header", f"{key}: {value}"])
+    if body_text and normalized_method not in {"GET", "HEAD", "OPTIONS"}:
+        curl_cmd.extend(["--data-raw", body_text])
+    curl_cmd.extend(
+        [
+            request_url,
+            "--write-out",
+            "\n__RYO_CURL_META__:%{http_code}|%{content_type}|%{size_download}|%{time_total}|%{url_effective}",
+        ]
+    )
+
+    display_cmd = list(curl_cmd)
+    for idx, token in enumerate(display_cmd):
+        if idx > 0 and display_cmd[idx - 1] == "--header":
+            parts = token.split(":", 1)
+            header_name = _as_text(parts[0])
+            if header_name.lower() in _SENSITIVE_HEADER_NAMES:
+                display_cmd[idx] = f"{header_name}: ***REDACTED***"
+        if idx > 0 and display_cmd[idx - 1] == "--data-raw" and len(token) > 120:
+            display_cmd[idx] = token[:117] + "..."
+
+    transport = "curl"
+    status_code = 0
+    content_type = ""
+    size_downloaded = 0
+    elapsed_seconds = 0.0
+    effective_url = request_url
+    response_text = ""
+
+    try:
+        completed = subprocess.run(
+            curl_cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds + 3,
+            check=False,
+        )
+        stdout = _as_text(completed.stdout)
+        stderr = _as_text(completed.stderr)
+        marker = "__RYO_CURL_META__:"
+        if marker in stdout:
+            body, _, meta_text = stdout.rpartition(marker)
+            response_text = body.rstrip("\n")
+            meta_parts = meta_text.split("|", 4)
+            if meta_parts:
+                status_code = _safe_int(meta_parts[0], 0)
+            if len(meta_parts) > 1:
+                content_type = _as_text(meta_parts[1])
+            if len(meta_parts) > 2:
+                size_downloaded = _safe_int(meta_parts[2], 0)
+            if len(meta_parts) > 3:
+                try:
+                    elapsed_seconds = float(meta_parts[3])
+                except (TypeError, ValueError):
+                    elapsed_seconds = 0.0
+            if len(meta_parts) > 4:
+                effective_url = _as_text(meta_parts[4], request_url)
+        else:
+            response_text = stdout
+
+        if completed.returncode != 0 and status_code == 0:
+            return {
+                "status": "error",
+                "error": "curl_command_failed",
+                "detail": stderr or f"curl exited with return code {completed.returncode}",
+                "curl_command": shlex.join(display_cmd),
+                "request": {
+                    "url": request_url,
+                    "method": normalized_method,
+                    "headers": _redact_headers(request_headers),
+                },
+            }
+    except FileNotFoundError:
+        transport = "requests_fallback"
+        try:
+            req_response = requests.request(
+                method=normalized_method,
+                url=request_url,
+                headers=request_headers or None,
+                data=body_text or None,
+                timeout=float(timeout_seconds),
+                allow_redirects=bool(followRedirects),
+            )
+        except Exception as error:  # noqa: BLE001
+            return {
+                "status": "error",
+                "error": "http_request_failed",
+                "detail": str(error),
+                "transport": transport,
+                "request": {
+                    "url": request_url,
+                    "method": normalized_method,
+                    "headers": _redact_headers(request_headers),
+                },
+            }
+        status_code = _safe_int(req_response.status_code, 0)
+        content_type = _as_text(req_response.headers.get("Content-Type"))
+        size_downloaded = len(req_response.content or b"")
+        if getattr(req_response, "elapsed", None):
+            elapsed_seconds = float(req_response.elapsed.total_seconds())
+        effective_url = _as_text(getattr(req_response, "url", request_url), request_url)
+        response_text = _as_text(req_response.text)
+    except subprocess.TimeoutExpired as error:
+        return {
+            "status": "error",
+            "error": "curl_timeout",
+            "detail": f"curl timed out after {timeout_seconds}s",
+            "transport": transport,
+            "request": {
+                "url": request_url,
+                "method": normalized_method,
+                "headers": _redact_headers(request_headers),
+            },
+            "stderr": _as_text(getattr(error, "stderr", "")),
+        }
+
+    response_excerpt = response_text
+    truncated = False
+    if len(response_excerpt) > max_response_chars:
+        response_excerpt = response_excerpt[: max_response_chars - 3].rstrip() + "..."
+        truncated = True
+
+    response_json = None
+    if response_text and ("json" in content_type.lower() or response_text.lstrip().startswith(("{", "["))):
+        try:
+            response_json = json.loads(response_text)
+        except Exception:  # noqa: BLE001
+            response_json = None
+
+    return {
+        "status": "ok",
+        "transport": transport,
+        "request": {
+            "url": request_url,
+            "method": normalized_method,
+            "headers": _redact_headers(request_headers),
+            "body_chars": len(body_text),
+            "follow_redirects": bool(followRedirects),
+            "timeout_seconds": timeout_seconds,
+        },
+        "response": {
+            "status_code": status_code,
+            "ok": status_code < 400 if status_code else False,
+            "content_type": content_type,
+            "size_downloaded": size_downloaded,
+            "elapsed_seconds": round(float(elapsed_seconds), 4),
+            "effective_url": effective_url,
+            "body_excerpt": response_excerpt,
+            "body_excerpt_truncated": truncated,
+            "json": response_json,
+        },
+        "curl_command": shlex.join(display_cmd),
+    }
 
 def braveSearch(queryString: str, count: int = 5) -> list:
     """
@@ -2993,6 +3444,7 @@ class ToolCallingAgent():
         )
         self._toolSpecs = build_tool_specs(
             brave_search_fn=braveSearch,
+            curl_request_fn=curlRequest,
             chat_history_search_fn=chatHistorySearch,
             knowledge_search_fn=knowledgeSearch,
             skip_tools_fn=skipTools,
@@ -3026,6 +3478,7 @@ class ToolCallingAgent():
         if customToolIndex:
             self._toolSpecs = build_tool_specs(
                 brave_search_fn=braveSearch,
+                curl_request_fn=curlRequest,
                 chat_history_search_fn=chatHistorySearch,
                 knowledge_search_fn=knowledgeSearch,
                 skip_tools_fn=skipTools,
@@ -3373,6 +3826,7 @@ class ToolCallingAgent():
         hints = self._analysis_tool_hints()
         query_text = self._latestUserMessage or _as_text(self._toolRuntimeContext.get("latest_user_message"))
         query_text = query_text.strip()
+        first_url = _extract_first_url(query_text)
         process_directive = self._analysis_process_directive()
         process_action = _as_text(process_directive.get("action"), "none")
         calls: list[dict[str, Any]] = []
@@ -3487,8 +3941,11 @@ class ToolCallingAgent():
                 max_calls = max(1, _runtime_int("tool_runtime.process_hint_max_calls", 3))
                 return calls[:max_calls]
 
-        if not hints and "braveSearch" in self._toolSpecs and query_text:
-            return [{"function": {"name": "braveSearch", "arguments": {"queryString": query_text}}}]
+        if not hints and query_text:
+            if first_url and "curlRequest" in self._toolSpecs:
+                return [{"function": {"name": "curlRequest", "arguments": {"url": first_url}}}]
+            if "braveSearch" in self._toolSpecs:
+                return [{"function": {"name": "braveSearch", "arguments": {"queryString": query_text}}}]
         for hint in hints:
             if hint == "skipTools":
                 continue
@@ -3497,6 +3954,16 @@ class ToolCallingAgent():
             args: dict[str, Any] = {}
             if hint in {"braveSearch", "chatHistorySearch", "knowledgeSearch"} and query_text:
                 args["queryString"] = query_text
+            elif hint == "curlRequest":
+                if first_url:
+                    args["url"] = first_url
+                elif "braveSearch" in self._toolSpecs and query_text:
+                    fallback_call = {"function": {"name": "braveSearch", "arguments": {"queryString": query_text}}}
+                    if fallback_call not in calls:
+                        calls.append(fallback_call)
+                    continue
+                else:
+                    continue
             elif hint == "knownUsersList":
                 if query_text:
                     args["queryString"] = query_text
@@ -3511,12 +3978,66 @@ class ToolCallingAgent():
                 # These hints require additional structured arguments from process_directive.
                 # Avoid executing malformed calls in generic hint fallback mode.
                 continue
-            calls.append({"function": {"name": hint, "arguments": args}})
-            if len(calls) >= 2:
+            candidate_call = {"function": {"name": hint, "arguments": args}}
+            if candidate_call not in calls:
+                calls.append(candidate_call)
+            if len(calls) >= 3:
                 break
         if not calls and "skipTools" in hints and "skipTools" in self._toolSpecs:
             calls.append({"function": {"name": "skipTools", "arguments": {}}})
         return calls
+
+    @staticmethod
+    def _first_url_from_brave_results(tool_results: list[dict[str, Any]] | None) -> str:
+        results = tool_results if isinstance(tool_results, list) else []
+        for item in results:
+            result = _coerce_dict(item)
+            if _as_text(result.get("tool_name")) != "braveSearch":
+                continue
+            if _as_text(result.get("status"), "error") != "success":
+                continue
+            payload = result.get("tool_results")
+            rows = payload if isinstance(payload, list) else []
+            for row in rows:
+                url_value = _as_text(_coerce_dict(row).get("url"))
+                if url_value:
+                    return url_value
+        return ""
+
+    async def _auto_expand_search_then_fetch(
+        self,
+        *,
+        tool_results: list[dict[str, Any]],
+        requested_tools: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if "curlRequest" not in self._toolSpecs:
+            return [], []
+        hints = self._analysis_tool_hints()
+        if "curlRequest" not in hints:
+            return [], []
+
+        requested_names = [_as_text(_coerce_dict(item).get("name")) for item in requested_tools]
+        executed_names = [_as_text(_coerce_dict(item).get("tool_name")) for item in (tool_results or [])]
+        if "curlRequest" in requested_names or "curlRequest" in executed_names:
+            return [], []
+        if "braveSearch" not in requested_names and "braveSearch" not in executed_names:
+            return [], []
+
+        discovered_url = self._first_url_from_brave_results(tool_results)
+        if not discovered_url:
+            return [], []
+
+        await self._emit_tool_runtime_event(
+            {
+                "stage": "tools.expand.fetch",
+                "status": "info",
+                "detail": "Expanding from search to URL fetch using curlRequest.",
+                "meta": {"url": discovered_url},
+            }
+        )
+        expansion_calls = [{"function": {"name": "curlRequest", "arguments": {"url": discovered_url}}}]
+        expansion_results = await self._execute_tool_calls(expansion_calls)
+        return expansion_calls, expansion_results
 
     def _pseudo_tool_catalog(self) -> list[dict[str, Any]]:
         catalog: list[dict[str, Any]] = []
@@ -4023,6 +4544,15 @@ class ToolCallingAgent():
         requestedTools: list[dict[str, Any]] = self._collect_requested_tools(rawToolCalls)
         if rawToolCalls:
             toolResults = await self._execute_tool_calls(rawToolCalls)
+
+        expansionCalls, expansionResults = await self._auto_expand_search_then_fetch(
+            tool_results=toolResults,
+            requested_tools=requestedTools,
+        )
+        if expansionCalls:
+            requestedTools.extend(self._collect_requested_tools(expansionCalls))
+        if expansionResults:
+            toolResults.extend(expansionResults)
         if modelOutputText and len(modelOutputText) > 280:
             modelOutputText = modelOutputText[:277].rstrip() + "..."
         toolErrors = [
@@ -4042,6 +4572,7 @@ class ToolCallingAgent():
             "tool_errors": toolErrors,
             "model_output_excerpt": modelOutputText,
             "execution_mode": "pseudo_structured_output" if used_pseudo_tool_fallback else "native_tools",
+            "auto_expanded_search_fetch": bool(expansionCalls),
         }
         for key in ("model_fallback", "model_error"):
             if key in previousSummary:

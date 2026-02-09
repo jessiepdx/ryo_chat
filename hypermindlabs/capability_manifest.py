@@ -30,6 +30,7 @@ def _tool_capability() -> dict[str, Any]:
     registry = ToolRegistryStore()
     items = registry.list_catalog(
         brave_search_fn=_noop_tool,
+        curl_request_fn=_noop_tool,
         chat_history_search_fn=_noop_tool,
         knowledge_search_fn=_noop_tool,
         skip_tools_fn=_noop_tool,
