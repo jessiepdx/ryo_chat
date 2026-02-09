@@ -1373,6 +1373,7 @@ class ConversationOrchestrator:
         analysisResponseMessage = ""
         analysisChunkCount = 0
         analysisCharCount = 0
+        analysisDoneSeen = False
         analysisLastProgressLog = time.monotonic()
         analysisLastProgressEmit = time.monotonic()
         analysisLatestPreview = ""
@@ -1412,6 +1413,7 @@ class ConversationOrchestrator:
                 )
                 analysisLastProgressEmit = now
             if chunk.done:
+                analysisDoneSeen = True
                 self._analysisStats = {
                     "total_duration": chunk.total_duration,
                     "load_duration": chunk.load_duration,
@@ -1424,12 +1426,25 @@ class ConversationOrchestrator:
                     "[stream.analysis] "
                     f"done chunks={analysisChunkCount} chars={analysisCharCount} eval_count={chunk.eval_count}"
                 )
+        if not analysisDoneSeen:
+            logger.warning(
+                "[stream.analysis] stream ended without done flag; "
+                f"using conservative analysis parse fallback (chunks={analysisChunkCount}, chars={analysisCharCount})."
+            )
+            await self._emit_stage(
+                "analysis.incomplete_stream",
+                "Analysis stream ended before done flag; using conservative parse fallback.",
+                chunks=analysisChunkCount,
+                chars=analysisCharCount,
+                stream_done=False,
+            )
         analysisStatsSummary = _ollama_stream_stats_summary(self._analysisStats)
         await self._emit_stage(
             "analysis.complete",
             "Analysis stage complete.",
             model=getattr(self._analysisAgent, "_model", None),
             selected_model=_coerce_dict(getattr(self._analysisAgent, "routing", {})).get("selected_model"),
+            stream_done=analysisDoneSeen,
             prompt_tokens=analysisStatsSummary.get("prompt_tokens"),
             completion_tokens=analysisStatsSummary.get("completion_tokens"),
             total_tokens=analysisStatsSummary.get("total_tokens"),
@@ -1443,7 +1458,7 @@ class ConversationOrchestrator:
         )
 
         normalizedAnalysis = _normalize_analysis_payload(
-            analysisResponseMessage,
+            analysisResponseMessage if analysisDoneSeen else "",
             knownContext.get("tool_results"),
         )
         analysisMessagePayload = {
@@ -1547,6 +1562,7 @@ class ConversationOrchestrator:
         responseMessage = ""
         responseChunkCount = 0
         responseCharCount = 0
+        responseDoneSeen = False
         responseLastProgressLog = time.monotonic()
         responseLastProgressEmit = time.monotonic()
         responseLatestPreview = ""
@@ -1585,6 +1601,7 @@ class ConversationOrchestrator:
                 )
                 responseLastProgressEmit = now
             if chunk.done:
+                responseDoneSeen = True
                 self._devStats = {
                     "total_duration": chunk.total_duration,
                     "load_duration": chunk.load_duration,
@@ -1597,12 +1614,18 @@ class ConversationOrchestrator:
                     "[stream.response] "
                     f"done chunks={responseChunkCount} chars={responseCharCount} eval_count={chunk.eval_count}"
                 )
+        if not responseDoneSeen:
+            logger.warning(
+                "[stream.response] stream ended without done flag; "
+                f"captured partial response text (chunks={responseChunkCount}, chars={responseCharCount})."
+            )
         responseStatsSummary = _ollama_stream_stats_summary(self._devStats)
         await self._emit_stage(
             "response.complete",
             "Final response generated.",
             model=getattr(self._chatConversationAgent, "_model", None),
             selected_model=_coerce_dict(getattr(self._chatConversationAgent, "routing", {})).get("selected_model"),
+            stream_done=responseDoneSeen,
             prompt_tokens=responseStatsSummary.get("prompt_tokens"),
             completion_tokens=responseStatsSummary.get("completion_tokens"),
             total_tokens=responseStatsSummary.get("total_tokens"),

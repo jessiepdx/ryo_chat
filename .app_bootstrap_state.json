@@ -1,5 +1,5 @@
 {
   "setup_completed": true,
-  "last_run_epoch": 1770611074,
-  "policy_model_sync_fingerprint": "{\"host\": \"http://127.0.0.1:11434\", \"models\": {\"chat_conversation\": [\"qwen3-vl:latest\"], \"dev_test\": [\"qwen3-vl:latest\"], \"message_analysis\": [\"qwen3-vl:latest\"], \"tool_calling\": [\"qwen3-vl:latest\"]}}"
+  "last_run_epoch": 1770611338,
+  "policy_model_sync_fingerprint": "{\"host\": \"http://127.0.0.1:11434\", \"models\": {\"chat_conversation\": [\"gemma3:4b\"], \"dev_test\": [\"gemma3:4b\"], \"message_analysis\": [\"gemma3:4b\"], \"tool_calling\": [\"gemma3:4b\"]}}"
 }
