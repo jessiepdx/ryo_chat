@@ -97,6 +97,28 @@ class TestRuntimeSettings(unittest.TestCase):
         )
         self.assertFalse(settings["orchestrator"]["discovery_force_tools_on_uncertainty"])
 
+    def test_build_runtime_settings_supports_progressive_history_overrides(self):
+        settings = build_runtime_settings(
+            config_data={
+                "runtime": {
+                    "retrieval": {
+                        "progressive_history_max_rounds": 6,
+                        "progressive_history_context_radius": 3,
+                    }
+                }
+            },
+            env_data={
+                "RYO_PROGRESSIVE_HISTORY_ENABLED": "false",
+                "RYO_PROGRESSIVE_HISTORY_ROUND_WINDOWS_HOURS": "6,24,72",
+                "RYO_PROGRESSIVE_HISTORY_MATCH_THRESHOLD": "0.51",
+            },
+        )
+        self.assertFalse(settings["retrieval"]["progressive_history_enabled"])
+        self.assertEqual(settings["retrieval"]["progressive_history_max_rounds"], 6)
+        self.assertEqual(settings["retrieval"]["progressive_history_context_radius"], 3)
+        self.assertEqual(settings["retrieval"]["progressive_history_round_windows_hours"], ["6", "24", "72"])
+        self.assertEqual(settings["retrieval"]["progressive_history_match_threshold"], 0.51)
+
     def test_build_runtime_settings_hydrates_from_public_community_requirements(self):
         config_data = {
             "runtime": {

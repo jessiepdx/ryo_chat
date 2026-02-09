@@ -32,6 +32,10 @@ from types import SimpleNamespace
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 from hypermindlabs.approval_manager import ApprovalManager
+from hypermindlabs.history_recall import (
+    ProgressiveHistoryExplorer,
+    ProgressiveHistoryExplorerConfig,
+)
 from hypermindlabs.model_router import ModelExecutionError, ModelRouter
 from hypermindlabs.policy_manager import PolicyManager, PolicyValidationError
 from hypermindlabs.temporal_context import (
@@ -113,6 +117,54 @@ def _runtime_value(path: str, default: Any = None) -> Any:
 
 def _runtime_bool(path: str, default: bool) -> bool:
     return config.runtimeBool(path, default)
+
+
+def _runtime_int_list(path: str, default: list[int]) -> list[int]:
+    raw_value = _runtime_value(path, default)
+    parsed: list[int] = []
+    source: list[Any]
+    if isinstance(raw_value, list):
+        source = raw_value
+    elif isinstance(raw_value, str):
+        source = [item.strip() for item in re.split(r"[,;\n]+", raw_value)]
+    else:
+        source = list(default)
+
+    for item in source:
+        try:
+            value = int(item)
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        if value in parsed:
+            continue
+        parsed.append(value)
+    if not parsed:
+        return list(default)
+    return parsed
+
+
+def _progressive_history_runtime_payload(*, max_selected_override: int | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "enabled": _runtime_bool("retrieval.progressive_history_enabled", True),
+        "max_rounds": max(1, _runtime_int("retrieval.progressive_history_max_rounds", 5)),
+        "round_windows_hours": _runtime_int_list(
+            "retrieval.progressive_history_round_windows_hours",
+            [12, 48, 168, 720],
+        ),
+        "semantic_limit_start": max(1, _runtime_int("retrieval.progressive_history_semantic_limit_start", 3)),
+        "semantic_limit_step": max(0, _runtime_int("retrieval.progressive_history_semantic_limit_step", 2)),
+        "timeline_limit_start": max(2, _runtime_int("retrieval.progressive_history_timeline_limit_start", 24)),
+        "timeline_limit_step": max(0, _runtime_int("retrieval.progressive_history_timeline_limit_step", 24)),
+        "context_radius": max(1, _runtime_int("retrieval.progressive_history_context_radius", 2)),
+        "match_threshold": max(0.05, min(0.98, _runtime_float("retrieval.progressive_history_match_threshold", 0.42))),
+        "max_selected": max(1, _runtime_int("retrieval.progressive_history_max_selected", 8)),
+        "max_message_chars": max(40, _runtime_int("retrieval.progressive_history_max_message_chars", 220)),
+    }
+    if isinstance(max_selected_override, int) and max_selected_override > 0:
+        payload["max_selected"] = max(1, min(int(max_selected_override), int(payload["max_selected"])))
+    return payload
 
 
 def _control_plane_cache_enabled() -> bool:
@@ -600,6 +652,26 @@ def _memory_selection_stage_preview(memory_selection: dict[str, Any] | None) -> 
                 "message_text": _as_text(entry.get("message_text")),
             }
         )
+    progressive_payload = _coerce_dict(selection.get("progressive_recall"))
+    rounds_raw = progressive_payload.get("rounds")
+    rounds = rounds_raw if isinstance(rounds_raw, list) else []
+    progressive_rounds_preview: list[dict[str, Any]] = []
+    for round_item in rounds[:6]:
+        round_data = _coerce_dict(round_item)
+        progressive_rounds_preview.append(
+            {
+                "round": round_data.get("round"),
+                "time_window_hours": round_data.get("time_window_hours"),
+                "scope_topic": round_data.get("scope_topic"),
+                "semantic_hits": round_data.get("semantic_hits"),
+                "timeline_hits": round_data.get("timeline_hits"),
+                "candidate_count": round_data.get("candidate_count"),
+                "best_history_id": round_data.get("best_history_id"),
+                "best_score": round_data.get("best_score"),
+                "found": round_data.get("found"),
+            }
+        )
+
     return {
         "schema": selection.get("schema", "ryo.memory_recall.v1"),
         "mode": selection.get("mode"),
@@ -610,6 +682,18 @@ def _memory_selection_stage_preview(memory_selection: dict[str, Any] | None) -> 
         "candidates_considered": selection.get("candidates_considered"),
         "selected_count": selection.get("selected_count", len(selected_preview)),
         "selected": selected_preview,
+        "progressive_recall": {
+            "enabled": progressive_payload.get("enabled"),
+            "used": _as_bool(selection.get("progressive_used"), False),
+            "found": progressive_payload.get("found"),
+            "found_round": progressive_payload.get("found_round"),
+            "decision_reason": progressive_payload.get("decision_reason"),
+            "target_history_id": progressive_payload.get("target_history_id"),
+            "target_context_index": progressive_payload.get("target_context_index"),
+            "target_score": progressive_payload.get("target_score"),
+            "round_count": len(rounds),
+            "rounds": progressive_rounds_preview,
+        },
     }
 
 
@@ -1230,6 +1314,8 @@ def _select_memory_recall(
         ),
     )
     min_score = max(0.0, _coerce_float(directive.get("min_score"), _runtime_float("retrieval.memory_min_score", 0.65)))
+    progressive_used = False
+    progressive_result: dict[str, Any] = {}
 
     records = history_messages if isinstance(history_messages, list) else []
     candidates_considered = min(len(records), max(1, _runtime_int("retrieval.memory_candidate_limit", 30)))
@@ -1259,6 +1345,8 @@ def _select_memory_recall(
                 "routing_note": circuit.get("routing_note"),
                 "small_talk_turn": small_talk_turn,
             },
+            "progressive_used": False,
+            "progressive_recall": {},
         }
 
     if small_talk_turn and not history_recall_requested:
@@ -1277,12 +1365,76 @@ def _select_memory_recall(
                 "routing_note": circuit.get("routing_note"),
                 "small_talk_turn": small_talk_turn,
             },
+            "progressive_used": False,
+            "progressive_recall": {},
         }
 
     if recall_scope == "none":
         history_search_allowed = False
 
     query_text = _as_text(current_message)
+    progressive_requested = history_recall_requested or _as_bool(
+        directive.get("progressive_recall"),
+        False,
+    )
+    progressive_config_payload = _progressive_history_runtime_payload(max_selected_override=max_items)
+    progressive_enabled = _as_bool(progressive_config_payload.get("enabled"), True)
+    if (
+        progressive_enabled
+        and progressive_requested
+        and history_search_allowed
+        and bool(query_text)
+        and chat_host_id is not None
+        and _as_text(chat_type)
+        and _as_text(platform)
+    ):
+        progressive_used = True
+        explorer = ProgressiveHistoryExplorer(
+            chat_history_manager=chatHistory,
+            config=ProgressiveHistoryExplorerConfig.from_runtime(progressive_config_payload),
+        )
+        progressive_result = explorer.explore(
+            query_text=query_text,
+            chat_host_id=chat_host_id,
+            chat_type=_as_text(chat_type),
+            platform=_as_text(platform),
+            topic_id=topic_id,
+            history_recall_requested=history_recall_requested,
+            switched=switched,
+            allow_history_search=history_search_allowed,
+        )
+        progressive_selected_raw = progressive_result.get("selected")
+        progressive_selected = progressive_selected_raw if isinstance(progressive_selected_raw, list) else []
+        progressive_found = _as_bool(progressive_result.get("found"), False)
+        if progressive_selected and (progressive_found or history_recall_requested):
+            selected = progressive_selected[:max_items]
+            rounds_raw = progressive_result.get("rounds")
+            rounds = rounds_raw if isinstance(rounds_raw, list) else []
+            return {
+                "schema": "ryo.memory_recall.v1",
+                "mode": mode,
+                "recall_scope": recall_scope,
+                "history_search_allowed": history_search_allowed,
+                "selected": selected,
+                "selected_count": len(selected),
+                "candidates_considered": sum(
+                    _safe_int(_coerce_dict(item).get("candidate_count"), 0) for item in rounds
+                ),
+                "decision_reason": _as_text(
+                    progressive_result.get("decision_reason"),
+                    "progressive_recall_selected",
+                ),
+                "selection_threshold": min_score,
+                "topic_transition": transition,
+                "memory_circuit": {
+                    "active_topic": circuit.get("active_topic"),
+                    "routing_note": circuit.get("routing_note"),
+                    "small_talk_turn": small_talk_turn,
+                },
+                "progressive_used": True,
+                "progressive_recall": progressive_result,
+            }
+
     query_tokens = set(_tokenize_topic_text(query_text))
     semantic_boost = {}
     if recall_scope in {"semantic", "hybrid"}:
@@ -1375,6 +1527,8 @@ def _select_memory_recall(
             "routing_note": circuit.get("routing_note"),
             "small_talk_turn": small_talk_turn,
         },
+        "progressive_used": progressive_used,
+        "progressive_recall": progressive_result,
     }
 
 
@@ -3627,6 +3781,58 @@ def chatHistorySearch(queryString: str, count: int = 2, runtime_context: dict | 
     scoped_time_window = switch_window_hours if (switched and not history_recall_requested) else None
 
     scopedSearch = bool(context.get("chat_host_id") is not None or context.get("chat_type") or context.get("platform"))
+    progressive_tool_enabled = _runtime_bool("retrieval.progressive_history_tool_enabled", True)
+    if (
+        progressive_tool_enabled
+        and scopedSearch
+        and _as_text(queryString)
+        and context.get("chat_host_id") is not None
+        and _as_text(context.get("chat_type"))
+        and _as_text(context.get("platform"))
+    ):
+        progressive_config_payload = _progressive_history_runtime_payload(max_selected_override=max(1, int(count)))
+        explorer = ProgressiveHistoryExplorer(
+            chat_history_manager=chatHistory,
+            config=ProgressiveHistoryExplorerConfig.from_runtime(progressive_config_payload),
+        )
+        progressive_result = explorer.explore(
+            query_text=queryString,
+            chat_host_id=context.get("chat_host_id"),
+            chat_type=_as_text(context.get("chat_type")),
+            platform=_as_text(context.get("platform")),
+            topic_id=context.get("topic_id"),
+            history_recall_requested=history_recall_requested,
+            switched=switched,
+            allow_history_search=_as_bool(context.get("history_search_allowed"), True),
+        )
+        progressive_selected_raw = progressive_result.get("selected")
+        progressive_selected = progressive_selected_raw if isinstance(progressive_selected_raw, list) else []
+        if progressive_selected and (
+            _as_bool(progressive_result.get("found"), False) or history_recall_requested
+        ):
+            converted_results: list[dict[str, Any]] = []
+            for result in progressive_selected[: max(1, int(count))]:
+                row = _coerce_dict(result)
+                converted_results.append(
+                    {
+                        "history_id": row.get("history_id"),
+                        "message_id": row.get("message_id"),
+                        "message_text": row.get("message_text"),
+                        "message_timestamp": row.get("timestamp_utc"),
+                        "score": row.get("score"),
+                        "signals": _coerce_dict(row.get("signals")),
+                        "role": _as_text(row.get("role")),
+                    }
+                )
+            logger.debug(
+                "Chat history tool used progressive recall:\n"
+                f"query={queryString}\n"
+                f"scope_chat_host={context.get('chat_host_id')}\n"
+                f"found={progressive_result.get('found')}\n"
+                f"selected={len(converted_results)}"
+            )
+            return converted_results
+
     results = chatHistory.searchChatHistory(
         text=queryString,
         limit=max(1, int(count)),
