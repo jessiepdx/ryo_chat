@@ -443,7 +443,7 @@ class MemberManager:
                     connection.commit()
                     logger.info("Owner account added.")
                 else:
-                    logger.info(f"There are {rowCount.get("total_members")} registered users.")
+                    logger.info(f"There are {rowCount.get('total_members')} registered users.")
                 
                 connection.commit()
                 # Close the cursor
