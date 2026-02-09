@@ -47,6 +47,21 @@ class TestPersonalityEngine(unittest.TestCase):
         merged = engine.apply_analysis_style(analysis_payload=payload, profile=profile)
         self.assertEqual(merged["response_style"]["tone"], "professional")
         self.assertEqual(merged["response_style"]["length"], "detailed")
+        self.assertEqual(merged["response_style"]["verbosity"], "detailed")
+
+    def test_apply_analysis_style_maps_extended_verbosity(self):
+        engine = PersonalityEngine()
+        payload = {"response_style": {}}
+        profile = {
+            "effective": {
+                "tone": "friendly",
+                "verbosity": "savant",
+                "reading_level": "advanced",
+            }
+        }
+        merged = engine.apply_analysis_style(analysis_payload=payload, profile=profile)
+        self.assertEqual(merged["response_style"]["verbosity"], "savant")
+        self.assertEqual(merged["response_style"]["length"], "detailed")
 
     def test_tone_adaptation_uses_requested_ladder(self):
         engine = PersonalityEngine()

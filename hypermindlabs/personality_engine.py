@@ -13,7 +13,7 @@ import re
 from typing import Any
 
 
-_VERBOSITY_LEVELS = ("brief", "standard", "detailed")
+_VERBOSITY_LEVELS = ("brief", "standard", "detailed", "aspie", "exhaustive", "savant")
 _READING_LEVELS = ("simple", "moderate", "advanced")
 _TONE_LEVELS = ("friendly", "annoyed", "sarcastic", "aggressive", "vile")
 _FORMAT_LEVELS = ("plain", "markdown_light")
@@ -311,6 +311,12 @@ class PersonalityEngine:
             behavior_rules.append("Prefer concise replies unless user asks for depth.")
         elif verbosity == "detailed":
             behavior_rules.append("Provide fuller explanations with clear structure.")
+        elif verbosity == "aspie":
+            behavior_rules.append("Use highly technical detail, explicit assumptions, and precision-first wording.")
+        elif verbosity == "exhaustive":
+            behavior_rules.append("Cover all major facets, edge cases, and tradeoffs in a structured response.")
+        elif verbosity == "savant":
+            behavior_rules.append("Deliver maximal depth with rigorous stepwise reasoning and dense technical context.")
         if effective.get("reading_level") == "simple":
             behavior_rules.append("Use simple wording and shorter sentences.")
         if effective.get("emoji") == "off":
@@ -407,10 +413,12 @@ class PersonalityEngine:
         analysis = _coerce_dict(analysis_payload)
         response_style = _coerce_dict(analysis.get("response_style"))
         length_hint = _as_text(response_style.get("length")).lower()
-        if length_hint == "concise":
+        if length_hint in {"very_short", "short", "concise"}:
             verbosity_score = min(verbosity_score, 0.25)
-        elif length_hint in {"detailed", "long"}:
+        elif length_hint in {"detailed", "long", "medium"}:
             verbosity_score = max(verbosity_score, 0.78)
+        elif length_hint in {"exhaustive", "savant", "very_long", "deep"}:
+            verbosity_score = max(verbosity_score, 0.95)
 
         complexity_hint = "moderate"
         if reading_score < 0.33:
@@ -431,11 +439,17 @@ class PersonalityEngine:
         }
 
     def _score_to_verbosity(self, score: float) -> str:
-        if score < 0.35:
+        if score < 0.2:
             return "brief"
-        if score < 0.72:
+        if score < 0.4:
             return "standard"
-        return "detailed"
+        if score < 0.58:
+            return "detailed"
+        if score < 0.74:
+            return "aspie"
+        if score < 0.88:
+            return "exhaustive"
+        return "savant"
 
     def _score_to_reading_level(self, score: float) -> str:
         if score < 0.35:
@@ -592,12 +606,14 @@ class PersonalityEngine:
 
         if tone:
             response_style["tone"] = tone
+        if verbosity:
+            response_style["verbosity"] = verbosity
         if verbosity == "brief":
             response_style["length"] = "concise"
-        elif verbosity == "detailed":
+        elif verbosity in {"detailed", "aspie", "exhaustive", "savant"}:
             response_style["length"] = "detailed"
         elif not _as_text(response_style.get("length")):
-            response_style["length"] = "standard"
+            response_style["length"] = "medium"
         payload["response_style"] = response_style
         return payload
 

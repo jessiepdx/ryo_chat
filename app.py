@@ -2538,7 +2538,7 @@ ROUTE_CONFIG_SPECS: dict[str, RouteConfigSpec] = {
                         value_type="string",
                         description="Default verbosity for new personality profiles.",
                         default_runtime_path="personality.default_verbosity",
-                        choices=("brief", "standard", "detailed"),
+                        choices=("brief", "standard", "detailed", "aspie", "exhaustive", "savant"),
                         env_override_keys=("RYO_PERSONALITY_DEFAULT_VERBOSITY",),
                     ),
                     RouteSettingSpec(
