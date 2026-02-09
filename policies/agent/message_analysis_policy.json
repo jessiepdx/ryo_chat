@@ -1,6 +1,7 @@
 {
   "allow_custom_system_prompt": false,
   "allowed_models": [
-    "gemma3:4b"
+    "gemma3:4b",
+    "qwen3-vl:latest"
   ]
 }

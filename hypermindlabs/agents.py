@@ -2117,6 +2117,44 @@ class ToolCallingAgent():
         except Exception as error:  # noqa: BLE001
             logger.warning(f"Tool runtime stage callback failed [{record['stage']}]: {error}")
 
+    def _candidate_model_names_for_tool_retry(self, routing: dict[str, Any]) -> list[str]:
+        attempted = set(_as_string_list(routing.get("attempted_models")))
+        available = _as_string_list(routing.get("available_models"))
+        candidates: list[str] = []
+
+        def add(name: Any) -> None:
+            model_name = _as_text(name)
+            if not model_name:
+                return
+            lowered = model_name.lower()
+            if "embed" in lowered:
+                return
+            if model_name in attempted:
+                return
+            if model_name in candidates:
+                return
+            candidates.append(model_name)
+
+        # Prioritize explicit runtime defaults first, then policy chain, then discovered inventory.
+        add(_runtime_value("inference.default_tool_model", ""))
+        add(_runtime_value("inference.default_chat_model", ""))
+        add(_runtime_value("inference.default_multimodal_model", ""))
+        for model_name in self._allowed_models:
+            add(model_name)
+        for model_name in available:
+            add(model_name)
+
+        limit = _runtime_int("tool_runtime.auto_model_retry_candidate_limit", 6)
+        if limit <= 0:
+            limit = 6
+        return candidates[:limit]
+
+    def _record_model_error_summary(self, error: Exception, routing: dict[str, Any]) -> None:
+        self._executionSummary["model_error"] = {
+            "message": str(error),
+            "routing": _coerce_dict(routing),
+        }
+
     async def generateResponse(self):
         logger.info(f"Generate a response for the tool calling agent.")
 
@@ -2131,10 +2169,58 @@ class ToolCallingAgent():
             )
         except ModelExecutionError as error:
             logger.error(f"Tool calling model execution failed:\n{error}")
-            logger.error(f"Routing metadata:\n{getattr(error, 'metadata', {})}")
-            return list()
+            initialRouting = _routing_from_error(error)
+            logger.error(f"Routing metadata:\n{initialRouting}")
+            self._routing = _coerce_dict(initialRouting)
+            retryCandidates = self._candidate_model_names_for_tool_retry(initialRouting)
+            if not retryCandidates:
+                self._record_model_error_summary(error, initialRouting)
+                return list()
+            logger.warning(
+                "Tool calling model failed; retrying with dynamic fallback candidates:\n"
+                f"{retryCandidates}"
+            )
+            try:
+                self._response, self._routing = await self._modelRouter.chat_with_fallback(
+                    capability="tool",
+                    requested_model=None,
+                    allowed_models=retryCandidates,
+                    messages=self._messages,
+                    stream=False,
+                    tools=self._modelTools,
+                )
+                self._executionSummary["model_fallback"] = {
+                    "trigger": "primary_tool_model_failed",
+                    "candidates": retryCandidates,
+                    "selected_model": _coerce_dict(self._routing).get("selected_model"),
+                    "success": True,
+                }
+            except ModelExecutionError as retryError:
+                retryRouting = _routing_from_error(retryError)
+                logger.error(f"Tool fallback model execution failed:\n{retryError}")
+                logger.error(f"Fallback routing metadata:\n{retryRouting}")
+                self._routing = _coerce_dict(retryRouting)
+                self._executionSummary["model_fallback"] = {
+                    "trigger": "primary_tool_model_failed",
+                    "candidates": retryCandidates,
+                    "selected_model": None,
+                    "success": False,
+                }
+                self._record_model_error_summary(retryError, retryRouting)
+                return list()
+            except Exception as retryError:  # noqa: BLE001
+                logger.error(f"Tool fallback model execution failed unexpectedly:\n{retryError}")
+                self._executionSummary["model_fallback"] = {
+                    "trigger": "primary_tool_model_failed",
+                    "candidates": retryCandidates,
+                    "selected_model": None,
+                    "success": False,
+                }
+                self._record_model_error_summary(retryError, initialRouting)
+                return list()
         except Exception as error:  # noqa: BLE001
             logger.error(f"Tool calling model execution failed unexpectedly:\n{error}")
+            self._record_model_error_summary(error, self._routing)
             return list()
 
         logger.info(f"Tool calling route metadata:\n{self._routing}")

@@ -449,6 +449,11 @@ class TelegramStageStatus:
             return "Determining whether tools are needed for this request."
 
         if stage == "tools.complete":
+            model_error = self._extract_from_meta_json(meta, "summary", "model_error")
+            if isinstance(model_error, dict):
+                error_message = str(model_error.get("message") or "").strip()
+                if error_message:
+                    return self._truncate_text(f"Tool stage degraded: {error_message}", 320)
             executed = meta.get("executed_tool_calls")
             if isinstance(executed, int):
                 tool_names = self._extract_from_meta_json(meta, "summary", "executed_tools")
