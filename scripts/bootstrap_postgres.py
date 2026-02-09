@@ -391,6 +391,48 @@ def _docker_container_host_port(name: str, container_port: str = "5432/tcp") -> 
     return value if value else None
 
 
+def _docker_bridge_network_failure(error_text: str) -> bool:
+    message = str(error_text or "").lower()
+    return (
+        "unable to enable direct access filtering" in message
+        or ("iptables" in message and "table does not exist" in message)
+        or "can't initialize iptables table `raw'" in message
+    )
+
+
+def _docker_run_args(
+    target: BootstrapTarget,
+    *,
+    image: str,
+    container_name: str,
+    volume: str | None,
+    network_mode: str,
+) -> list[str]:
+    run_args = [
+        "docker",
+        "run",
+        "-d",
+        "--name",
+        container_name,
+        "-e",
+        f"POSTGRES_DB={target.db_name}",
+        "-e",
+        f"POSTGRES_USER={target.user}",
+        "-e",
+        f"POSTGRES_PASSWORD={target.password}",
+    ]
+    if network_mode == "host":
+        run_args.extend(["--network", "host"])
+    else:
+        run_args.extend(["-p", f"{target.port}:5432"])
+    if volume:
+        run_args.extend(["-v", volume])
+    run_args.append(image)
+    if network_mode == "host":
+        run_args.extend(["-c", f"port={target.port}"])
+    return run_args
+
+
 def _resolve_docker_host_port(
     target: BootstrapTarget,
     *,
@@ -490,10 +532,32 @@ def _ensure_docker_container(
         exists = False
         running = False
 
-    # Existing containers without published host ports cannot be reused for app startup.
+    # Existing containers without published host ports may still be valid when running with
+    # host networking. Try to start/probe before forcing recreation.
     if exists:
         mapped_port = _docker_container_host_port(container_name)
         if not mapped_port:
+            if not running:
+                start_probe = _docker_exec(["docker", "start", container_name])
+                if start_probe.returncode == 0:
+                    running = True
+                elif _docker_bridge_network_failure(start_probe.stderr):
+                    print(
+                        f"[{target.label}] existing container '{container_name}' failed bridge start; "
+                        "will recreate using host network mode."
+                    )
+                else:
+                    raise RuntimeError(start_probe.stderr.strip() or f"failed to start container {container_name}")
+            if running:
+                try:
+                    _wait_for_target_accepting_connections(target, retries=max(1, retries), retry_delay=retry_delay)
+                    print(
+                        f"Docker container already running with host/network-specific port behavior: "
+                        f"{container_name} (target port: {target.port})"
+                    )
+                    return True
+                except Exception:  # noqa: BLE001
+                    pass
             print(
                 f"[{target.label}] existing container '{container_name}' has no published host port; recreating."
             )
@@ -506,13 +570,25 @@ def _ensure_docker_container(
     if exists and not running:
         start = _docker_exec(["docker", "start", container_name])
         if start.returncode != 0:
-            raise RuntimeError(start.stderr.strip() or f"failed to start container {container_name}")
-        mapped_port = _docker_container_host_port(container_name)
-        if mapped_port:
-            target.port = mapped_port
-        _wait_for_target_accepting_connections(target, retries=max(1, retries), retry_delay=retry_delay)
-        print(f"Started existing docker container: {container_name} (host port: {target.port})")
-        return True
+            if _docker_bridge_network_failure(start.stderr):
+                print(
+                    f"[{target.label}] existing container '{container_name}' failed bridge networking start; "
+                    "recreating with host network mode."
+                )
+                rm = _docker_exec(["docker", "rm", "-f", container_name])
+                if rm.returncode != 0:
+                    raise RuntimeError(rm.stderr.strip() or f"failed to remove container {container_name}")
+                exists = False
+                running = False
+            else:
+                raise RuntimeError(start.stderr.strip() or f"failed to start container {container_name}")
+        else:
+            mapped_port = _docker_container_host_port(container_name)
+            if mapped_port:
+                target.port = mapped_port
+            _wait_for_target_accepting_connections(target, retries=max(1, retries), retry_delay=retry_delay)
+            print(f"Started existing docker container: {container_name} (host port: {target.port})")
+            return True
 
     if exists and running:
         mapped_port = _docker_container_host_port(container_name)
@@ -522,33 +598,49 @@ def _ensure_docker_container(
         print(f"Docker container already running: {container_name} (host port: {target.port})")
         return True
 
-    run_args = [
-        "docker",
-        "run",
-        "-d",
-        "--name",
-        container_name,
-        "-e",
-        f"POSTGRES_DB={target.db_name}",
-        "-e",
-        f"POSTGRES_USER={target.user}",
-        "-e",
-        f"POSTGRES_PASSWORD={target.password}",
-        "-p",
-        f"{target.port}:5432",
-    ]
-    if volume:
-        run_args.extend(["-v", volume])
-    run_args.append(image)
-
+    network_mode = "bridge"
+    run_args = _docker_run_args(
+        target,
+        image=image,
+        container_name=container_name,
+        volume=volume,
+        network_mode=network_mode,
+    )
     result = _docker_exec(run_args)
+    if result.returncode != 0 and _docker_bridge_network_failure(result.stderr):
+        print(
+            f"[{target.label}] bridge networking failed due host iptables/kernel constraints; "
+            "retrying docker launch with host network mode."
+        )
+        if _docker_container_exists(container_name):
+            rm = _docker_exec(["docker", "rm", "-f", container_name])
+            if rm.returncode != 0:
+                raise RuntimeError(rm.stderr.strip() or f"failed to remove container {container_name}")
+        network_mode = "host"
+        run_args = _docker_run_args(
+            target,
+            image=image,
+            container_name=container_name,
+            volume=volume,
+            network_mode=network_mode,
+        )
+        result = _docker_exec(run_args)
+
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"failed to launch docker container {container_name}")
-    mapped_port = _docker_container_host_port(container_name)
-    if mapped_port:
-        target.port = mapped_port
+
+    if network_mode == "bridge":
+        mapped_port = _docker_container_host_port(container_name)
+        if mapped_port:
+            target.port = mapped_port
     _wait_for_target_accepting_connections(target, retries=max(1, retries), retry_delay=retry_delay)
-    print(f"Created docker container: {container_name} ({image}) on host port {target.port}")
+    if network_mode == "host":
+        print(
+            f"Created docker container: {container_name} ({image}) using host network "
+            f"on port {target.port}"
+        )
+    else:
+        print(f"Created docker container: {container_name} ({image}) on host port {target.port}")
     return True
 
 
