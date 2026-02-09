@@ -16,6 +16,7 @@
 # IMPORTS #
 ###########
 
+import asyncio
 import copy
 from datetime import datetime, timedelta, timezone
 import inspect
@@ -89,6 +90,7 @@ timezone(-timedelta(hours=7), "Pacific")
 _CONTROL_PLANE_MANAGER_CACHE: dict[str, dict[str, Any]] = {}
 _CONTROL_PLANE_POLICY_CACHE: dict[str, dict[str, Any]] = {}
 _CONTROL_PLANE_PROMPT_CACHE: dict[str, dict[str, Any]] = {}
+_TOOL_CAPABILITY_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def _runtime_int(path: str, default: int) -> int:
@@ -116,6 +118,43 @@ def _control_plane_cache_ttl_seconds() -> float:
     if ttl <= 0:
         return 0.0
     return max(0.25, float(ttl))
+
+
+def _normalize_model_name(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _looks_like_embedding_model(model_name: str) -> bool:
+    lowered = _normalize_model_name(model_name).lower()
+    return "embed" in lowered if lowered else False
+
+
+def _dedupe_models(candidates: list[Any]) -> list[str]:
+    ordered: list[str] = []
+    for raw_name in candidates:
+        model_name = _normalize_model_name(raw_name)
+        if not model_name:
+            continue
+        if model_name in ordered:
+            continue
+        ordered.append(model_name)
+    return ordered
+
+
+def _runtime_model_list(path: str, default: list[str] | None = None) -> list[str]:
+    raw_value = _runtime_value(path, default if default is not None else [])
+    if isinstance(raw_value, list):
+        return _dedupe_models(raw_value)
+    if isinstance(raw_value, str):
+        separators = [",", "\n", ";"]
+        parts = [raw_value]
+        for separator in separators:
+            expanded: list[str] = []
+            for part in parts:
+                expanded.extend(part.split(separator))
+            parts = expanded
+        return _dedupe_models(parts)
+    return _dedupe_models(default or [])
 
 
 def _cache_valid(entry: dict[str, Any], ttl_seconds: float) -> bool:
@@ -615,6 +654,7 @@ def _detect_topic_transition(
     keyword_terms = max(1, _runtime_int("topic_shift.keyword_terms", 4))
     min_token_count = max(1, _runtime_int("topic_shift.min_token_count", 3))
     jaccard_threshold = max(0.0, min(1.0, _runtime_float("topic_shift.jaccard_switch_threshold", 0.18)))
+    low_token_switch_enabled = _runtime_bool("topic_shift.low_token_switch_enabled", True)
 
     current_text = _as_text(current_message)
     previous_text = _last_user_message_text(history_messages)
@@ -631,11 +671,17 @@ def _detect_topic_transition(
     else:
         jaccard_similarity = 1.0
 
-    explicit_switch = any(re.search(pattern, current_text.lower()) for pattern in _TOPIC_SHIFT_PATTERNS)
     lexical_switch = (
-        len(current_tokens) >= min_token_count
+        len(current_tokens) >= max(1, min_token_count - 1)
         and len(previous_tokens) >= min_token_count
         and jaccard_similarity <= jaccard_threshold
+        and not small_talk_turn
+    )
+    low_token_switch = (
+        low_token_switch_enabled
+        and len(current_tokens) >= 1
+        and len(previous_tokens) >= max(1, min_token_count - 1)
+        and jaccard_similarity <= max(0.0, jaccard_threshold * 0.6)
         and not small_talk_turn
     )
 
@@ -657,13 +703,13 @@ def _detect_topic_transition(
         confidence = "high"
     elif not previous_text:
         reason = "no_prior_user_message"
-    elif explicit_switch and to_topic != from_topic:
-        switched = True
-        reason = "explicit_switch_signal"
-        confidence = "high"
     elif lexical_switch and to_topic != from_topic:
         switched = True
         reason = "lexical_divergence"
+        confidence = "medium"
+    elif low_token_switch and to_topic != from_topic:
+        switched = True
+        reason = "low_token_divergence"
         confidence = "medium"
 
     if switched:
@@ -703,6 +749,7 @@ def _build_memory_circuit(
     keyword_terms = max(1, _runtime_int("topic_shift.keyword_terms", 4))
     recent_user_messages_limit = max(1, _runtime_int("topic_shift.recent_user_messages", 6))
     deweight_history_on_switch = _runtime_bool("topic_shift.deweight_history_search_on_switch", True)
+    allow_recent_topic_fallback = _runtime_bool("topic_shift.allow_recent_topic_fallback", False)
 
     recent_user_messages: list[str] = []
     for record in reversed(history_messages or []):
@@ -727,12 +774,18 @@ def _build_memory_circuit(
     active_topic = _as_text(transition.get("to_topic"))
     if not active_topic or active_topic == "general":
         active_topic = _topic_label(current_message, max_terms=keyword_terms, fallback="general")
-    if (not active_topic or active_topic == "general") and recent_user_topics:
-        active_topic = recent_user_topics[-1]
-
     switched = _as_bool(transition.get("switched"), False)
     history_recall_requested = _as_bool(transition.get("history_recall_requested"), False) or _history_recall_requested(current_message)
     small_talk_turn = _as_bool(transition.get("small_talk_turn"), False) or _is_small_talk_message(current_message)
+    if (
+        (not active_topic or active_topic == "general")
+        and recent_user_topics
+        and allow_recent_topic_fallback
+        and not switched
+        and not small_talk_turn
+    ):
+        active_topic = recent_user_topics[-1]
+
     history_search_allowed = bool(history_recall_requested or not (switched and deweight_history_on_switch))
     if small_talk_turn and not history_recall_requested:
         active_topic = "general"
@@ -864,6 +917,9 @@ def _select_memory_recall(
     history_recall_requested = _as_bool(circuit.get("history_recall_requested"), False)
     small_talk_turn = _as_bool(circuit.get("small_talk_turn"), False)
     switched = _as_bool(transition.get("switched"), False)
+    min_overlap_default = max(0.0, min(1.0, _runtime_float("topic_shift.history_min_overlap_default", 0.08)))
+    min_overlap_on_switch = max(0.0, min(1.0, _runtime_float("topic_shift.history_min_overlap_on_switch", 0.22)))
+    required_overlap = min_overlap_on_switch if (switched and not history_recall_requested) else min_overlap_default
 
     if max_items <= 0 or not records:
         reason = "max_items_zero" if max_items <= 0 else "no_history_candidates"
@@ -943,11 +999,17 @@ def _select_memory_recall(
         if recall_scope == "semantic":
             lexical_overlap = lexical_overlap * 0.6
 
+        if not history_recall_requested and required_overlap > 0.0:
+            if switched and lexical_overlap < required_overlap:
+                continue
+            if lexical_overlap < required_overlap and semantic_weight < 0.55:
+                continue
+
         score = (lexical_overlap * 2.2) + (semantic_weight * 1.4) + (recency_weight * 0.5)
         if role == "user":
             score += 0.08
-        if switched and not history_recall_requested and lexical_overlap < 0.2:
-            score -= 0.35
+        if switched and not history_recall_requested and lexical_overlap < max(required_overlap, 0.2):
+            score -= 0.25
 
         scored.append(
             {
@@ -2318,6 +2380,7 @@ class ToolCallingAgent():
         attempted = set(_as_string_list(routing.get("attempted_models")))
         available = _as_string_list(routing.get("available_models"))
         candidates: list[str] = []
+        enforce_capability = _runtime_bool("tool_runtime.enforce_native_tool_capability", True)
 
         def add(name: Any) -> None:
             model_name = _as_text(name)
@@ -2329,6 +2392,8 @@ class ToolCallingAgent():
             if model_name in attempted:
                 return
             if model_name in candidates:
+                return
+            if enforce_capability and self._cached_tool_capability(model_name) is False:
                 return
             candidates.append(model_name)
 
@@ -2345,6 +2410,127 @@ class ToolCallingAgent():
         if limit <= 0:
             limit = 6
         return candidates[:limit]
+
+    def _tool_capability_cache_key(self, model_name: str) -> str:
+        host = self._modelRouter.resolve_host("tool")
+        return f"{host}|{model_name}"
+
+    def _cached_tool_capability(self, model_name: str) -> bool | None:
+        cache_key = self._tool_capability_cache_key(model_name)
+        entry = _TOOL_CAPABILITY_CACHE.get(cache_key)
+        if not isinstance(entry, dict):
+            return None
+        ttl_seconds = max(5.0, _runtime_float("tool_runtime.tool_capability_probe_cache_ttl_seconds", 21600.0))
+        cached_at = float(entry.get("cached_at") or 0.0)
+        if (time.monotonic() - cached_at) > ttl_seconds:
+            _TOOL_CAPABILITY_CACHE.pop(cache_key, None)
+            return None
+        capable = entry.get("capable")
+        if isinstance(capable, bool):
+            return capable
+        return None
+
+    def _remember_tool_capability(self, model_name: str, *, capable: bool, reason: str = "") -> None:
+        cleaned_model = _normalize_model_name(model_name)
+        if not cleaned_model:
+            return
+        cache_key = self._tool_capability_cache_key(cleaned_model)
+        _TOOL_CAPABILITY_CACHE[cache_key] = {
+            "cached_at": time.monotonic(),
+            "capable": bool(capable),
+            "reason": _as_text(reason),
+        }
+
+    async def _probe_native_tool_capability(self, model_name: str) -> bool:
+        cached = self._cached_tool_capability(model_name)
+        if isinstance(cached, bool):
+            return cached
+
+        model_name = _normalize_model_name(model_name)
+        if not model_name:
+            return False
+        if not self._modelTools:
+            self._remember_tool_capability(model_name, capable=True, reason="no_tools_registered")
+            return True
+
+        host = self._modelRouter.resolve_host("tool")
+        client = AsyncClient(host=host)
+        probe_tools = [self._modelTools[0]]
+        probe_messages = [
+            Message(
+                role="system",
+                content=(
+                    "Native tool capability probe. "
+                    "Call exactly one available tool with minimal valid arguments and no prose."
+                ),
+            ),
+            Message(role="user", content="Probe native tool calling support."),
+        ]
+        timeout_seconds = max(0.5, _runtime_float("tool_runtime.tool_capability_probe_timeout_seconds", 3.0))
+        try:
+            response = await asyncio.wait_for(
+                client.chat(
+                    model=model_name,
+                    messages=probe_messages,
+                    stream=False,
+                    tools=probe_tools,
+                    options={"temperature": 0, "num_predict": 32},
+                ),
+                timeout=timeout_seconds,
+            )
+            response_message = getattr(response, "message", None)
+            tool_calls = list(getattr(response_message, "tool_calls", []) or [])
+            capable = bool(tool_calls)
+            reason = "probe_tool_calls_present" if capable else "probe_missing_tool_calls"
+            self._remember_tool_capability(model_name, capable=capable, reason=reason)
+            return capable
+        except asyncio.TimeoutError:
+            self._remember_tool_capability(model_name, capable=False, reason="probe_timeout")
+            return False
+        except Exception as error:  # noqa: BLE001
+            capable = False
+            routing = {"errors": [str(error)], "selected_model": model_name}
+            if not self._is_tool_capability_failure(error, routing):
+                logger.warning(f"Tool capability probe failed for model '{model_name}': {error}")
+            self._remember_tool_capability(model_name, capable=capable, reason=f"probe_error:{error}")
+            return capable
+
+    async def _resolve_native_tool_candidates(self, candidates: list[str]) -> list[str]:
+        ordered = [name for name in _dedupe_models(candidates) if not _looks_like_embedding_model(name)]
+        if not ordered:
+            return []
+
+        if not _runtime_bool("tool_runtime.enforce_native_tool_capability", True):
+            return ordered
+        if not _runtime_bool("tool_runtime.tool_capability_probe_enabled", True):
+            return ordered
+
+        known_capable: list[str] = []
+        unknown: list[str] = []
+        for model_name in ordered:
+            cached = self._cached_tool_capability(model_name)
+            if cached is True:
+                known_capable.append(model_name)
+            elif cached is None:
+                unknown.append(model_name)
+
+        if known_capable:
+            return known_capable
+
+        probe_limit = _runtime_int("tool_runtime.tool_capability_probe_max_models", 3)
+        if probe_limit <= 0:
+            probe_limit = 3
+        probes = 0
+        for model_name in unknown:
+            if probes >= probe_limit:
+                break
+            probes += 1
+            if await self._probe_native_tool_capability(model_name):
+                known_capable.append(model_name)
+
+        if known_capable:
+            return known_capable
+        return []
 
     def _record_model_error_summary(self, error: Exception, routing: dict[str, Any]) -> None:
         self._executionSummary["model_error"] = {
@@ -2719,22 +2905,76 @@ class ToolCallingAgent():
     async def generateResponse(self):
         logger.info(f"Generate a response for the tool calling agent.")
         used_pseudo_tool_fallback = False
+        enforce_native_capability = _runtime_bool("tool_runtime.enforce_native_tool_capability", True)
+        native_allowed_models = list(self._allowed_models)
+        if enforce_native_capability:
+            native_allowed_models = await self._resolve_native_tool_candidates(native_allowed_models)
+        requested_tool_model = self._model if self._model in native_allowed_models else (native_allowed_models[0] if native_allowed_models else None)
+
+        if enforce_native_capability and not native_allowed_models:
+            self._routing = {
+                "capability": "tool",
+                "requested_model": self._model,
+                "selected_model": None,
+                "allowed_models": list(self._allowed_models),
+                "candidate_models": [],
+                "errors": ["No native tool-capable model candidates available."],
+            }
+            pseudo_calls, pseudo_text, pseudo_routing = await self._pseudo_tool_fallback(
+                base_routing=self._routing,
+                trigger_error=RuntimeError("no_tool_capable_models_available"),
+            )
+            if pseudo_calls is not None:
+                self._response = SimpleNamespace(
+                    message=SimpleNamespace(content=pseudo_text, tool_calls=pseudo_calls)
+                )
+                if pseudo_routing:
+                    self._routing = pseudo_routing
+                used_pseudo_tool_fallback = True
+                self._executionSummary["model_fallback"] = {
+                    "trigger": "no_tool_capable_models",
+                    "mode": "pseudo_structured_output",
+                    "selected_model": _coerce_dict(self._routing).get("selected_model"),
+                    "success": True,
+                }
+            else:
+                self._executionSummary["model_fallback"] = {
+                    "trigger": "no_tool_capable_models",
+                    "mode": "pseudo_structured_output",
+                    "selected_model": None,
+                    "success": False,
+                }
+                return list()
 
         try:
-            self._response, self._routing = await self._modelRouter.chat_with_fallback(
-                capability="tool",
-                requested_model=self._model,
-                allowed_models=self._allowed_models,
-                messages=self._messages,
-                stream=False,
-                tools=self._modelTools,
-            )
+            if not used_pseudo_tool_fallback:
+                self._response, self._routing = await self._modelRouter.chat_with_fallback(
+                    capability="tool",
+                    requested_model=requested_tool_model,
+                    allowed_models=native_allowed_models or self._allowed_models,
+                    messages=self._messages,
+                    stream=False,
+                    tools=self._modelTools,
+                )
         except ModelExecutionError as error:
             logger.error(f"Tool calling model execution failed:\n{error}")
             initialRouting = _routing_from_error(error)
             logger.error(f"Routing metadata:\n{initialRouting}")
             self._routing = _coerce_dict(initialRouting)
             if self._is_tool_capability_failure(error, initialRouting):
+                attempted_for_capability = _as_string_list(initialRouting.get("attempted_models"))
+                attempted_for_capability.extend(
+                    [
+                        _as_text(initialRouting.get("selected_model")),
+                        _as_text(initialRouting.get("requested_model")),
+                    ]
+                )
+                for attempted_model in _dedupe_models(attempted_for_capability):
+                    self._remember_tool_capability(
+                        attempted_model,
+                        capable=False,
+                        reason="runtime_tool_capability_error",
+                    )
                 pseudo_calls, pseudo_text, pseudo_routing = await self._pseudo_tool_fallback(
                     base_routing=initialRouting,
                     trigger_error=error,
@@ -2818,6 +3058,25 @@ class ToolCallingAgent():
         responseMessage = getattr(self._response, "message", None)
         rawToolCalls = list(getattr(responseMessage, "tool_calls", []) or [])
         modelOutputText = _as_text(getattr(responseMessage, "content", ""))
+        selected_model_name = _as_text(_coerce_dict(self._routing).get("selected_model"))
+
+        if selected_model_name and rawToolCalls:
+            self._remember_tool_capability(
+                selected_model_name,
+                capable=True,
+                reason="native_tool_calls_present",
+            )
+        elif (
+            selected_model_name
+            and not used_pseudo_tool_fallback
+            and self._analysis_requires_tools()
+            and not rawToolCalls
+        ):
+            self._remember_tool_capability(
+                selected_model_name,
+                capable=False,
+                reason="missing_tool_calls_when_tools_required",
+            )
 
         if not rawToolCalls and not used_pseudo_tool_fallback and self._analysis_requires_tools():
             logger.warning(
@@ -3588,6 +3847,15 @@ def resolveAllowedModels(policyName: str, policy: dict) -> list[str]:
             models = [name for name in models if name != preferred]
         models.insert(0, preferred)
 
+    if policyName == "tool_calling":
+        runtimeToolDefault = _normalize_model_name(_runtime_value("inference.default_tool_model", ""))
+        runtimeToolCapable = _runtime_model_list("inference.tool_capable_models", [])
+        runtimeChatDefault = _normalize_model_name(_runtime_value("inference.default_chat_model", ""))
+        toolOrdered = _dedupe_models(
+            [runtimeToolDefault, *runtimeToolCapable, *models, runtimeChatDefault]
+        )
+        models = [name for name in toolOrdered if not _looks_like_embedding_model(name)]
+
     if models:
         return models
 
@@ -3598,9 +3866,22 @@ def resolveAllowedModels(policyName: str, policy: dict) -> list[str]:
             if isinstance(modelName, str) and modelName.strip():
                 models.append(modelName.strip())
 
+    if policyName == "tool_calling":
+        runtimeToolDefault = _normalize_model_name(_runtime_value("inference.default_tool_model", ""))
+        runtimeToolCapable = _runtime_model_list("inference.tool_capable_models", [])
+        runtimeChatDefault = _normalize_model_name(_runtime_value("inference.default_chat_model", ""))
+        toolOrdered = _dedupe_models(
+            [runtimeToolDefault, *runtimeToolCapable, *models, runtimeChatDefault]
+        )
+        models = [name for name in toolOrdered if not _looks_like_embedding_model(name)]
+
     if models:
         return models
 
+    if policyName == "tool_calling":
+        toolFallback = _normalize_model_name(_runtime_value("inference.default_tool_model", ""))
+        if toolFallback:
+            return [toolFallback]
     return [str(_runtime_value("inference.default_chat_model", "llama3.2:latest"))]
 
 

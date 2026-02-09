@@ -20,6 +20,7 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "default_chat_model": "llama3.2:latest",
         "default_tool_model": "llama3.2:latest",
         "default_multimodal_model": "llama3.2-vision:latest",
+        "tool_capable_models": [],
         "model_context_window": 4096,
         "probe_timeout_seconds": 3.0,
         "embedding_timeout_seconds": 12.0,
@@ -46,6 +47,11 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "default_max_retries": 1,
         "auto_model_retry_candidate_limit": 6,
         "pseudo_tool_candidate_limit": 6,
+        "enforce_native_tool_capability": True,
+        "tool_capability_probe_enabled": True,
+        "tool_capability_probe_timeout_seconds": 3.0,
+        "tool_capability_probe_cache_ttl_seconds": 21600.0,
+        "tool_capability_probe_max_models": 3,
         "brave_timeout_seconds": 10.0,
         "chat_history_timeout_seconds": 6.0,
         "knowledge_timeout_seconds": 6.0,
@@ -111,6 +117,10 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "history_window_hours_on_switch": 2,
         "trim_temporal_history_on_small_talk": True,
         "small_talk_history_limit": 2,
+        "allow_recent_topic_fallback": False,
+        "history_min_overlap_default": 0.08,
+        "history_min_overlap_on_switch": 0.22,
+        "low_token_switch_enabled": True,
     },
     "security": {
         "password_min_length": 12,
@@ -201,6 +211,7 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "inference.default_chat_model": (("RYO_DEFAULT_CHAT_MODEL", "OLLAMA_CHAT_MODEL"), "str"),
     "inference.default_tool_model": (("RYO_DEFAULT_TOOL_MODEL", "OLLAMA_TOOL_MODEL"), "str"),
     "inference.default_multimodal_model": (("RYO_DEFAULT_MULTIMODAL_MODEL", "OLLAMA_MULTIMODAL_MODEL"), "str"),
+    "inference.tool_capable_models": (("RYO_TOOL_CAPABLE_MODELS",), "csv"),
     "inference.model_context_window": (("RYO_INFERENCE_CONTEXT_WINDOW",), "int"),
     "inference.probe_timeout_seconds": (("RYO_OLLAMA_PROBE_TIMEOUT_SECONDS",), "float"),
     "inference.embedding_timeout_seconds": (("RYO_OLLAMA_EMBED_TIMEOUT_SECONDS",), "float"),
@@ -223,6 +234,11 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "tool_runtime.default_max_retries": (("RYO_TOOL_RUNTIME_DEFAULT_MAX_RETRIES",), "int"),
     "tool_runtime.auto_model_retry_candidate_limit": (("RYO_TOOL_RUNTIME_AUTO_MODEL_RETRY_CANDIDATE_LIMIT",), "int"),
     "tool_runtime.pseudo_tool_candidate_limit": (("RYO_TOOL_RUNTIME_PSEUDO_TOOL_CANDIDATE_LIMIT",), "int"),
+    "tool_runtime.enforce_native_tool_capability": (("RYO_TOOL_RUNTIME_ENFORCE_NATIVE_CAPABILITY",), "bool"),
+    "tool_runtime.tool_capability_probe_enabled": (("RYO_TOOL_RUNTIME_CAPABILITY_PROBE_ENABLED",), "bool"),
+    "tool_runtime.tool_capability_probe_timeout_seconds": (("RYO_TOOL_RUNTIME_CAPABILITY_PROBE_TIMEOUT_SECONDS",), "float"),
+    "tool_runtime.tool_capability_probe_cache_ttl_seconds": (("RYO_TOOL_RUNTIME_CAPABILITY_PROBE_CACHE_TTL_SECONDS",), "float"),
+    "tool_runtime.tool_capability_probe_max_models": (("RYO_TOOL_RUNTIME_CAPABILITY_PROBE_MAX_MODELS",), "int"),
     "tool_runtime.brave_timeout_seconds": (("RYO_TOOL_RUNTIME_BRAVE_TIMEOUT_SECONDS",), "float"),
     "tool_runtime.chat_history_timeout_seconds": (("RYO_TOOL_RUNTIME_CHAT_HISTORY_TIMEOUT_SECONDS",), "float"),
     "tool_runtime.knowledge_timeout_seconds": (("RYO_TOOL_RUNTIME_KNOWLEDGE_TIMEOUT_SECONDS",), "float"),
@@ -292,6 +308,10 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "topic_shift.history_window_hours_on_switch": (("RYO_TOPIC_SHIFT_HISTORY_WINDOW_HOURS_ON_SWITCH",), "int"),
     "topic_shift.trim_temporal_history_on_small_talk": (("RYO_TOPIC_SHIFT_TRIM_TEMPORAL_ON_SMALL_TALK",), "bool"),
     "topic_shift.small_talk_history_limit": (("RYO_TOPIC_SHIFT_SMALL_TALK_HISTORY_LIMIT",), "int"),
+    "topic_shift.allow_recent_topic_fallback": (("RYO_TOPIC_SHIFT_ALLOW_RECENT_TOPIC_FALLBACK",), "bool"),
+    "topic_shift.history_min_overlap_default": (("RYO_TOPIC_SHIFT_HISTORY_MIN_OVERLAP_DEFAULT",), "float"),
+    "topic_shift.history_min_overlap_on_switch": (("RYO_TOPIC_SHIFT_HISTORY_MIN_OVERLAP_ON_SWITCH",), "float"),
+    "topic_shift.low_token_switch_enabled": (("RYO_TOPIC_SHIFT_LOW_TOKEN_SWITCH_ENABLED",), "bool"),
     "security.password_min_length": (("RYO_PASSWORD_MIN_LENGTH",), "int"),
     "vectors.embedding_dimensions": (("RYO_VECTOR_DIMENSIONS",), "int"),
     "retrieval.conversation_short_history_limit": (("RYO_RETRIEVAL_SHORT_HISTORY_LIMIT",), "int"),
@@ -344,6 +364,14 @@ def _coerce_env_value(raw_value: str, value_type: str) -> Any:
         return float(raw_value)
     if value_type == "bool":
         return _parse_bool(raw_value)
+    if value_type == "csv":
+        values: list[str] = []
+        for item in raw_value.split(","):
+            cleaned = item.strip()
+            if not cleaned or cleaned in values:
+                continue
+            values.append(cleaned)
+        return values
     return raw_value
 
 
