@@ -527,27 +527,104 @@ def _print_command_output(prefix: str, text: str, *, max_lines: int = 24) -> Non
         print(f"{prefix}... ({remaining} additional line(s) omitted)")
 
 
-def ensure_database_route_ready(
+def _database_route_is_healthy(status: dict[str, Any]) -> bool:
+    value = str(status.get("status", "unknown")).strip().lower()
+    return value in {"primary", "fallback"}
+
+
+def _parse_env_line(line: str) -> tuple[str | None, str | None]:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None, None
+    key, value = stripped.split("=", 1)
+    return key.strip(), value
+
+
+def _upsert_env_values(path: Path, updates: dict[str, str]) -> bool:
+    normalized_updates = {str(key).strip(): str(value) for key, value in updates.items() if str(key).strip()}
+    if not normalized_updates:
+        return False
+
+    lines: list[str] = []
+    if path.exists():
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+
+    key_to_index: dict[str, int] = {}
+    for idx, line in enumerate(lines):
+        key, _ = _parse_env_line(line)
+        if key:
+            key_to_index[key] = idx
+
+    changed = False
+    for key, value in normalized_updates.items():
+        rendered = f"{key}={value}"
+        if key in key_to_index:
+            existing_idx = key_to_index[key]
+            if lines[existing_idx] != rendered:
+                lines[existing_idx] = rendered
+                changed = True
+        else:
+            lines.append(rendered)
+            changed = True
+
+    if changed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            for line in lines:
+                handle.write(line + "\n")
+    return changed
+
+
+def _sync_db_env_from_config(config_data: dict[str, Any]) -> bool:
+    primary = config_data.get("database")
+    fallback = config_data.get("database_fallback")
+    if not isinstance(primary, dict):
+        primary = {}
+    if not isinstance(fallback, dict):
+        fallback = {}
+
+    updates: dict[str, str] = {}
+    primary_map = {
+        "db_name": "POSTGRES_DB",
+        "user": "POSTGRES_USER",
+        "password": "POSTGRES_PASSWORD",
+        "host": "POSTGRES_HOST",
+        "port": "POSTGRES_PORT",
+    }
+    for config_key, env_key in primary_map.items():
+        value = str(primary.get(config_key, "")).strip()
+        if value:
+            updates[env_key] = value
+
+    updates["POSTGRES_FALLBACK_ENABLED"] = "true" if bool(fallback.get("enabled", False)) else "false"
+    fallback_map = {
+        "mode": "POSTGRES_FALLBACK_MODE",
+        "db_name": "POSTGRES_FALLBACK_DB",
+        "user": "POSTGRES_FALLBACK_USER",
+        "password": "POSTGRES_FALLBACK_PASSWORD",
+        "host": "POSTGRES_FALLBACK_HOST",
+        "port": "POSTGRES_FALLBACK_PORT",
+    }
+    for config_key, env_key in fallback_map.items():
+        value = str(fallback.get(config_key, "")).strip()
+        if value:
+            updates[env_key] = value
+
+    return _upsert_env_values(ENV_FILE, updates)
+
+
+def _run_database_bootstrap_attempt(
     *,
     config_data: dict[str, Any],
     runtime_settings: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    db_status = read_database_route_status(config_data=config_data, runtime_settings=runtime_settings)
-    status_value = str(db_status.get("status", "unknown")).strip().lower()
-    if status_value not in {"failed_all", "error"}:
-        return config_data, runtime_settings, db_status
-
-    auto_bootstrap = bool(get_runtime_setting(runtime_settings, "database.auto_bootstrap_on_app_start", True))
-    if not auto_bootstrap:
-        print("[db] Auto-bootstrap disabled (`runtime.database.auto_bootstrap_on_app_start=false`).")
-        return config_data, runtime_settings, db_status
-
-    if not _is_local_bootstrap_candidate(config_data):
-        print("[db] Route unhealthy and local auto-bootstrap criteria not met; leaving DB config unchanged.")
-        return config_data, runtime_settings, db_status
-
-    use_docker = bool(get_runtime_setting(runtime_settings, "database.auto_bootstrap_use_docker", True))
-    target = _bootstrap_target_from_config(config_data)
+    target: str,
+    use_docker: bool,
+    attempt_index: int,
+    attempt_count: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], subprocess.CompletedProcess[str]]:
     command = [
         sys.executable,
         "-m",
@@ -561,35 +638,97 @@ def ensure_database_route_ready(
         command.append("--docker")
 
     print(
-        "[db] Route unhealthy "
-        f"(status={db_status.get('status')}, target={db_status.get('active_target')}). "
-        f"Attempting auto-bootstrap (target={target}, docker={'yes' if use_docker else 'no'})."
+        "[db] Auto-bootstrap attempt "
+        f"{attempt_index}/{attempt_count}: target={target}, docker={'yes' if use_docker else 'no'}."
     )
     result = run_command(command, cwd=PROJECT_ROOT, check=False, capture_output=True)
     _print_command_output("[db/bootstrap] ", result.stdout or "")
     _print_command_output("[db/bootstrap] ", result.stderr or "")
 
-    config_data = load_config()
-    runtime_settings = build_runtime_settings(config_data=config_data)
-    refreshed_status = read_database_route_status(config_data=config_data, runtime_settings=runtime_settings)
-    refreshed_value = str(refreshed_status.get("status", "unknown")).strip().lower()
-    if result.returncode == 0 and refreshed_value in {"primary", "fallback"}:
-        print(
-            "[db] Auto-bootstrap recovered database route "
-            f"(status={refreshed_status.get('status')}, target={refreshed_status.get('active_target')})."
+    refreshed_config = load_config()
+    refreshed_runtime = build_runtime_settings(config_data=refreshed_config)
+    refreshed_status = read_database_route_status(
+        config_data=refreshed_config,
+        runtime_settings=refreshed_runtime,
+    )
+    if _database_route_is_healthy(refreshed_status):
+        _sync_db_env_from_config(refreshed_config)
+    return refreshed_config, refreshed_runtime, refreshed_status, result
+
+
+def ensure_database_route_ready(
+    *,
+    config_data: dict[str, Any],
+    runtime_settings: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    db_status = read_database_route_status(config_data=config_data, runtime_settings=runtime_settings)
+    if _database_route_is_healthy(db_status):
+        return config_data, runtime_settings, db_status
+
+    auto_bootstrap = bool(get_runtime_setting(runtime_settings, "database.auto_bootstrap_on_app_start", True))
+    if not auto_bootstrap:
+        print("[db] Auto-bootstrap disabled (`runtime.database.auto_bootstrap_on_app_start=false`).")
+        return config_data, runtime_settings, db_status
+
+    if not _is_local_bootstrap_candidate(config_data):
+        print("[db] Route unhealthy and local auto-bootstrap criteria not met; leaving DB config unchanged.")
+        return config_data, runtime_settings, db_status
+
+    target = _bootstrap_target_from_config(config_data)
+    preferred_mode = bool(get_runtime_setting(runtime_settings, "database.auto_bootstrap_use_docker", True))
+    docker_available = shutil.which("docker") is not None
+    modes: list[bool] = [preferred_mode]
+    alternate_mode = not preferred_mode
+    if alternate_mode not in modes:
+        modes.append(alternate_mode)
+
+    filtered_modes: list[bool] = []
+    for mode in modes:
+        if mode and not docker_available:
+            continue
+        if mode not in filtered_modes:
+            filtered_modes.append(mode)
+    if not filtered_modes:
+        filtered_modes = [False]
+
+    print(
+        "[db] Route unhealthy "
+        f"(status={db_status.get('status')}, target={db_status.get('active_target')}). "
+        f"Starting auto-recovery attempts (target={target})."
+    )
+
+    last_status = db_status
+    for idx, mode in enumerate(filtered_modes, start=1):
+        config_data, runtime_settings, refreshed_status, result = _run_database_bootstrap_attempt(
+            config_data=config_data,
+            runtime_settings=runtime_settings,
+            target=target,
+            use_docker=mode,
+            attempt_index=idx,
+            attempt_count=len(filtered_modes),
         )
-    elif refreshed_value in {"primary", "fallback"}:
+        last_status = refreshed_status
+        if _database_route_is_healthy(refreshed_status):
+            print(
+                "[db] Auto-bootstrap recovered database route "
+                f"(status={refreshed_status.get('status')}, target={refreshed_status.get('active_target')})."
+            )
+            return config_data, runtime_settings, refreshed_status
+
+        mode_label = "docker" if mode else "host"
         print(
-            "[db] Database route became healthy after bootstrap attempt "
-            f"(status={refreshed_status.get('status')}, target={refreshed_status.get('active_target')})."
+            "[db] Auto-bootstrap attempt did not recover route "
+            f"(mode={mode_label}, returncode={result.returncode}, status={refreshed_status.get('status')})."
         )
-    else:
-        error_count = len(refreshed_status.get("errors", []))
-        print(
-            "[db] WARNING: database route still unhealthy after bootstrap attempt "
-            f"(status={refreshed_status.get('status')}, errors={error_count})."
-        )
-    return config_data, runtime_settings, refreshed_status
+
+    error_count = len(last_status.get("errors", []))
+    print(
+        "[db] WARNING: database route remains unhealthy after recovery attempts "
+        f"(status={last_status.get('status')}, errors={error_count})."
+    )
+    if not docker_available:
+        print("[db] Docker not detected on PATH; automatic local container provisioning was skipped.")
+    return config_data, runtime_settings, last_status
 
 
 def ensure_database_migrations(runtime_settings: dict[str, Any]) -> None:
@@ -5508,6 +5647,16 @@ def main() -> int:
 
     ensure_database_migrations(runtime_settings=runtime_settings)
     db_status = read_database_route_status(config_data=config_data, runtime_settings=runtime_settings)
+    db_healthy = _database_route_is_healthy(db_status)
+    if not db_healthy:
+        print(
+            "[db] WARNING: Route is still unhealthy before launcher start "
+            f"(status={db_status.get('status')}, target={db_status.get('active_target')})."
+        )
+        watchdog_settings = runtime_settings.setdefault("watchdog", {})
+        if isinstance(watchdog_settings, dict) and bool(watchdog_settings.get("auto_start_routes", True)):
+            watchdog_settings["auto_start_routes"] = False
+            print("[launcher] Disabled watchdog auto-start because database route is unhealthy.")
 
     state["last_run_epoch"] = int(time.time())
     save_state(state)
