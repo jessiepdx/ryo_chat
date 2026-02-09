@@ -389,6 +389,10 @@ class TelegramStageStatus:
         elif isinstance(tool_calls, int):
             pieces.append(f"tools={tool_calls}")
 
+        execution_mode = self._extract_from_meta_json(meta, "summary", "execution_mode")
+        if isinstance(execution_mode, str) and execution_mode.strip():
+            pieces.append(f"mode={execution_mode.strip()}")
+
         stats = self._extract_stats_payload(meta)
         total_tps = self._coerce_float(stats.get("total_tokens_per_second"))
         completion_tps = self._coerce_float(stats.get("completion_tokens_per_second"))

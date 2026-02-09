@@ -42,6 +42,8 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
     "tool_runtime": {
         "default_timeout_seconds": 8.0,
         "default_max_retries": 1,
+        "auto_model_retry_candidate_limit": 6,
+        "pseudo_tool_candidate_limit": 6,
         "brave_timeout_seconds": 10.0,
         "chat_history_timeout_seconds": 6.0,
         "knowledge_timeout_seconds": 6.0,
@@ -211,6 +213,8 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "database.auto_migrate_on_app_start": (("RYO_DB_AUTO_MIGRATE_ON_START",), "bool"),
     "tool_runtime.default_timeout_seconds": (("RYO_TOOL_RUNTIME_DEFAULT_TIMEOUT_SECONDS",), "float"),
     "tool_runtime.default_max_retries": (("RYO_TOOL_RUNTIME_DEFAULT_MAX_RETRIES",), "int"),
+    "tool_runtime.auto_model_retry_candidate_limit": (("RYO_TOOL_RUNTIME_AUTO_MODEL_RETRY_CANDIDATE_LIMIT",), "int"),
+    "tool_runtime.pseudo_tool_candidate_limit": (("RYO_TOOL_RUNTIME_PSEUDO_TOOL_CANDIDATE_LIMIT",), "int"),
     "tool_runtime.brave_timeout_seconds": (("RYO_TOOL_RUNTIME_BRAVE_TIMEOUT_SECONDS",), "float"),
     "tool_runtime.chat_history_timeout_seconds": (("RYO_TOOL_RUNTIME_CHAT_HISTORY_TIMEOUT_SECONDS",), "float"),
     "tool_runtime.knowledge_timeout_seconds": (("RYO_TOOL_RUNTIME_KNOWLEDGE_TIMEOUT_SECONDS",), "float"),

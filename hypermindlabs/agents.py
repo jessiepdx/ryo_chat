@@ -2155,8 +2155,335 @@ class ToolCallingAgent():
             "routing": _coerce_dict(routing),
         }
 
+    @staticmethod
+    def _is_tool_capability_failure(error: Exception, routing: dict[str, Any]) -> bool:
+        texts = [str(error)]
+        if isinstance(routing, dict):
+            for item in _as_string_list(routing.get("errors")):
+                texts.append(item)
+        normalized = " | ".join(texts).lower()
+        return (
+            "does not support tools" in normalized
+            or ("tool" in normalized and "status code: 400" in normalized)
+            or "unsupported tool" in normalized
+        )
+
+    def _candidate_model_names_for_pseudo_tooling(self, routing: dict[str, Any]) -> list[str]:
+        available = _as_string_list(routing.get("available_models"))
+        attempted = _as_string_list(routing.get("attempted_models"))
+        candidates: list[str] = []
+
+        def add(name: Any) -> None:
+            model_name = _as_text(name)
+            if not model_name:
+                return
+            lowered = model_name.lower()
+            if "embed" in lowered:
+                return
+            if model_name in candidates:
+                return
+            candidates.append(model_name)
+
+        add(routing.get("selected_model"))
+        add(routing.get("requested_model"))
+        for model_name in attempted:
+            add(model_name)
+        add(_runtime_value("inference.default_chat_model", ""))
+        add(_runtime_value("inference.default_tool_model", ""))
+        add(_runtime_value("inference.default_multimodal_model", ""))
+        for model_name in self._allowed_models:
+            add(model_name)
+        for model_name in available:
+            add(model_name)
+
+        limit = _runtime_int("tool_runtime.pseudo_tool_candidate_limit", 6)
+        if limit <= 0:
+            limit = 6
+        return candidates[:limit]
+
+    def _pseudo_tool_catalog(self) -> list[dict[str, Any]]:
+        catalog: list[dict[str, Any]] = []
+        for entry in self._modelTools:
+            if not isinstance(entry, dict):
+                continue
+            function_payload = _coerce_dict(entry.get("function"))
+            name = _as_text(function_payload.get("name"))
+            if not name:
+                continue
+            parameters = _coerce_dict(function_payload.get("parameters"))
+            properties = _coerce_dict(parameters.get("properties"))
+            required = [str(item).strip() for item in parameters.get("required", []) if str(item).strip()]
+            catalog.append(
+                {
+                    "name": name,
+                    "description": _as_text(function_payload.get("description")),
+                    "parameters": {
+                        "properties": properties,
+                        "required": required,
+                    },
+                }
+            )
+        return catalog
+
+    @staticmethod
+    def _json_payload_candidates(raw_text: str) -> list[Any]:
+        raw = _as_text(raw_text)
+        if not raw:
+            return []
+        candidates: list[str] = [raw]
+        fence_pattern = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+        for match in fence_pattern.findall(raw):
+            extracted = _as_text(match)
+            if extracted and extracted not in candidates:
+                candidates.append(extracted)
+        start_obj = raw.find("{")
+        end_obj = raw.rfind("}")
+        if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+            object_slice = raw[start_obj : end_obj + 1]
+            if object_slice not in candidates:
+                candidates.append(object_slice)
+        start_list = raw.find("[")
+        end_list = raw.rfind("]")
+        if start_list != -1 and end_list != -1 and end_list > start_list:
+            list_slice = raw[start_list : end_list + 1]
+            if list_slice not in candidates:
+                candidates.append(list_slice)
+
+        parsed_payloads: list[Any] = []
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            parsed_payloads.append(parsed)
+        return parsed_payloads
+
+    def _extract_pseudo_tool_calls(self, raw_text: str) -> tuple[list[dict[str, Any]], bool]:
+        known_tool_names = set(self._toolSpecs.keys())
+
+        def normalize_call(item: Any) -> dict[str, Any] | None:
+            if not isinstance(item, dict):
+                return None
+            function_payload = _coerce_dict(item.get("function"))
+            call_name = _as_text(function_payload.get("name"))
+            call_args: Any = function_payload.get("arguments", {})
+            if not call_name:
+                call_name = _as_text(item.get("name")) or _as_text(item.get("tool_name")) or _as_text(item.get("tool"))
+                call_args = item.get("arguments", item.get("args", item.get("parameters", {})))
+            if not call_name:
+                return None
+            if known_tool_names and call_name not in known_tool_names:
+                return None
+            if not isinstance(call_args, dict):
+                if isinstance(call_args, str):
+                    try:
+                        parsed = json.loads(call_args)
+                    except json.JSONDecodeError:
+                        parsed = {}
+                    call_args = parsed if isinstance(parsed, dict) else {}
+                else:
+                    call_args = {}
+            return {
+                "function": {
+                    "name": call_name,
+                    "arguments": call_args,
+                }
+            }
+
+        parsed_payload_seen = False
+        for payload in self._json_payload_candidates(raw_text):
+            parsed_payload_seen = True
+            raw_calls: list[Any] = []
+            explicit_empty = False
+            if isinstance(payload, dict):
+                if isinstance(payload.get("tool_calls"), list):
+                    raw_calls = payload.get("tool_calls") or []
+                    if not raw_calls:
+                        explicit_empty = True
+                elif isinstance(payload.get("calls"), list):
+                    raw_calls = payload.get("calls") or []
+                    if not raw_calls:
+                        explicit_empty = True
+                elif isinstance(payload.get("tools"), list):
+                    raw_calls = payload.get("tools") or []
+                    if not raw_calls:
+                        explicit_empty = True
+                elif payload.get("name") or payload.get("tool_name") or payload.get("tool"):
+                    raw_calls = [payload]
+            elif isinstance(payload, list):
+                raw_calls = payload
+                if not raw_calls:
+                    explicit_empty = True
+            else:
+                raw_calls = []
+
+            normalized: list[dict[str, Any]] = []
+            for call_item in raw_calls:
+                call_record = normalize_call(call_item)
+                if call_record is not None:
+                    normalized.append(call_record)
+            if normalized:
+                return normalized, True
+            if explicit_empty:
+                return [], True
+        return [], parsed_payload_seen
+
+    async def _pseudo_tool_fallback(
+        self,
+        *,
+        base_routing: dict[str, Any],
+        trigger_error: Exception,
+    ) -> tuple[list[dict[str, Any]] | None, str, dict[str, Any]]:
+        catalog = self._pseudo_tool_catalog()
+        if not catalog:
+            return None, "", {}
+
+        planner_candidates = self._candidate_model_names_for_pseudo_tooling(base_routing)
+        requested_model = _as_text(base_routing.get("selected_model")) or _as_text(base_routing.get("requested_model"))
+        planner_instruction = (
+            "Native tool calling is unavailable for the active model. "
+            "Plan tool usage using strict JSON only. Output exactly one JSON object with shape: "
+            "{\"tool_calls\": [{\"name\": \"<tool_name>\", \"arguments\": {...}}], \"reason\": \"<short_reason>\"}. "
+            "Use only tool names from the provided catalog. If no tools are needed, return {\"tool_calls\": [], \"reason\": \"...\"}. "
+            "Do not include markdown, prose, comments, or extra keys."
+        )
+        planner_prompt = {
+            "fallback_mode": "pseudo_tool_calling_v1",
+            "error": str(trigger_error),
+            "tool_catalog": catalog,
+        }
+        planner_messages = list(self._messages)
+        planner_messages.append(Message(role="system", content=planner_instruction))
+        planner_messages.append(
+            Message(
+                role="user",
+                content="TOOL CATALOG AND CONSTRAINTS:\n" + json.dumps(planner_prompt, ensure_ascii=False),
+            )
+        )
+        await self._emit_tool_runtime_event(
+            {
+                "stage": "tools.pseudo_fallback.start",
+                "status": "info",
+                "detail": "Attempting pseudo tool-calling fallback via structured output.",
+                "meta": {
+                    "requested_model": requested_model,
+                    "candidate_models": planner_candidates,
+                },
+            }
+        )
+        try:
+            response, routing = await self._modelRouter.chat_with_fallback(
+                capability="chat",
+                requested_model=requested_model or None,
+                allowed_models=planner_candidates,
+                messages=planner_messages,
+                stream=False,
+            )
+        except Exception as pseudo_error:  # noqa: BLE001
+            logger.error(f"Pseudo tool fallback planner failed:\n{pseudo_error}")
+            await self._emit_tool_runtime_event(
+                {
+                    "stage": "tools.pseudo_fallback.complete",
+                    "status": "error",
+                    "detail": "Pseudo tool-calling fallback failed before planning output.",
+                    "meta": {"error": str(pseudo_error)},
+                }
+            )
+            return None, "", {}
+
+        response_message = getattr(response, "message", None)
+        response_text = _as_text(getattr(response_message, "content", ""))
+        pseudo_calls, parsed_ok = self._extract_pseudo_tool_calls(response_text)
+        await self._emit_tool_runtime_event(
+            {
+                "stage": "tools.pseudo_fallback.complete",
+                "status": "info",
+                "detail": f"Pseudo tool planner produced {len(pseudo_calls)} call(s).",
+                "meta": {
+                    "selected_model": _coerce_dict(routing).get("selected_model"),
+                    "tool_calls": len(pseudo_calls),
+                    "parsed_ok": parsed_ok,
+                },
+            }
+        )
+        if not parsed_ok:
+            return None, response_text, _coerce_dict(routing)
+        return pseudo_calls, response_text, _coerce_dict(routing)
+
+    def _collect_requested_tools(self, raw_tool_calls: list[Any]) -> list[dict[str, Any]]:
+        requested_tools: list[dict[str, Any]] = []
+        for tool_call in raw_tool_calls:
+            tool_name = None
+            tool_args: Any = {}
+            if hasattr(tool_call, "function"):
+                tool_name = getattr(tool_call.function, "name", None)
+                tool_args = getattr(tool_call.function, "arguments", {}) or {}
+            elif isinstance(tool_call, dict):
+                function_data = tool_call.get("function")
+                if isinstance(function_data, dict):
+                    tool_name = function_data.get("name")
+                    tool_args = function_data.get("arguments", {}) or {}
+                else:
+                    tool_name = tool_call.get("name")
+                    tool_args = tool_call.get("arguments", {}) or {}
+            requested_tools.append(
+                {
+                    "name": str(tool_name or "unknown"),
+                    "arguments": tool_args,
+                }
+            )
+        return requested_tools
+
+    async def _execute_tool_calls(self, raw_tool_calls: list[Any]) -> list[dict[str, Any]]:
+        tool_results: list[dict[str, Any]] = []
+        for tool in raw_tool_calls:
+            tool_name = None
+            tool_args = None
+            if hasattr(tool, "function"):
+                tool_name = getattr(tool.function, "name", None)
+                tool_args = getattr(tool.function, "arguments", None)
+            elif isinstance(tool, dict):
+                function_data = tool.get("function")
+                if isinstance(function_data, dict):
+                    tool_name = function_data.get("name")
+                    tool_args = function_data.get("arguments")
+                else:
+                    tool_name = tool.get("name")
+                    tool_args = tool.get("arguments")
+
+            logger.debug(
+                "Tool calling agent execution request:\n"
+                f"Tool: {tool_name}\n"
+                f"Arguments: {tool_args}"
+            )
+            tool_result = self._toolRuntime.execute_tool_call(tool)
+            audit_events = tool_result.get("audit")
+            if isinstance(audit_events, list):
+                for audit_event in audit_events:
+                    await self._emit_tool_runtime_event(_coerce_dict(audit_event))
+            if (
+                self._unknownToolBehavior == "ignore"
+                and tool_result.get("status") == "error"
+                and isinstance(tool_result.get("error"), dict)
+                and tool_result.get("error", {}).get("code") == "tool_not_registered"
+            ):
+                logger.warning(
+                    "Ignoring unknown tool call per policy.\n"
+                    f"Tool: {tool_result.get('tool_name')}"
+                )
+                continue
+            tool_results.append(tool_result)
+            if tool_result.get("status") == "error":
+                logger.warning(
+                    "Tool execution degraded gracefully.\n"
+                    f"Tool: {tool_result.get('tool_name')}\n"
+                    f"Error: {tool_result.get('error')}"
+                )
+        return tool_results
+
     async def generateResponse(self):
         logger.info(f"Generate a response for the tool calling agent.")
+        used_pseudo_tool_fallback = False
 
         try:
             self._response, self._routing = await self._modelRouter.chat_with_fallback(
@@ -2172,52 +2499,80 @@ class ToolCallingAgent():
             initialRouting = _routing_from_error(error)
             logger.error(f"Routing metadata:\n{initialRouting}")
             self._routing = _coerce_dict(initialRouting)
-            retryCandidates = self._candidate_model_names_for_tool_retry(initialRouting)
-            if not retryCandidates:
-                self._record_model_error_summary(error, initialRouting)
-                return list()
-            logger.warning(
-                "Tool calling model failed; retrying with dynamic fallback candidates:\n"
-                f"{retryCandidates}"
-            )
-            try:
-                self._response, self._routing = await self._modelRouter.chat_with_fallback(
-                    capability="tool",
-                    requested_model=None,
-                    allowed_models=retryCandidates,
-                    messages=self._messages,
-                    stream=False,
-                    tools=self._modelTools,
+            if self._is_tool_capability_failure(error, initialRouting):
+                pseudo_calls, pseudo_text, pseudo_routing = await self._pseudo_tool_fallback(
+                    base_routing=initialRouting,
+                    trigger_error=error,
                 )
-                self._executionSummary["model_fallback"] = {
-                    "trigger": "primary_tool_model_failed",
-                    "candidates": retryCandidates,
-                    "selected_model": _coerce_dict(self._routing).get("selected_model"),
-                    "success": True,
-                }
-            except ModelExecutionError as retryError:
-                retryRouting = _routing_from_error(retryError)
-                logger.error(f"Tool fallback model execution failed:\n{retryError}")
-                logger.error(f"Fallback routing metadata:\n{retryRouting}")
-                self._routing = _coerce_dict(retryRouting)
-                self._executionSummary["model_fallback"] = {
-                    "trigger": "primary_tool_model_failed",
-                    "candidates": retryCandidates,
-                    "selected_model": None,
-                    "success": False,
-                }
-                self._record_model_error_summary(retryError, retryRouting)
-                return list()
-            except Exception as retryError:  # noqa: BLE001
-                logger.error(f"Tool fallback model execution failed unexpectedly:\n{retryError}")
-                self._executionSummary["model_fallback"] = {
-                    "trigger": "primary_tool_model_failed",
-                    "candidates": retryCandidates,
-                    "selected_model": None,
-                    "success": False,
-                }
-                self._record_model_error_summary(retryError, initialRouting)
-                return list()
+                if pseudo_calls is not None:
+                    self._response = SimpleNamespace(
+                        message=SimpleNamespace(content=pseudo_text, tool_calls=pseudo_calls)
+                    )
+                    if pseudo_routing:
+                        self._routing = pseudo_routing
+                    used_pseudo_tool_fallback = True
+                    self._executionSummary["model_fallback"] = {
+                        "trigger": "tool_capability_unsupported",
+                        "mode": "pseudo_structured_output",
+                        "selected_model": _coerce_dict(self._routing).get("selected_model"),
+                        "success": True,
+                    }
+                else:
+                    self._executionSummary["model_fallback"] = {
+                        "trigger": "tool_capability_unsupported",
+                        "mode": "pseudo_structured_output",
+                        "selected_model": _coerce_dict(self._routing).get("selected_model"),
+                        "success": False,
+                    }
+            if used_pseudo_tool_fallback:
+                logger.info("Tool calling fallback mode active: pseudo structured output.")
+            else:
+                retryCandidates = self._candidate_model_names_for_tool_retry(initialRouting)
+                if not retryCandidates:
+                    self._record_model_error_summary(error, initialRouting)
+                    return list()
+                logger.warning(
+                    "Tool calling model failed; retrying with dynamic fallback candidates:\n"
+                    f"{retryCandidates}"
+                )
+                try:
+                    self._response, self._routing = await self._modelRouter.chat_with_fallback(
+                        capability="tool",
+                        requested_model=None,
+                        allowed_models=retryCandidates,
+                        messages=self._messages,
+                        stream=False,
+                        tools=self._modelTools,
+                    )
+                    self._executionSummary["model_fallback"] = {
+                        "trigger": "primary_tool_model_failed",
+                        "candidates": retryCandidates,
+                        "selected_model": _coerce_dict(self._routing).get("selected_model"),
+                        "success": True,
+                    }
+                except ModelExecutionError as retryError:
+                    retryRouting = _routing_from_error(retryError)
+                    logger.error(f"Tool fallback model execution failed:\n{retryError}")
+                    logger.error(f"Fallback routing metadata:\n{retryRouting}")
+                    self._routing = _coerce_dict(retryRouting)
+                    self._executionSummary["model_fallback"] = {
+                        "trigger": "primary_tool_model_failed",
+                        "candidates": retryCandidates,
+                        "selected_model": None,
+                        "success": False,
+                    }
+                    self._record_model_error_summary(retryError, retryRouting)
+                    return list()
+                except Exception as retryError:  # noqa: BLE001
+                    logger.error(f"Tool fallback model execution failed unexpectedly:\n{retryError}")
+                    self._executionSummary["model_fallback"] = {
+                        "trigger": "primary_tool_model_failed",
+                        "candidates": retryCandidates,
+                        "selected_model": None,
+                        "success": False,
+                    }
+                    self._record_model_error_summary(retryError, initialRouting)
+                    return list()
         except Exception as error:  # noqa: BLE001
             logger.error(f"Tool calling model execution failed unexpectedly:\n{error}")
             self._record_model_error_summary(error, self._routing)
@@ -2225,74 +2580,11 @@ class ToolCallingAgent():
 
         logger.info(f"Tool calling route metadata:\n{self._routing}")
         toolResults = list()
-        requestedTools: list[dict[str, Any]] = []
         responseMessage = getattr(self._response, "message", None)
         rawToolCalls = list(getattr(responseMessage, "tool_calls", []) or [])
-        for toolCall in rawToolCalls:
-            toolName = None
-            toolArgs = {}
-            if hasattr(toolCall, "function"):
-                toolName = getattr(toolCall.function, "name", None)
-                toolArgs = getattr(toolCall.function, "arguments", {}) or {}
-            elif isinstance(toolCall, dict):
-                functionData = toolCall.get("function")
-                if isinstance(functionData, dict):
-                    toolName = functionData.get("name")
-                    toolArgs = functionData.get("arguments", {}) or {}
-                else:
-                    toolName = toolCall.get("name")
-                    toolArgs = toolCall.get("arguments", {}) or {}
-            requestedTools.append(
-                {
-                    "name": str(toolName or "unknown"),
-                    "arguments": toolArgs,
-                }
-            )
-        
+        requestedTools: list[dict[str, Any]] = self._collect_requested_tools(rawToolCalls)
         if rawToolCalls:
-            for tool in rawToolCalls:
-                toolName = None
-                toolArgs = None
-                if hasattr(tool, "function"):
-                    toolName = getattr(tool.function, "name", None)
-                    toolArgs = getattr(tool.function, "arguments", None)
-                elif isinstance(tool, dict):
-                    functionData = tool.get("function")
-                    if isinstance(functionData, dict):
-                        toolName = functionData.get("name")
-                        toolArgs = functionData.get("arguments")
-                    else:
-                        toolName = tool.get("name")
-                        toolArgs = tool.get("arguments")
-
-                logger.debug(
-                    "Tool calling agent execution request:\n"
-                    f"Tool: {toolName}\n"
-                    f"Arguments: {toolArgs}"
-                )
-                toolResult = self._toolRuntime.execute_tool_call(tool)
-                auditEvents = toolResult.get("audit")
-                if isinstance(auditEvents, list):
-                    for auditEvent in auditEvents:
-                        await self._emit_tool_runtime_event(_coerce_dict(auditEvent))
-                if (
-                    self._unknownToolBehavior == "ignore"
-                    and toolResult.get("status") == "error"
-                    and isinstance(toolResult.get("error"), dict)
-                    and toolResult.get("error", {}).get("code") == "tool_not_registered"
-                ):
-                    logger.warning(
-                        "Ignoring unknown tool call per policy.\n"
-                        f"Tool: {toolResult.get('tool_name')}"
-                    )
-                    continue
-                toolResults.append(toolResult)
-                if toolResult.get("status") == "error":
-                    logger.warning(
-                        "Tool execution degraded gracefully.\n"
-                        f"Tool: {toolResult.get('tool_name')}\n"
-                        f"Error: {toolResult.get('error')}"
-                    )
+            toolResults = await self._execute_tool_calls(rawToolCalls)
         modelOutputText = _as_text(getattr(responseMessage, "content", ""))
         if modelOutputText and len(modelOutputText) > 280:
             modelOutputText = modelOutputText[:277].rstrip() + "..."
@@ -2304,6 +2596,7 @@ class ToolCallingAgent():
             for result in toolResults
             if str(result.get("status") or "") == "error"
         ]
+        previousSummary = dict(self._executionSummary) if isinstance(self._executionSummary, dict) else {}
         self._executionSummary = {
             "requested_tool_calls": len(requestedTools),
             "requested_tools": requestedTools,
@@ -2311,7 +2604,11 @@ class ToolCallingAgent():
             "executed_tools": [str(result.get("tool_name") or "unknown") for result in toolResults],
             "tool_errors": toolErrors,
             "model_output_excerpt": modelOutputText,
+            "execution_mode": "pseudo_structured_output" if used_pseudo_tool_fallback else "native_tools",
         }
+        for key in ("model_fallback", "model_error"):
+            if key in previousSummary:
+                self._executionSummary[key] = previousSummary[key]
 
         detail = (
             f"Model returned {len(requestedTools)} tool call(s); executed {len(toolResults)}."
