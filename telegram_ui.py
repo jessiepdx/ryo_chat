@@ -302,6 +302,19 @@ class TelegramStageStatus:
         return text[: max_chars - 3] + "..."
 
     @staticmethod
+    def _looks_like_structured_fragment(text: str) -> bool:
+        candidate = str(text or "").strip()
+        if not candidate:
+            return False
+        if candidate[0] in {"{", "["}:
+            return True
+        if "```" in candidate:
+            return True
+        if ":" in candidate and "{" in candidate:
+            return True
+        return False
+
+    @staticmethod
     def _extract_from_meta_json(meta: dict[str, Any], *path: str) -> Any:
         cursor: Any = meta.get("json")
         for key in path:
@@ -396,13 +409,22 @@ class TelegramStageStatus:
             elif isinstance(total_tokens, int):
                 pieces.append(f"tok={total_tokens}")
 
+        if stage.endswith(".progress"):
+            chunks = meta.get("chunks")
+            chars = meta.get("chars")
+            if isinstance(chunks, int) and chunks >= 0:
+                pieces.append(f"chunks={chunks}")
+            if isinstance(chars, int) and chars >= 0:
+                pieces.append(f"chars={chars}")
+
         # Keep summaries short in stage stream updates.
         summary = " | ".join(piece for piece in pieces if piece)
         return self._truncate_text(summary, 160)
 
     def _human_readable_stage_message(self, stage: str, detail: str, meta: dict[str, Any]) -> str:
         snippet = str(meta.get("snippet") or "").strip()
-        if snippet:
+        snippet_structured = self._looks_like_structured_fragment(snippet)
+        if snippet and not snippet_structured:
             return self._truncate_text(snippet, 320)
 
         if stage == "orchestrator.start":
@@ -410,6 +432,13 @@ class TelegramStageStatus:
 
         if stage == "analysis.start":
             return "Running message analysis and model routing."
+
+        if stage == "analysis.progress":
+            chunks = meta.get("chunks")
+            chars = meta.get("chars")
+            if isinstance(chunks, int) and isinstance(chars, int):
+                return f"Reasoning over intent/topic and routing model ({chunks} chunks, {chars} chars)."
+            return "Reasoning over intent/topic and routing model."
 
         if stage == "tools.model_output":
             excerpt = self._extract_from_meta_json(meta, "execution_summary", "model_output_excerpt")
