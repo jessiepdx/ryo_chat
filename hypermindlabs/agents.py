@@ -841,6 +841,101 @@ def _is_small_talk_message(text: str) -> bool:
     return False
 
 
+def _preflight_tool_intent_signal(message_text: str) -> dict[str, Any]:
+    raw_text = _as_text(message_text)
+    lowered = raw_text.lower()
+    if not lowered:
+        return {
+            "explicit_request": False,
+            "tool_hints": [],
+            "reasons": [],
+            "first_url": "",
+        }
+
+    hints: list[str] = []
+    reasons: list[str] = []
+    explicit_request = False
+
+    def add_hint(hint_name: str) -> None:
+        if hint_name in _ALLOWED_TOOL_HINTS and hint_name not in hints:
+            hints.append(hint_name)
+
+    def add_reason(reason: str) -> None:
+        if reason not in reasons:
+            reasons.append(reason)
+
+    first_url = _extract_first_url(raw_text)
+    if first_url:
+        add_hint("curlRequest")
+        add_reason("direct_url_present")
+        explicit_request = True
+
+    explicit_tool_phrases = (
+        r"\buse (?:a |the )?tool(?:s)?\b",
+        r"\bcall (?:a |the )?tool(?:s)?\b",
+        r"\binvoke (?:a |the )?tool(?:s)?\b",
+        r"\brun (?:a |the )?tool(?:s)?\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in explicit_tool_phrases):
+        add_reason("explicit_tool_phrase")
+        explicit_request = True
+
+    if re.search(r"\bbrave(?:\s+search)?\b", lowered):
+        add_hint("braveSearch")
+        add_reason("brave_search_requested")
+        explicit_request = True
+    if re.search(r"\bcurl\b|\bhttp\s+request\b|\bfetch\s+(?:the\s+)?(?:url|endpoint)\b|\bcall\s+(?:the\s+)?api\b", lowered):
+        add_hint("curlRequest")
+        add_reason("http_fetch_requested")
+        explicit_request = True
+    if re.search(r"\bchat\s+history\b|\bsearch\s+history\b|\bhistory\s+search\b", lowered):
+        add_hint("chatHistorySearch")
+        add_reason("chat_history_requested")
+        explicit_request = True
+    if re.search(r"\bknowledge\s+search\b|\bsearch\s+knowledge\b|\bknowledge\s+base\b|\bkb\b", lowered):
+        add_hint("knowledgeSearch")
+        add_reason("knowledge_search_requested")
+        explicit_request = True
+
+    if re.search(r"\b(search|look\s*up|find|browse|investigate|check)\b", lowered):
+        add_hint("braveSearch")
+        add_reason("research_action_detected")
+        explicit_request = True
+
+    if re.search(r"\b(message|dm|send)\b", lowered) and (
+        "@" in lowered or re.search(r"\b(user|member|username)\b", lowered)
+    ):
+        add_hint("knownUsersList")
+        add_hint("messageKnownUser")
+        add_reason("inter_user_message_requested")
+        explicit_request = True
+
+    if re.search(r"\b(process|workflow|step|resume|continue|progress|outbox)\b", lowered):
+        add_hint("listProcessWorkspace")
+        add_hint("upsertProcessWorkspace")
+        add_hint("updateProcessWorkspaceStep")
+        add_reason("process_workspace_requested")
+        explicit_request = True
+
+    if re.search(r"\blist\s+(users?|members?)\b|\bwho\s+(?:can|is|are)\b", lowered):
+        add_hint("knownUsersList")
+        add_reason("known_user_listing_requested")
+        explicit_request = True
+
+    if explicit_request and not hints:
+        # Keep this generic: trigger lightweight retrieval tooling if user explicitly requests tools
+        # but doesn't name one.
+        add_hint("braveSearch")
+        add_reason("default_research_tool_injected")
+
+    return {
+        "explicit_request": explicit_request,
+        "tool_hints": hints,
+        "reasons": reasons,
+        "first_url": first_url,
+    }
+
+
 def _last_user_message_text(history_messages: list[dict[str, Any]] | None) -> str:
     for record in reversed(history_messages or []):
         if not isinstance(record, dict):
@@ -1971,7 +2066,7 @@ class ConversationOrchestrator:
     async def runAgents(self):
         await self._emit_stage("orchestrator.start", "Accepted request and preparing context.")
         emitProgressStages = _runtime_bool("orchestrator.progress_stage_events_enabled", False)
-        analysisBypassSmallTalk = _runtime_bool("orchestrator.analysis_bypass_small_talk_enabled", True)
+        analysisBypassSmallTalk = _runtime_bool("orchestrator.analysis_bypass_small_talk_enabled", False)
         autoExpandToolStage = _runtime_bool("orchestrator.auto_expand_tool_stage_enabled", True)
         autoExpandMaxRounds = max(0, _runtime_int("orchestrator.auto_expand_max_rounds", 1))
 
@@ -2078,11 +2173,19 @@ class ConversationOrchestrator:
         smallTalkTurn = _as_bool(memoryCircuit.get("small_talk_turn"), False)
         historyRecallRequested = _as_bool(memoryCircuit.get("history_recall_requested"), False)
         workspaceResumeRecommended = _as_bool(workspaceContext.get("resume_recommended"), False)
+        preflightToolIntent = _coerce_dict(_preflight_tool_intent_signal(self._message))
+        preflightToolRequested = _as_bool(preflightToolIntent.get("explicit_request"), False)
+        preflightToolHints = [
+            hint
+            for hint in _as_string_list(preflightToolIntent.get("tool_hints"))
+            if hint in _ALLOWED_TOOL_HINTS and hint != "skipTools"
+        ]
         analysisBypassed = (
             analysisBypassSmallTalk
             and smallTalkTurn
             and not historyRecallRequested
             and not workspaceResumeRecommended
+            and not preflightToolRequested
         )
 
         if analysisBypassed:
@@ -2286,6 +2389,33 @@ class ConversationOrchestrator:
                     json=processDirective,
                 )
 
+        normalizedToolHints = [
+            hint
+            for hint in _as_string_list(normalizedAnalysis.get("tool_hints"))
+            if hint in _ALLOWED_TOOL_HINTS and hint != "skipTools"
+        ]
+        for hint in preflightToolHints:
+            if hint not in normalizedToolHints:
+                normalizedToolHints.append(hint)
+        if normalizedToolHints:
+            normalizedAnalysis["tool_hints"] = normalizedToolHints
+
+        if preflightToolRequested and not _as_bool(normalizedAnalysis.get("needs_tools"), False):
+            normalizedAnalysis["needs_tools"] = True
+            normalizedAnalysis["brevity_directive"] = {
+                "mode": "standard",
+                "reason": "explicit_tool_request_preflight",
+            }
+            await self._emit_stage(
+                "orchestrator.expand",
+                "Escalating to tool stage from explicit user tool request.",
+                json={
+                    "reason": "explicit_tool_request_preflight",
+                    "hints": normalizedToolHints,
+                    "signals": preflightToolIntent.get("reasons"),
+                },
+            )
+
         analysisMessagePayload = {
             "tool_name": "Message Analysis",
             "tool_results": normalizedAnalysis,
@@ -2352,6 +2482,7 @@ class ConversationOrchestrator:
             fastPathEnabled
             and brevityMode == "brief_social"
             and not analysisNeedsTools
+            and not preflightToolRequested
         )
 
         toolResponses: list[dict[str, Any]] = []

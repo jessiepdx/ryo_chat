@@ -103,7 +103,7 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
     "orchestrator": {
         "fast_path_small_talk_enabled": True,
         "fast_path_small_talk_max_chars": 96,
-        "analysis_bypass_small_talk_enabled": True,
+        "analysis_bypass_small_talk_enabled": False,
         "analysis_history_limit": 8,
         "analysis_history_limit_on_switch": 4,
         "analysis_history_limit_small_talk": 2,
