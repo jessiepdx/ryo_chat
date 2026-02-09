@@ -2,241 +2,382 @@
 
 {% block title %}{{ contentData.title }}{% endblock %}
 
-{% block content %}
-<!-- Interface specific imports and input handling, as well as chat history intake api -->
+{% block javascript %}
+<link rel="stylesheet" href="{{ url_for('static', filename='agent-playground/workspace.css') }}" />
+<script type="module" src="{{ url_for('static', filename='agent-playground/workspace.js') }}"></script>
+{% endblock %}
 
+{% block leftPanel %}
+<div id="left-panel" class="panel-section-left">
+    <div class="panel-header">
+        <nav onclick="panelMan.togglePanel('left');">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <g id="Edit / Add_Minus_Square">
+                    <path id="Vector" d="M8 12H16M4 16.8002V7.2002C4 6.08009 4 5.51962 4.21799 5.0918C4.40973 4.71547 4.71547 4.40973 5.0918 4.21799C5.51962 4 6.08009 4 7.2002 4H16.8002C17.9203 4 18.4801 4 18.9079 4.21799C19.2842 4.40973 19.5905 4.71547 19.7822 5.0918C20.0002 5.51962 20.0002 6.07967 20.0002 7.19978V16.7998C20.0002 17.9199 20.0002 18.48 19.7822 18.9078C19.5905 19.2841 19.2842 19.5905 18.9079 19.7822C18.4805 20 17.9215 20 16.8036 20H7.19691C6.07899 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2842 4.21799 18.9079C4 18.4801 4 17.9203 4 16.8002Z" stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                </g>
+            </svg>
+        </nav>
+        <div class="section-auxiliary">
+            <h3>Playground Controls</h3>
+        </div>
+    </div>
+    <div class="panel-content ap-side-layout">
+        <section class="ap-side-card">
+            <h4>Workspace Sections</h4>
+            <ul id="ap-side-sections" class="ap-side-list">
+                {% for section in contentData.sections %}
+                <li>{{ section }}</li>
+                {% endfor %}
+            </ul>
+        </section>
 
-<style>
-    
-  #chat-container {
-    flex: 1;
-    overflow-y: auto;
-    margin:calc(-1 * var(--mini-rem));
-    padding:var(--mini-rem);
-    display:flex;
-    flex-flow:column;
-    gap:var(--mini-rem);
-  }
-  .message {
-    max-width: 80%;
-    padding: 0.8em;
-    border-radius: 6px;
-    line-height: 1.4;
-    word-wrap: break-word;
-  }
-  .user {
-    background-color: var(--accent-dark);
-    border: 1px solid var(--accent-border);
-    align-self: flex-end;
-    margin-left: auto;
-  }
-  .assistant {
-    background-color: var(--accent-ternery);
-    border: 1px solid var(--accent-border);
-    align-self: flex-start;
-    margin-right: auto;
-  }
-  .system {
-    background-color: var(--accent-grey);
-    border: 1px solid var(--accent-border);
-    align-self: center;
-    font-style: italic;
-  }
-  #input-section {
-    display: flex;
-    width:100%;
-  }
-  #user-input {
-    flex: 1;
-    padding: 0.5em;
-    margin-right: 0.5em;
-    background-color: var(--accent-ternery);
+        <section class="ap-side-card">
+            <h4>Requested Model</h4>
+            <p class="ap-side-muted">Type a model name or choose from discovered Ollama models.</p>
+            <div class="ap-model-requested-row">
+                <input id="ap-model-requested-input" type="text" placeholder="qwen3-vl:latest" autocomplete="off" />
+                <select id="ap-model-requested-select">
+                    <option value="">Loading models...</option>
+                </select>
+            </div>
+            <p id="ap-model-source-hint" class="ap-side-muted">Model inventory pending...</p>
+        </section>
 
-  }
-  #send-btn {
-    padding: 0.5em 1em;
-    cursor: pointer;
-    display: flex;
-    flex-flow: column;
-    justify-content: center;
-  }
-</style>
+        <section class="ap-side-card">
+            <h4>Run Hotkeys</h4>
+            <ul class="ap-side-list">
+                <li><code>Ctrl/Cmd + Enter</code> starts a run.</li>
+                <li>Use pane toggles to focus trace/state/artifacts.</li>
+                <li>Select a trace step to inspect exact payloads.</li>
+            </ul>
+        </section>
 
-<!-- Main Area Content -->
+        <section class="ap-side-card">
+            <h4>Agent Definition Builder</h4>
+            <div class="ap-side-inline-grid">
+                <select id="ap-agent-definition-select">
+                    <option value="">Select definition</option>
+                </select>
+                <select id="ap-agent-definition-version">
+                    <option value="">Version</option>
+                </select>
+            </div>
+            <input id="ap-agent-definition-name" type="text" placeholder="Agent name (metadata)" />
+            <input id="ap-agent-change-summary" type="text" placeholder="Version change summary" />
+            <textarea id="ap-agent-definition-json" class="ap-side-json-editor" rows="12" placeholder="Agent definition JSON"></textarea>
+            <div class="ap-side-action-row">
+                <button id="ap-agent-definition-refresh" type="button">Refresh</button>
+                <button id="ap-agent-definition-new" type="button">Create</button>
+                <button id="ap-agent-definition-save-version" type="button">Save Version</button>
+                <button id="ap-agent-definition-rollback" type="button">Rollback</button>
+                <button id="ap-agent-definition-export" type="button">Copy Export</button>
+                <button id="ap-agent-definition-import" type="button">Import JSON</button>
+            </div>
+            <p id="ap-agent-definition-status" class="ap-side-muted">Definition builder idle.</p>
+            <div id="ap-agent-definition-history" class="ap-side-history">No version history yet.</div>
+        </section>
 
+        <section class="ap-side-card">
+            <h4>Tool Registry</h4>
+            <div class="ap-side-inline-grid">
+                <select id="ap-tool-registry-select">
+                    <option value="">Select tool</option>
+                </select>
+                <div id="ap-tool-selected-summary" class="ap-side-muted">builtin</div>
+            </div>
+            <div id="ap-tool-registry-write-hint" class="ap-side-muted">Checking write access...</div>
+            <div id="ap-tool-metadata-form" class="ap-schema-form-inline"></div>
+            <label class="ap-side-label" for="ap-tool-input-schema-json">Input Schema (JSON)</label>
+            <textarea id="ap-tool-input-schema-json" class="ap-side-json-editor" rows="8" placeholder='{"type":"object","properties":{}}'></textarea>
+            <label class="ap-side-label" for="ap-tool-static-result-json">Static Result (JSON, optional)</label>
+            <textarea id="ap-tool-static-result-json" class="ap-side-json-editor" rows="5" placeholder='{"status":"ok"}'></textarea>
+            <div class="ap-side-subhead">Argument Preview Form</div>
+            <div id="ap-tool-arg-preview-form" class="ap-schema-form-inline"></div>
+            <div class="ap-side-action-row">
+                <button id="ap-tool-registry-refresh" type="button">Refresh</button>
+                <button id="ap-tool-registry-new" type="button">New</button>
+                <button id="ap-tool-registry-save" type="button">Save</button>
+                <button id="ap-tool-registry-delete" type="button">Delete</button>
+            </div>
+            <p id="ap-tool-registry-status" class="ap-side-muted">Tool registry idle.</p>
+        </section>
 
-<div id="chat-container">
-    <!-- Chat messages will appear here -->
+        <section class="ap-side-card">
+            <h4>Tool Sandbox Policy</h4>
+            <div class="ap-side-inline-grid">
+                <select id="ap-sandbox-tool-select">
+                    <option value="">Select tool</option>
+                </select>
+                <div id="ap-sandbox-source-label" class="ap-side-muted">builtin</div>
+            </div>
+            <input id="ap-sandbox-tool-name" type="text" placeholder="Tool name" />
+            <div class="ap-side-inline-grid">
+                <label class="ap-side-label" for="ap-sandbox-side-effect">Side Effect</label>
+                <select id="ap-sandbox-side-effect">
+                    <option value="read_only">read_only</option>
+                    <option value="mutating">mutating</option>
+                    <option value="sensitive">sensitive</option>
+                </select>
+            </div>
+            <div class="ap-side-inline-grid">
+                <label><input id="ap-sandbox-approval-required" type="checkbox" /> Require approval</label>
+                <label><input id="ap-sandbox-dry-run" type="checkbox" /> Force dry-run</label>
+            </div>
+            <div class="ap-side-inline-grid">
+                <label class="ap-side-label" for="ap-sandbox-approval-timeout">Approval timeout (s)</label>
+                <input id="ap-sandbox-approval-timeout" type="number" min="1" step="1" value="45" />
+            </div>
+            <div class="ap-side-inline-grid">
+                <label class="ap-side-label" for="ap-sandbox-timeout-ceiling">Exec timeout ceiling (s)</label>
+                <input id="ap-sandbox-timeout-ceiling" type="number" min="0.1" step="0.1" value="30" />
+            </div>
+            <div class="ap-side-inline-grid">
+                <label class="ap-side-label" for="ap-sandbox-max-memory">Max memory (MB)</label>
+                <input id="ap-sandbox-max-memory" type="number" min="16" step="1" value="512" />
+            </div>
+            <div class="ap-side-inline-grid">
+                <label><input id="ap-sandbox-network-enabled" type="checkbox" checked /> Network enabled</label>
+                <select id="ap-sandbox-filesystem-mode">
+                    <option value="none">fs:none</option>
+                    <option value="read_only">fs:read_only</option>
+                    <option value="read_write">fs:read_write</option>
+                </select>
+            </div>
+            <label class="ap-side-label" for="ap-sandbox-network-allowlist">Network allowlist domains</label>
+            <input id="ap-sandbox-network-allowlist" type="text" placeholder="api.search.brave.com, example.com" />
+            <label class="ap-side-label" for="ap-sandbox-filesystem-allowed-paths">Filesystem allowed paths (one per line)</label>
+            <textarea id="ap-sandbox-filesystem-allowed-paths" class="ap-side-json-editor" rows="4" placeholder="/tmp/safe-path"></textarea>
+            <div id="ap-sandbox-write-hint" class="ap-side-muted">Checking write access...</div>
+            <div class="ap-side-action-row">
+                <button id="ap-sandbox-refresh" type="button">Refresh</button>
+                <button id="ap-sandbox-new" type="button">New</button>
+                <button id="ap-sandbox-save" type="button">Save</button>
+                <button id="ap-sandbox-delete" type="button">Delete</button>
+            </div>
+            <p id="ap-sandbox-status" class="ap-side-muted">Sandbox policy idle.</p>
+        </section>
+
+        <section class="ap-side-card">
+            <h4>Approval Queue</h4>
+            <div id="ap-approval-write-hint" class="ap-side-muted">Loading approval permissions...</div>
+            <div class="ap-side-action-row">
+                <button id="ap-approval-refresh" type="button">Refresh Queue</button>
+            </div>
+            <div id="ap-approval-queue-list" class="ap-approval-list">
+                <div class="ap-approval-row ap-approval-row-empty">No pending approvals.</div>
+            </div>
+            <p id="ap-approval-status" class="ap-side-muted">Approval queue idle.</p>
+        </section>
+
+        <section class="ap-side-card">
+            <h4>Tool Test Harness</h4>
+            <div class="ap-side-inline-grid">
+                <select id="ap-tool-harness-case-select">
+                    <option value="">Select case</option>
+                </select>
+                <select id="ap-tool-harness-tool-select">
+                    <option value="">Select tool</option>
+                </select>
+            </div>
+            <input id="ap-tool-harness-fixture-name" type="text" placeholder="Fixture name" />
+            <input id="ap-tool-harness-description" type="text" placeholder="Fixture description (optional)" />
+            <div class="ap-side-inline-grid">
+                <label class="ap-side-label" for="ap-tool-harness-mode">Execution mode</label>
+                <select id="ap-tool-harness-mode">
+                    <option value="real">real</option>
+                    <option value="mock">mock</option>
+                </select>
+            </div>
+            <label class="ap-side-label" for="ap-tool-harness-input-json">Fixture Input (JSON)</label>
+            <textarea id="ap-tool-harness-input-json" class="ap-side-json-editor" rows="7" placeholder='{"queryString":"hello","count":1}'></textarea>
+            <div id="ap-tool-harness-write-hint" class="ap-side-muted">Checking harness permissions...</div>
+            <div class="ap-side-action-row">
+                <button id="ap-tool-harness-refresh" type="button">Refresh</button>
+                <button id="ap-tool-harness-new" type="button">New</button>
+                <button id="ap-tool-harness-save" type="button">Save Case</button>
+                <button id="ap-tool-harness-run" type="button">Run Case</button>
+                <button id="ap-tool-harness-save-golden" type="button">Save Golden</button>
+                <button id="ap-tool-harness-save-contract" type="button">Save Contract</button>
+                <button id="ap-tool-harness-delete" type="button">Delete</button>
+            </div>
+            <p id="ap-tool-harness-status" class="ap-side-muted">Tool harness idle.</p>
+            <pre id="ap-tool-harness-report" class="ap-side-json">No harness report yet.</pre>
+        </section>
+    </div>
+    <div class="panel-footer button-bar">
+        <div class="button-text">Run Setup</div>
+    </div>
 </div>
+{% endblock %}
 
+{% block content %}
+<div id="ap-workspace" data-api-base="/api/agent-playground">
+    <section id="ap-toolbar">
+        <div class="ap-toolbar-group">
+            <label for="ap-run-mode">Run Mode</label>
+            <select id="ap-run-mode"></select>
+            <label for="ap-run-history">Run History</label>
+            <select id="ap-run-history"></select>
+            <button id="ap-start-btn" type="button">Start Run</button>
+            <button id="ap-refresh-btn" type="button">Refresh</button>
+        </div>
+        <div class="ap-toolbar-group" id="ap-pane-controls">
+            <span class="ap-toolbar-label">Panes</span>
+        </div>
+        <div class="ap-toolbar-group">
+            <label for="ap-layout-preset">Layout</label>
+            <select id="ap-layout-preset">
+                <option value="balanced">Balanced</option>
+                <option value="chat_focus">Chat Focus</option>
+                <option value="analysis_focus">Analysis Focus</option>
+            </select>
+            <button id="ap-layout-reset" type="button">Reset Panes</button>
+        </div>
+        <div class="ap-toolbar-group">
+            <span id="ap-run-status">Idle</span>
+            <span id="ap-run-meta">Run: <span id="ap-run-id">-</span></span>
+            <span id="ap-run-mode-meta">Mode: <span id="ap-run-mode-active">-</span></span>
+        </div>
+        <div class="ap-toolbar-group" id="ap-metrics-row">
+            <span class="ap-metric-chip">Total <strong id="ap-metric-total">0</strong></span>
+            <span class="ap-metric-chip">Running <strong id="ap-metric-running">0</strong></span>
+            <span class="ap-metric-chip">Avg(s) <strong id="ap-metric-avg">0</strong></span>
+            <span class="ap-metric-chip">Completed <strong id="ap-metric-completed">0</strong></span>
+            <span class="ap-metric-chip">Failed <strong id="ap-metric-failed">0</strong></span>
+        </div>
+    </section>
 
+    <section class="ap-pane" id="ap-schema-pane">
+        <header class="ap-pane-header">
+            <div class="ap-pane-title">Schema Driven Config</div>
+            <div class="ap-pane-header-actions">
+                <button class="ap-pane-collapse-btn" type="button" data-pane-collapse="schema" aria-expanded="true">Collapse</button>
+            </div>
+        </header>
+        <div class="ap-pane-body">
+            <div class="ap-toolbar-group">
+                <label for="ap-schema-capability">Capability</label>
+                <select id="ap-schema-capability"></select>
+            </div>
+            <form id="ap-schema-form"></form>
+        </div>
+    </section>
 
+    <section id="ap-grid">
+        <article class="ap-pane" id="ap-chat-pane">
+            <header class="ap-pane-header">
+                <div class="ap-pane-title">Chat / Run</div>
+                <div class="ap-pane-header-actions">
+                    <button class="ap-pane-collapse-btn" type="button" data-pane-collapse="chat" aria-expanded="true">Collapse</button>
+                </div>
+            </header>
+            <div class="ap-pane-body" data-pane="chat"></div>
+        </article>
+
+        <article class="ap-pane" id="ap-trace-pane">
+            <header class="ap-pane-header">
+                <div class="ap-pane-title">Trace / Steps</div>
+                <div class="ap-pane-header-actions">
+                    <button class="ap-pane-collapse-btn" type="button" data-pane-collapse="trace" aria-expanded="true">Collapse</button>
+                </div>
+            </header>
+            <div class="ap-pane-body" data-pane="trace"></div>
+        </article>
+
+        <article class="ap-pane" id="ap-state-pane">
+            <header class="ap-pane-header">
+                <div class="ap-pane-title">State</div>
+                <div class="ap-pane-header-actions">
+                    <button class="ap-pane-collapse-btn" type="button" data-pane-collapse="state" aria-expanded="true">Collapse</button>
+                </div>
+            </header>
+            <div class="ap-pane-body" data-pane="state"></div>
+        </article>
+
+        <article class="ap-pane" id="ap-artifacts-pane">
+            <header class="ap-pane-header">
+                <div class="ap-pane-title">Artifacts</div>
+                <div class="ap-pane-header-actions">
+                    <button class="ap-pane-collapse-btn" type="button" data-pane-collapse="artifacts" aria-expanded="true">Collapse</button>
+                </div>
+            </header>
+            <div class="ap-pane-body" data-pane="artifacts"></div>
+        </article>
+
+        <article class="ap-pane" id="ap-inspector-pane">
+            <header class="ap-pane-header">
+                <div class="ap-pane-title">Inspector</div>
+                <div class="ap-pane-header-actions">
+                    <button class="ap-pane-collapse-btn" type="button" data-pane-collapse="inspector" aria-expanded="true">Collapse</button>
+                </div>
+            </header>
+            <div class="ap-pane-body" data-pane="inspector"></div>
+        </article>
+    </section>
+</div>
+{% endblock %}
+
+{% block rightTopPanel %}
+<div id="right-top-panel">
+    <div class="panel-header">
+        <div class="section-auxiliary">
+            <h3>Active Run Snapshot</h3>
+        </div>
+        <nav onclick="panelMan.togglePanel('right');">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <g id="Edit / Add_Minus_Square">
+                    <path id="Vector" d="M8 12H16M4 16.8002V7.2002C4 6.08009 4 5.51962 4.21799 5.0918C4.40973 4.71547 4.71547 4.40973 5.0918 4.21799C5.51962 4 6.08009 4 7.2002 4H16.8002C17.9203 4 18.4801 4 18.9079 4.21799C19.2842 4.40973 19.5905 4.71547 19.7822 5.0918C20.0002 5.51962 20.0002 6.07967 20.0002 7.19978V16.7998C20.0002 17.9199 20.0002 18.48 19.7822 18.9078C19.5905 19.2841 19.2842 19.5905 18.9079 19.7822C18.4805 20 17.9215 20 16.8036 20H7.19691C6.07899 20 5.5192 20 5.0918 19.7822C4.71547 19.5905 4.40973 19.2842 4.21799 18.9079C4 18.4801 4 17.9203 4 16.8002Z" stroke="var(--accent-primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                </g>
+            </svg>
+        </nav>
+    </div>
+    <div class="panel-content ap-side-layout">
+        <div class="ap-side-stat-grid">
+            <span class="ap-side-key">Run ID</span><span id="ap-side-run-id" class="ap-side-value">-</span>
+            <span class="ap-side-key">Status</span><span id="ap-side-run-status" class="ap-side-value">idle</span>
+            <span class="ap-side-key">Mode</span><span id="ap-side-run-mode" class="ap-side-value">-</span>
+            <span class="ap-side-key">Model</span><span id="ap-side-run-model" class="ap-side-value">router default</span>
+            <span class="ap-side-key">Events</span><span id="ap-side-run-events" class="ap-side-value">0</span>
+        </div>
+        <p class="ap-side-muted">Updates in real time from the append-only run stream.</p>
+    </div>
+    <div class="panel-footer button-bar">
+        <div class="button-text">Run Metadata</div>
+    </div>
+</div>
+{% endblock %}
+
+{% block rightBottomPanel %}
+<div id="right-bottom-panel">
+    <div class="panel-header">
+        <div class="section-auxiliary">
+            <h3>Selected Step</h3>
+        </div>
+    </div>
+    <div class="panel-content ap-side-layout">
+        <div class="ap-side-stat-grid">
+            <span class="ap-side-key">Sequence</span><span id="ap-side-event-seq" class="ap-side-value">-</span>
+            <span class="ap-side-key">Event Type</span><span id="ap-side-event-type" class="ap-side-value">-</span>
+            <span class="ap-side-key">Stage</span><span id="ap-side-event-stage" class="ap-side-value">-</span>
+            <span class="ap-side-key">Status</span><span id="ap-side-event-status" class="ap-side-value">-</span>
+        </div>
+        <pre id="ap-side-event-summary" class="ap-side-json">Select a trace row to inspect payload details.</pre>
+    </div>
+    <div class="panel-footer button-bar">
+        <div class="button-text">Trace Inspector</div>
+    </div>
+</div>
 {% endblock %}
 
 {% block footer %}
-<!-- Marked.js for Markdown parsing -->
-<script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
-
-<!-- Highlight.js library: updated from cdnjs so that hljs is defined -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
-
-
-<div id="input-section">
-    <!-- Start with a single-line input; this may be replaced by a textarea -->
-    <input type="text" id="user-input" placeholder="Type a message...">
-    <button id="send-btn">Send</button>
-  </div>
-
-
-<script>
-    // Configure marked for code highlighting.
-    marked.setOptions({
-      highlight: function(code, lang) {
-        if (lang && hljs.getLanguage(lang)) {
-          return hljs.highlight(code, { language: lang }).value;
-        }
-        return hljs.highlightAuto(code).value;
-      }
-    });
-  
-    const chatContainer = document.getElementById('chat-container');
-    const inputSection = document.getElementById('input-section');
-    let userInput = document.getElementById('user-input'); // will be swapped with a textarea if needed
-    const sendBtn = document.getElementById('send-btn');
-  
-    // Append a message to the chat. 'role' should be "system", "assistant", or "user".
-    // 'content' is a markdown string (with code blocks via triple backticks).
-    function addMessage(role, content) {
-      const messageDiv = document.createElement('div');
-      messageDiv.classList.add('message', role);
-      const html = marked.parse(content);
-      messageDiv.innerHTML = html;
-      chatContainer.appendChild(messageDiv);
-      chatContainer.scrollTop = chatContainer.scrollHeight;
-    }
-  
-    // Send the current message and then revert to an input if necessary.
-    function sendMessage() {
-      const text = userInput.value.trim();
-      if (!text) return;
-      addMessage('user', text);
-      userInput.value = '';
-      // After sending, if in textarea mode or text reduces to one line, revert to input.
-      maybeSwitchToInput();
-    }
-  
-    // Switch the current element from an <input> to a <textarea>.
-    function switchToTextarea() {
-      const oldValue = userInput.value;
-      const newEl = document.createElement('textarea');
-      newEl.id = 'user-input';
-      newEl.placeholder = 'Type a message...';
-      newEl.style.flex = '1';
-      newEl.style.padding = '0.5em';
-      newEl.style.marginRight = '0.5em';
-      // Append a newline so the user starts on a new line.
-      newEl.value = oldValue + '\n';
-      attachListeners(newEl);
-      inputSection.replaceChild(newEl, userInput);
-      userInput = newEl;
-      userInput.focus();
-      userInput.setSelectionRange(userInput.value.length, userInput.value.length);
-    }
-  
-    // Switch the current element from a <textarea> back to an <input>.
-    function switchToInput() {
-      const oldValue = userInput.value;
-      const newEl = document.createElement('input');
-      newEl.type = 'text';
-      newEl.id = 'user-input';
-      newEl.placeholder = 'Type a message...';
-      newEl.style.flex = '1';
-      newEl.style.padding = '0.5em';
-      newEl.style.marginRight = '0.5em';
-      // Remove any newline characters so we get a single-line string.
-      newEl.value = oldValue.replace(/\n/g, '');
-      attachListeners(newEl);
-      inputSection.replaceChild(newEl, userInput);
-      userInput = newEl;
-      userInput.focus();
-      userInput.setSelectionRange(userInput.value.length, userInput.value.length);
-    }
-  
-    // Returns true if the given text contains no newline characters.
-    function isSingleLine(text) {
-      return !text.includes('\n');
-    }
-  
-    // Check the content; if it's only a single line, switch back to the input box.
-    function maybeSwitchToInput() {
-      if (userInput.tagName.toLowerCase() === 'textarea' && isSingleLine(userInput.value)) {
-        switchToInput();
-      }
-    }
-  
-    // Attach event listeners to the element (input or textarea)
-    function attachListeners(el) {
-      el.addEventListener('keydown', (e) => {
-        // Branch according to whether we're dealing with an input or textarea.
-        if (el.tagName.toLowerCase() === 'input') {
-          // In input mode, use:
-          // Shift+Enter: switch to textarea.
-          // Enter (no modifiers): send message.
-          if (e.key === 'Enter') {
-            if (e.shiftKey) {
-              e.preventDefault();
-              switchToTextarea();
-            } else {
-              e.preventDefault();
-              sendMessage();
-            }
-          }
-        } else if (el.tagName.toLowerCase() === 'textarea') {
-          // In textarea mode:
-          // Ctrl+Enter sends the message.
-          // Plain Enter (or with Shift) produces a newline.
-          if (e.key === 'Enter' && e.ctrlKey) {
-            e.preventDefault();
-            sendMessage();
-          }
-          // Otherwise, let Enter insert newline.
-        }
-      });
-  
-      // Use input event to monitor for changes; if the content has no newlines, revert back.
-      el.addEventListener('input', () => {
-        maybeSwitchToInput();
-      });
-    }
-  
-    // Attach the listeners to the initial input.
-    attachListeners(userInput);
-  
-    // Click handler for the Send button (works in both input and textarea mode).
-    sendBtn.addEventListener('click', () => {
-      sendMessage();
-    });
-  
-    // ---------------------------------------------------
-    // DEMO: Pre-populate the chat with sample messages.
-    // ---------------------------------------------------
-    addMessage('system', '*System:* Hello! This is a demonstration of a chat interface with **Markdown** and syntax highlighting. Feel free to experiment.');
-    addMessage('assistant', `Sure! Here's a sample code block in Python:
-  
-  \`\`\`python
-  def hello_world():
-      print("Hello, world!")
-  \`\`\`
-  `);
-    addMessage('user', 'That looks cool. Can you show me a JavaScript snippet as well?');
-    addMessage('assistant', `Absolutely! Here's a JavaScript snippet:
-  
-  \`\`\`javascript
-  function add(a, b) {
-    return a + b;
-  }
-  console.log(add(2, 3));
-  \`\`\`
-  `);
-  </script>
-  {% endblock %}
+<div id="ap-composer">
+    <div id="ap-mode-helper" class="ap-mode-helper">Chat mode: Ask one question and run.</div>
+    <textarea id="ap-input" placeholder="Enter a user prompt. For batch mode, add one input per line. For workflow mode, define stage intent in natural language."></textarea>
+    <div id="ap-composer-actions">
+        <button id="ap-run-btn" type="button">Run</button>
+        <button id="ap-cancel-btn" type="button">Cancel</button>
+        <button id="ap-replay-btn" type="button">Replay</button>
+        <button id="ap-resume-btn" type="button">Resume</button>
+    </div>
+</div>
+{% endblock %}

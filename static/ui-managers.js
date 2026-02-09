@@ -27,6 +27,34 @@ class PanelsManager {
         PanelsManager.instance = this;
     }
 
+    _panelSectionsDOM() {
+        return document.getElementById("panel-sections");
+    }
+
+    _isPanelVisibleByID(panelID) {
+        const panel = document.getElementById(panelID);
+        if (!panel) {
+            return false;
+        }
+        const computedDisplay = window.getComputedStyle(panel).display;
+        return computedDisplay !== "none";
+    }
+
+    syncLayoutState() {
+        const panelSections = this._panelSectionsDOM();
+        if (!panelSections) {
+            return;
+        }
+
+        const leftOpen = this._isPanelVisibleByID("left-panel");
+        const rightOpen = this._isPanelVisibleByID("right-panel")
+            || this._isPanelVisibleByID("account-panel")
+            || this._isPanelVisibleByID("main-menu-panel");
+
+        panelSections.dataset.leftOpen = leftOpen ? "1" : "0";
+        panelSections.dataset.rightOpen = rightOpen ? "1" : "0";
+    }
+
     addPanel(panel, position) {
         this.panels[position].unshift(panel);
     }
@@ -54,6 +82,7 @@ class PanelsManager {
 
         panel.showPanel();
         this.panelStates[position] = panel;
+        this.syncLayoutState();
         
         // Set UI state in local storage for persistance
         //const uiPrefs = new DATA.UIPrefs();
@@ -65,6 +94,7 @@ class PanelsManager {
         if (currentPanel) {
             currentPanel.hidePanel();
             this.panelStates[position] = null;
+            this.syncLayoutState();
 
             // Update the UI state in local storage
             //const uiPrefs = new DATA.UIPrefs();
@@ -87,6 +117,7 @@ class PanelsManager {
         else {
             this.showPanel(position);
         }
+        this.syncLayoutState();
     }
 }
 
@@ -117,6 +148,7 @@ class MenuManager {
             this.currentMenu.hidePanel();
             menuPanel.showPanel();
             this.currentMenu = menuPanel;
+            new PanelsManager().syncLayoutState();
         }
         else {
             // Check for a right side panel and hide it
@@ -128,6 +160,7 @@ class MenuManager {
             // Show the menu panel
             menuPanel.showPanel();
             this.currentMenu = menuPanel;
+            panelsManager.syncLayoutState();
         }
     }
 
@@ -140,6 +173,7 @@ class MenuManager {
             if (this.rightPanelState) {
                 this.rightPanelState.showPanel();
             }
+            new PanelsManager().syncLayoutState();
         }
     }
 
@@ -253,10 +287,12 @@ class Panel {
 
     showPanel() {
         this.containerDOM.style.display = "flex";
+        PanelsManager.instance?.syncLayoutState();
     }
 
     hidePanel() {
         this.containerDOM.style.display = "none";
+        PanelsManager.instance?.syncLayoutState();
     }
 
     togglePanel() {

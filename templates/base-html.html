@@ -82,74 +82,119 @@
         // Clear the previous session storage
         sessionStorage.removeItem("member_data");
 
-        
-        // Login Code
-        // Flag to track if the password field is currently empty after deletion.
-        let passwordEmptyFlag = false;
+        function setAuthTab(tabName) {
+            const requested = (tabName === "signup") ? "signup" : "login";
+            document.querySelectorAll(".auth-tab").forEach((button) => {
+                const isActive = button.dataset.tab === requested;
+                button.classList.toggle("active", isActive);
+                button.setAttribute("aria-selected", isActive ? "true" : "false");
+            });
+            document.querySelectorAll(".auth-pane").forEach((pane) => {
+                const isActive = pane.dataset.pane === requested;
+                pane.classList.toggle("active", isActive);
+                pane.hidden = !isActive;
+            });
+            const clientMessage = document.getElementById("auth-client-message");
+            if (clientMessage) {
+                clientMessage.hidden = true;
+                clientMessage.textContent = "";
+            }
+        }
 
-        function contentLoaded() {
-            // Get references to the form elements.
-            const loginForm = document.getElementById("login-form");
-            const usernameInput = loginForm.elements["username"];
-            const passwordInput = loginForm.elements["userpass"];
-            const submitLoginBtn = loginForm.elements["login-btn"];
+        function openAuthModal() {
+            const modal = document.getElementById("auth-modal-overlay");
+            if (!modal) {
+                return;
+            }
+            modal.classList.add("open");
+            modal.setAttribute("aria-hidden", "false");
+        }
 
-            // Click handler for the submit/next button.
-            submitLoginBtn.addEventListener("click", (event) => {
-                event.preventDefault();
+        function closeAuthModal() {
+            const modal = document.getElementById("auth-modal-overlay");
+            if (!modal) {
+                return;
+            }
+            modal.classList.remove("open");
+            modal.setAttribute("aria-hidden", "true");
+        }
 
-                // Check if we are in the email entry step.
-                if (usernameInput.style.display !== "none") {
-                    // Handle username input
-                    const username = usernameInput.value.trim();
-                    if (username === "") {
-                        alert("Please enter your username.");
-                        return;
-                    }
+        function wireAuthTabs() {
+            document.querySelectorAll(".auth-tab").forEach((button) => {
+                button.addEventListener("click", () => {
+                    setAuthTab(button.dataset.tab || "login");
+                });
+            });
+        }
 
-                    // Validate the username input before moving forward
-
-                    // Show the password input
-                    usernameInput.style.display = "none";
-                    passwordInput.style.display = "inline-block";
-                    passwordInput.focus();
-                    submitLoginBtn.value = "Login";
-                    passwordEmptyFlag = true;
-                } else {
-                    // Handle the password input
-                    const password = passwordInput.value.trim();
-                    if (password === "") {
-                        alert("Please enter your password or press backspace to return to the email input.");
-                        return;
-                    }
-
-                    // Validate the password input before submitting
-
-                    loginForm.submit();
-                }
+        function wireAuthModalButtons() {
+            document.querySelectorAll("[data-auth-open]").forEach((button) => {
+                button.addEventListener("click", () => {
+                    openAuthModal();
+                });
+            });
+            document.querySelectorAll("[data-auth-close]").forEach((button) => {
+                button.addEventListener("click", () => {
+                    closeAuthModal();
+                });
             });
 
-            // Update password empty flag boolean
-            passwordInput.addEventListener("input", (event) => {
-                passwordEmptyFlag = passwordInput.value.length === 0;
-            });
+            const modal = document.getElementById("auth-modal-overlay");
+            if (modal) {
+                modal.addEventListener("click", (event) => {
+                    if (event.target === modal) {
+                        closeAuthModal();
+                    }
+                });
+            }
+        }
 
-            // Listen for keydown events on the password field to handle backspace.
-            passwordInput.addEventListener("keydown", (event) => {
-                // Switch back to username if the user presses backspace on an empty password field
-                if (event.key === "Backspace" && passwordInput.value === "" && !event.repeat && passwordEmptyFlag) {
+        function wireSignupValidation() {
+            const signupForm = document.getElementById("signup-form");
+            if (!signupForm) {
+                return;
+            }
+            signupForm.addEventListener("submit", (event) => {
+                const username = signupForm.elements["username"].value.trim();
+                const password = signupForm.elements["userpass"].value.trim();
+                const confirmPassword = signupForm.elements["userpass-confirm"].value.trim();
+                const clientMessage = document.getElementById("auth-client-message");
+                const showMessage = (text) => {
+                    if (clientMessage) {
+                        clientMessage.hidden = false;
+                        clientMessage.textContent = text;
+                    }
+                };
+
+                if (username === "") {
+                    showMessage("Please enter a username for signup.");
+                    setAuthTab("signup");
                     event.preventDefault();
-
-                    // Show the username input
-                    usernameInput.style.display = "inline-block";
-                    passwordInput.style.display = "none";
-                    usernameInput.focus();
-                    submitLoginBtn.value = "Next";
+                    return;
+                }
+                if (password === "") {
+                    showMessage("Please enter a password for signup.");
+                    setAuthTab("signup");
+                    event.preventDefault();
+                    return;
+                }
+                if (password !== confirmPassword) {
+                    showMessage("Signup passwords do not match.");
+                    setAuthTab("signup");
+                    event.preventDefault();
                 }
             });
         }
 
-        
+        function contentLoaded() {
+            const defaultTab = document.body.dataset.authActiveTab || "login";
+            wireAuthTabs();
+            wireAuthModalButtons();
+            wireSignupValidation();
+            setAuthTab(defaultTab);
+            openAuthModal();
+        }
+
         // Set up Callback Listeners
         document.addEventListener("DOMContentLoaded", contentLoaded);
     </script>
@@ -171,7 +216,7 @@
 
     {% endblock %}
 </head>
-<body>
+<body data-auth-active-tab="{{ authActiveTab if authActiveTab else 'login' }}">
     <div id="container">
         <header>
             <div onclick="location.href = '/';" id="logo">
@@ -395,13 +440,12 @@
                 {% else %}
                 <div id="account-top-panel" class="panel-no-header">
                     <div class="panel-header"></div>
-                    <div class="panel-content login-area">
-                        <h3>Login</h3>
-                        <form action="/login" id="login-form" method="post">
-                            <input id="username" placeholder="username" type="text" name="username" />
-                            <input id="userpass" placeholder="password" type="password" name="userpass" />
-                            <input id="submit-login" name="login-btn" type="submit" value="Next" />
-                        </form>
+                    <div class="panel-content login-area account-auth-panel">
+                        <h3>Account Access</h3>
+                        <p>Open the authentication dialog to log in or create an account.</p>
+                        <button type="button" class="auth-inline-launch" data-auth-open>
+                            Open Login / Signup
+                        </button>
                     </div>
                     <div class="panel-footer">
                     </div>
@@ -523,6 +567,86 @@
                 {% endblock %}
             </div>
         </div>
+
+        {% if not memberData %}
+        <div id="auth-modal-overlay" class="auth-modal-overlay" aria-hidden="true">
+            <section class="auth-modal-card" role="dialog" aria-modal="true" aria-label="Account authentication">
+                <div class="auth-modal-header">
+                    <h3>Welcome to RYO Chat</h3>
+                    <button type="button" class="auth-modal-close" data-auth-close aria-label="Close authentication dialog">×</button>
+                </div>
+
+                <div class="auth-tabs" role="tablist" aria-label="Authentication Tabs">
+                    <button type="button" class="auth-tab" data-tab="login" role="tab" aria-selected="false">Login</button>
+                    <button type="button" class="auth-tab" data-tab="signup" role="tab" aria-selected="false">Sign Up</button>
+                </div>
+
+                <div id="auth-client-message" class="auth-message error" hidden></div>
+                {% if authMessage %}
+                <div class="auth-message {{ authMessageKind }}">{{ authMessage }}</div>
+                {% endif %}
+
+                <div class="auth-pane" data-pane="login" hidden>
+                    <form action="/login" id="login-form" class="auth-form" method="post">
+                        <label class="auth-field">
+                            <span>Username</span>
+                            <input id="login-username" placeholder="username" type="text" name="username" autocomplete="username" required />
+                        </label>
+                        <label class="auth-field">
+                            <span>Password</span>
+                            <input id="login-password" placeholder="password" type="password" name="userpass" autocomplete="current-password" required />
+                        </label>
+                        <input id="submit-login" class="auth-submit" name="login-btn" type="submit" value="Login" />
+                    </form>
+                </div>
+
+                <div class="auth-pane" data-pane="signup" hidden>
+                    <form action="/signup" id="signup-form" class="auth-form" method="post">
+                        <label class="auth-field">
+                            <span>First Name (Optional)</span>
+                            <input id="signup-first-name" placeholder="first name" type="text" name="first_name" />
+                        </label>
+                        <label class="auth-field">
+                            <span>Last Name (Optional)</span>
+                            <input id="signup-last-name" placeholder="last name" type="text" name="last_name" />
+                        </label>
+                        <label class="auth-field">
+                            <span>Username</span>
+                            <input id="signup-username" placeholder="username" type="text" name="username" autocomplete="username" required />
+                        </label>
+                        <label class="auth-field">
+                            <span>Password</span>
+                            <input
+                                id="signup-password"
+                                placeholder="password"
+                                type="password"
+                                name="userpass"
+                                autocomplete="new-password"
+                                minlength="{{ passwordPolicyMinLength }}"
+                                title="{{ passwordPolicyHint }}"
+                                required
+                            />
+                        </label>
+                        <label class="auth-field">
+                            <span>Confirm Password</span>
+                            <input
+                                id="signup-password-confirm"
+                                placeholder="confirm password"
+                                type="password"
+                                name="userpass-confirm"
+                                autocomplete="new-password"
+                                minlength="{{ passwordPolicyMinLength }}"
+                                title="{{ passwordPolicyHint }}"
+                                required
+                            />
+                        </label>
+                        <div class="auth-policy">{{ passwordPolicyHint }}</div>
+                        <input id="submit-signup" class="auth-submit" name="signup-btn" type="submit" value="Create Account" />
+                    </form>
+                </div>
+            </section>
+        </div>
+        {% endif %}
     </div>
 </body>
 </html>

@@ -17,7 +17,7 @@
 # IMPORTS #
 ###########
 
-import datetime
+from datetime import datetime
 import logging
 import tweepy
 import tweepy.asynchronous
@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 ###########
 
 config = ConfigManager()
+logger.info(f"Database route status: {config.databaseRoute}")
 
 # TODO Check if the twitter keys exist at all and throw critical if not
 

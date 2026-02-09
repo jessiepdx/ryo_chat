@@ -1,52 +1,298 @@
 {
-  "bot_name": "Telegram bot username",
+  "bot_name": "telegram_bot_username",
   "bot_id": 12345,
-  "bot_token": "Telegram bot token",
+  "bot_token": "telegram_bot_token",
   "web_ui_url": "https://web.ui.url/",
   "owner_info": {
-    "first_name": "First name",
-    "last_name": "Last name",
+    "first_name": "First",
+    "last_name": "Last",
     "user_id": 12345,
-    "username": "Telegram username"
+    "username": "telegram_username"
   },
   "database": {
-      "db_name": "Database name",
-      "user": "Database user", 
-      "password": "Database password", 
-      "host": "Postgres URL",
-      "port": "Postgres port"
+    "db_name": "ryo_chat",
+    "user": "postgres_user",
+    "password": "postgres_password",
+    "host": "127.0.0.1",
+    "port": "5432"
+  },
+  "database_fallback": {
+    "enabled": true,
+    "mode": "local",
+    "db_name": "ryo_chat_fallback",
+    "user": "postgres_user",
+    "password": "postgres_password",
+    "host": "127.0.0.1",
+    "port": "5433"
   },
   "knowledge": {
-    "domains": ["Short List", "Of Main", "Knowledge Domains"]
+    "domains": ["General", "Project", "Operations"]
   },
+  "roles_list": ["user", "tester", "marketing", "admin", "owner"],
   "defaults": {
-    "system_prompt": "You are a helpful Telegram Chatbot having conversations with users in the Telegram Messager App. Do your best to respond truthfully and factually. If you  don't know the answer, let the user know. You may need to ask the user questions to gather more information. ",
-    "generate_sys_prompt": "To keep the conversation flow going smoothly, it may make sense to keep responses short and concise while other times you should give a thorough response. ",
-    "chat_sys_prompt": "Using the message history of our conversations and you vast collection of training knowledge, respond to user prompts as best as you are able. If recalling information from previous parts of the conversation, make sure to summarize a response and don't be verbatum."
+    "system_prompt": "You are a helpful chatbot. Respond truthfully and factually. If you do not know the answer, say so and ask for clarification when needed.",
+    "generate_sys_prompt": "Adjust response length to the user request: concise for quick asks, detailed for deeper asks.",
+    "chat_sys_prompt": "Use conversation history and retrieved context when relevant, while keeping answers on-topic."
   },
   "inference": {
     "embedding": {
-      "url": "Ollama location",
-      "model": "Embedding model"
+      "url": "http://127.0.0.1:11434",
+      "model": ""
     },
     "generate": {
-      "url": "Ollama location",
-      "model": "Generate model"
+      "url": "http://127.0.0.1:11434",
+      "model": ""
     },
     "chat": {
-      "url": "Ollama location",
-      "model": "Chat model"
+      "url": "http://127.0.0.1:11434",
+      "model": ""
     },
     "tool": {
-      "url": "Ollama location",
-      "model": "Tool model"
+      "url": "http://127.0.0.1:11434",
+      "model": ""
     },
     "multimodal": {
-      "url": "Ollama location",
-      "model": "Multimodal model"
+      "url": "http://127.0.0.1:11434",
+      "model": ""
     }
   },
+  "community_score_requirements": {
+    "private_chat": 50,
+    "private_image": 70,
+    "group_image": 20,
+    "other_group": 20,
+    "link_sharing": 20,
+    "message_forwarding": 20
+  },
+  "runtime": {
+    "inference": {
+      "default_ollama_host": "http://127.0.0.1:11434",
+      "default_embedding_model": "",
+      "default_generate_model": "",
+      "default_chat_model": "",
+      "default_tool_model": "",
+      "default_multimodal_model": "",
+      "model_context_window": 4096,
+      "probe_timeout_seconds": 3.0,
+      "embedding_timeout_seconds": 12.0,
+      "embedding_max_input_chars": 6000,
+      "prompt_model_selection_on_startup": false
+    },
+    "database": {
+      "default_primary_host": "127.0.0.1",
+      "default_primary_port": "5432",
+      "default_fallback_host": "127.0.0.1",
+      "default_fallback_port": "5433",
+      "connect_timeout_seconds": 2,
+      "bootstrap_connect_retries": 15,
+      "bootstrap_retry_delay_seconds": 1.0,
+      "bootstrap_port_scan_limit": 100,
+      "auto_bootstrap_on_app_start": true,
+      "auto_bootstrap_use_docker": true,
+      "auto_migrate_on_app_start": true
+    },
+    "tool_runtime": {
+      "default_timeout_seconds": 8.0,
+      "default_max_retries": 1,
+      "brave_timeout_seconds": 10.0,
+      "chat_history_timeout_seconds": 6.0,
+      "knowledge_timeout_seconds": 6.0,
+      "skip_tools_timeout_seconds": 2.0,
+      "enable_human_approval": true,
+      "default_approval_timeout_seconds": 45.0,
+      "approval_poll_interval_seconds": 0.25,
+      "default_dry_run": false,
+      "sandbox": {
+        "enabled": true,
+        "side_effect_class": "read_only",
+        "require_approval": false,
+        "dry_run": false,
+        "approval_timeout_seconds": 45.0,
+        "execution_timeout_ceiling": 30.0,
+        "max_memory_mb": 512,
+        "network": {
+          "enabled": true,
+          "allowlist_domains": []
+        },
+        "filesystem": {
+          "mode": "none",
+          "allowed_paths": []
+        }
+      }
+    },
+    "telegram": {
+      "minimum_community_score_private_chat": 50,
+      "minimum_community_score_private_image": 70,
+      "minimum_community_score_group_image": 20,
+      "minimum_community_score_other_group": 20,
+      "minimum_community_score_link": 20,
+      "minimum_community_score_forward": 20,
+      "get_updates_write_timeout": 500,
+      "show_stage_progress": true,
+      "show_stage_json_details": false,
+      "stage_detail_level": "normal"
+    },
+    "orchestrator": {
+      "fast_path_small_talk_enabled": true,
+      "fast_path_small_talk_max_chars": 96,
+      "analysis_max_output_tokens": 256,
+      "analysis_temperature": 0.1,
+      "analysis_context_summary_max_chars": 220,
+      "discovery_layer_enabled": true,
+      "discovery_force_tools_on_uncertainty": true,
+      "discovery_unknown_threshold": 0.67,
+      "discovery_probably_unknown_threshold": 0.4,
+      "discovery_default_tool_hints": [
+        "braveSearch",
+        "curlRequest"
+      ]
+    },
+    "personality": {
+      "enabled": true,
+      "adaptive_enabled": true,
+      "narrative_enabled": true,
+      "max_injection_chars": 900,
+      "narrative_summary_max_chars": 360,
+      "narrative_source_history_limit": 8,
+      "rollup_turn_threshold": 8,
+      "rollup_char_threshold": 2200,
+      "max_active_chunks": 6,
+      "adaptation_min_turns": 4,
+      "adaptation_max_step_per_window": 1,
+      "adaptation_window_turns": 4,
+      "verbosity_short_token_threshold": 10,
+      "verbosity_long_token_threshold": 36,
+      "default_tone": "friendly",
+      "default_verbosity": "brief",
+      "default_reading_level": "moderate",
+      "default_format": "plain",
+      "default_humor": "low",
+      "default_emoji": "off",
+      "default_language": "en"
+    },
+    "security": {
+      "password_min_length": 12
+    },
+    "vectors": {
+      "embedding_dimensions": 768
+    },
+    "retrieval": {
+      "conversation_short_history_limit": 20,
+      "chat_history_window_hours": 12,
+      "chat_history_default_limit": 1,
+      "chat_history_sender_window_hours": 12,
+      "chat_history_sender_default_limit": 0,
+      "progressive_history_enabled": true,
+      "progressive_history_tool_enabled": true,
+      "progressive_history_max_rounds": 5,
+      "progressive_history_round_windows_hours": [12, 48, 168, 720],
+      "progressive_history_semantic_limit_start": 3,
+      "progressive_history_semantic_limit_step": 2,
+      "progressive_history_timeline_limit_start": 24,
+      "progressive_history_timeline_limit_step": 24,
+      "progressive_history_context_radius": 2,
+      "progressive_history_match_threshold": 0.42,
+      "progressive_history_max_selected": 8,
+      "progressive_history_max_message_chars": 220,
+      "knowledge_list_limit": 10,
+      "knowledge_search_default_limit": 1,
+      "spam_list_limit": 10,
+      "spam_search_default_limit": 1
+    },
+    "conversation": {
+      "knowledge_lookup_word_threshold": 6,
+      "knowledge_lookup_result_limit": 2,
+      "community_score_message_word_threshold": 20,
+      "spam_distance_threshold": 10,
+      "new_member_grace_period_seconds": 60
+    },
+    "community": {
+      "score_rules": [
+        {
+          "private": {
+            "min": 50
+          },
+          "community": {
+            "min": 0
+          },
+          "message_per_hour": 2,
+          "image_per_hour": 0
+        },
+        {
+          "private": {
+            "min": 55
+          },
+          "community": {
+            "min": 5
+          },
+          "message_per_hour": 4,
+          "image_per_hour": 0
+        },
+        {
+          "private": {
+            "min": 60
+          },
+          "community": {
+            "min": 10
+          },
+          "message_per_hour": 6,
+          "image_per_hour": 0
+        },
+        {
+          "private": {
+            "min": 65
+          },
+          "community": {
+            "min": 15
+          },
+          "message_per_hour": 8,
+          "image_per_hour": 0
+        },
+        {
+          "private": {
+            "min": 70
+          },
+          "community": {
+            "min": 20
+          },
+          "message_per_hour": 10,
+          "image_per_hour": 1
+        },
+        {
+          "private": {
+            "min": 75
+          },
+          "community": {
+            "min": 25
+          },
+          "message_per_hour": 12,
+          "image_per_hour": 1
+        }
+      ]
+    },
+    "watchdog": {
+      "restart_window_seconds": 60,
+      "max_restarts_per_window": 5,
+      "terminate_timeout_seconds": 8,
+      "kill_timeout_seconds": 4,
+      "thread_join_timeout_seconds": 2,
+      "auto_start_routes": true
+    },
+    "web": {
+      "host": "127.0.0.1",
+      "port": 4747,
+      "port_scan_limit": 100,
+      "debug": false,
+      "use_reloader": false
+    }
+  },
+  "twitter_keys": {
+    "consumer_key": "",
+    "consumer_secret": "",
+    "access_token": "",
+    "access_token_secret": ""
+  },
   "api_keys": {
-    "brave_search": "Brave search for AI keys"
+    "brave_search": ""
   }
 }

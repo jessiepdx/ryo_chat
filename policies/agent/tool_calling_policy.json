@@ -1,4 +1,31 @@
 {
-    "allow_custom_system_prompt": false,
-    "allowed_models": ["llama3.2:latest", "llama3.2:1b", "llama3.1:8b"]
+  "allow_custom_system_prompt": false,
+  "allowed_models": [
+    "qwen3-vl:4b"
+  ],
+  "tool_runtime": {
+    "default_timeout_seconds": 8.0,
+    "default_max_retries": 1,
+    "reject_unknown_args": false,
+    "unknown_tool_behavior": "structured_error",
+    "tools": {
+      "braveSearch": {
+        "required_api_key": "brave_search",
+        "timeout_seconds": 10,
+        "max_retries": 1
+      },
+      "chatHistorySearch": {
+        "timeout_seconds": 6,
+        "max_retries": 0
+      },
+      "knowledgeSearch": {
+        "timeout_seconds": 6,
+        "max_retries": 0
+      },
+      "skipTools": {
+        "timeout_seconds": 2,
+        "max_retries": 0
+      }
+    }
+  }
 }

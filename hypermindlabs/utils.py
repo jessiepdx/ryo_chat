@@ -21,18 +21,31 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import psycopg
+import queue
 import re
+import requests
 import secrets
+import sys
 import string
+import threading
 import textstat
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from hypermindlabs.database_router import DatabaseRouter
+from hypermindlabs.runtime_settings import (
+    build_runtime_settings,
+    get_runtime_setting,
+    load_dotenv_file,
+)
 from math import ceil
 from ollama import Client
 from psycopg.rows import dict_row
-from urllib.parse import parse_qs, unquote
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 
@@ -48,18 +61,37 @@ class CustomFormatter(logging.Formatter):
     red = "\x1b[31;20m"
     bold_red = "\x1b[31;1m"
     reset = "\x1b[0m"
-    format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"
+    base_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"
 
-    FORMATS = {
-        logging.DEBUG: grey + format + reset,
-        logging.INFO: grey + format + reset,
-        logging.WARNING: yellow + format + reset,
-        logging.ERROR: red + format + reset,
-        logging.CRITICAL: bold_red + format + reset
+    COLOR_FORMATS = {
+        logging.DEBUG: grey + base_format + reset,
+        logging.INFO: grey + base_format + reset,
+        logging.WARNING: yellow + base_format + reset,
+        logging.ERROR: red + base_format + reset,
+        logging.CRITICAL: bold_red + base_format + reset
     }
 
+    def __init__(self, *, use_color: bool | None = None, stream: Any | None = None):
+        super().__init__(self.base_format)
+        if use_color is None:
+            no_color = str(os.getenv("NO_COLOR", "")).strip()
+            ryo_color = str(os.getenv("RYO_LOG_COLOR", "")).strip().lower()
+            if no_color:
+                use_color = False
+            elif ryo_color in {"0", "false", "no", "off"}:
+                use_color = False
+            elif ryo_color in {"1", "true", "yes", "on"}:
+                use_color = True
+            else:
+                target_stream = stream if stream is not None else sys.stderr
+                use_color = bool(getattr(target_stream, "isatty", lambda: False)())
+        self._use_color = bool(use_color)
+
     def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno)
+        if not self._use_color:
+            formatter = logging.Formatter(self.base_format)
+            return formatter.format(record)
+        log_fmt = self.COLOR_FORMATS.get(record.levelno, self.base_format)
         formatter = logging.Formatter(log_fmt)
         return formatter.format(record)
 
@@ -70,6 +102,252 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db" / "migrations"
+MIGRATION_TOKEN_PATTERN = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+STARTUP_CORE_MIGRATIONS: tuple[str, ...] = (
+    "001_member_data.sql",
+    "002_member_telegram.sql",
+    "003_member_telegram_user_id_nullable.sql",
+    "004_member_secure.sql",
+    "010_chat_history.sql",
+    "020_community_data.sql",
+    "021_community_telegram.sql",
+    "030_community_score.sql",
+    "050_proposals.sql",
+    "051_proposal_disclosure.sql",
+    "070_inference_usage.sql",
+    "080_runs.sql",
+    "081_run_events.sql",
+    "082_run_state_snapshots.sql",
+    "083_run_artifacts.sql",
+    "084_agent_process_workspace.sql",
+    "085_member_outbox.sql",
+    "086_member_personality_profile.sql",
+    "087_member_narrative_chunks.sql",
+    "088_member_personality_events.sql",
+)
+STARTUP_VECTOR_MIGRATIONS: tuple[str, ...] = (
+    "011_create_vector_extension.sql",
+    "012_chat_history_embeddings.sql",
+    "040_knowledge.sql",
+    "041_knowledge_retrievals.sql",
+    "060_spam.sql",
+)
+VECTOR_DIMENSION_MIGRATIONS: set[str] = {
+    "012_chat_history_embeddings.sql",
+    "040_knowledge.sql",
+    "060_spam.sql",
+}
+_EMBEDDING_WRITE_QUEUE: queue.Queue[dict[str, Any]] | None = None
+_EMBEDDING_WORKER_THREAD: threading.Thread | None = None
+_EMBEDDING_WORKER_LOCK = threading.Lock()
+
+
+def _render_migration_sql(sql_text: str, context: dict[str, Any] | None = None) -> str:
+    migration_context = context or {}
+
+    def replace_token(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in migration_context:
+            raise KeyError(f"Missing migration template value: {key}")
+        value = migration_context[key]
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        raise ValueError(f"Unsupported migration template value for '{key}': {type(value).__name__}")
+
+    return MIGRATION_TOKEN_PATTERN.sub(replace_token, sql_text)
+
+
+def execute_migration(cursor: Any, migration_filename: str, context: dict[str, Any] | None = None) -> None:
+    migration_path = MIGRATIONS_DIR / migration_filename
+    migration_sql = migration_path.read_text(encoding="utf-8")
+    rendered_sql = _render_migration_sql(migration_sql, context=context)
+    cursor.execute(rendered_sql)
+
+
+def ensure_startup_database_migrations() -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "route_status": "unknown",
+        "active_target": "unknown",
+        "core_applied": list(),
+        "vector_applied": list(),
+        "core_failed": list(),
+        "vector_failed": list(),
+        "connection_error": None,
+    }
+
+    try:
+        config_manager = ConfigManager()
+        route = config_manager.databaseRoute if isinstance(config_manager.databaseRoute, dict) else {}
+        report["route_status"] = str(route.get("status", "unknown"))
+        report["active_target"] = str(route.get("active_target", "unknown"))
+        conninfo = str(config_manager._instance.db_conninfo or "").strip()
+        vector_dimensions = max(1, config_manager.runtimeInt("vectors.embedding_dimensions", 768))
+    except Exception as error:  # noqa: BLE001
+        report["connection_error"] = str(error)
+        return report
+
+    if not conninfo:
+        report["connection_error"] = "Empty database connection info."
+        return report
+
+    connection = None
+    try:
+        connection = psycopg.connect(conninfo=conninfo)
+        cursor = connection.cursor()
+
+        for migration_filename in STARTUP_CORE_MIGRATIONS:
+            try:
+                execute_migration(cursor, migration_filename)
+                connection.commit()
+                report["core_applied"].append(migration_filename)
+            except (Exception, psycopg.DatabaseError) as error:  # noqa: PERF203
+                connection.rollback()
+                report["core_failed"].append(
+                    {"migration": migration_filename, "error": str(error)}
+                )
+
+        for migration_filename in STARTUP_VECTOR_MIGRATIONS:
+            try:
+                context = (
+                    {"vector_dimensions": vector_dimensions}
+                    if migration_filename in VECTOR_DIMENSION_MIGRATIONS
+                    else None
+                )
+                execute_migration(cursor, migration_filename, context=context)
+                connection.commit()
+                report["vector_applied"].append(migration_filename)
+            except (Exception, psycopg.DatabaseError) as error:  # noqa: PERF203
+                connection.rollback()
+                report["vector_failed"].append(
+                    {"migration": migration_filename, "error": str(error)}
+                )
+
+        cursor.close()
+    except (Exception, psycopg.DatabaseError) as error:
+        report["connection_error"] = str(error)
+    finally:
+        if connection is not None:
+            connection.close()
+
+    return report
+
+
+def _defer_embeddings_on_write_enabled() -> bool:
+    try:
+        return ConfigManager().runtimeBool("inference.defer_embeddings_on_write", True)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _embedding_write_queue_max_size() -> int:
+    try:
+        size = int(ConfigManager().runtimeInt("inference.embedding_write_queue_size", 512))
+    except Exception:  # noqa: BLE001
+        size = 512
+    return max(16, size)
+
+
+def _persist_chat_embedding(history_id: int, message_text: str, *, source: str = "sync") -> bool:
+    if history_id is None:
+        return False
+
+    embedding = getEmbeddings(message_text)
+    if embedding is None:
+        logger.warning("Skipping chat embeddings persistence because embedding model returned no vector.")
+        return False
+
+    connection = None
+    try:
+        connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+        cursor = connection.cursor()
+        insertEmbeddings_sql = """INSERT INTO chat_history_embeddings (history_id, embeddings)
+        VALUES (%s, %s);"""
+        cursor.execute(insertEmbeddings_sql, (history_id, embedding))
+        connection.commit()
+        cursor.close()
+        logger.debug(f"Chat embeddings persisted ({source}) for history id {history_id}.")
+        return True
+    except (Exception, psycopg.DatabaseError) as error:
+        if connection is not None:
+            connection.rollback()
+        logger.warning(f"Unable to persist chat embeddings ({source}) for history id {history_id}:\n{error}")
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _embedding_worker_loop() -> None:
+    global _EMBEDDING_WRITE_QUEUE
+    logger.info("Embedding worker started for deferred chat history persistence.")
+    while True:
+        workQueue = _EMBEDDING_WRITE_QUEUE
+        if workQueue is None:
+            break
+        try:
+            job = workQueue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Embedding worker queue error: {error}")
+            continue
+
+        if not isinstance(job, dict):
+            continue
+
+        history_id = job.get("history_id")
+        message_text = str(job.get("message_text") or "")
+        if not isinstance(history_id, int) or history_id <= 0:
+            continue
+        if message_text.strip() == "":
+            continue
+
+        try:
+            _persist_chat_embedding(history_id, message_text, source="deferred")
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Embedding worker failed for history id {history_id}: {error}")
+
+
+def _ensure_embedding_worker_started() -> queue.Queue[dict[str, Any]]:
+    global _EMBEDDING_WRITE_QUEUE
+    global _EMBEDDING_WORKER_THREAD
+
+    with _EMBEDDING_WORKER_LOCK:
+        expectedSize = _embedding_write_queue_max_size()
+        if _EMBEDDING_WRITE_QUEUE is None:
+            _EMBEDDING_WRITE_QUEUE = queue.Queue(maxsize=expectedSize)
+        if _EMBEDDING_WORKER_THREAD is None or not _EMBEDDING_WORKER_THREAD.is_alive():
+            _EMBEDDING_WORKER_THREAD = threading.Thread(
+                target=_embedding_worker_loop,
+                name="ryo-embedding-writer",
+                daemon=True,
+            )
+            _EMBEDDING_WORKER_THREAD.start()
+    return _EMBEDDING_WRITE_QUEUE
+
+
+def _enqueue_chat_embedding(history_id: int, message_text: str) -> bool:
+    if not _defer_embeddings_on_write_enabled():
+        return False
+    if not isinstance(history_id, int) or history_id <= 0:
+        return False
+    if str(message_text or "").strip() == "":
+        return False
+
+    try:
+        workQueue = _ensure_embedding_worker_started()
+        workQueue.put_nowait({"history_id": history_id, "message_text": str(message_text)})
+        return True
+    except queue.Full:
+        logger.warning("Embedding queue is full; skipping deferred embedding enqueue for history id %s.", history_id)
+        return False
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"Unable to enqueue deferred embedding for history id {history_id}: {error}")
+        return False
 
 
 # NOTE OLD - but other aspects of code still use... Maybe make into a class for dot syntax use
@@ -115,45 +393,19 @@ class MemberManager:
                 logger.debug(f"PostgreSQL connection established.")
 
                 # Create the member data table
-                memberData_sql = """CREATE TABLE IF NOT EXISTS member_data (
-                    member_id SERIAL PRIMARY KEY,
-                    first_name VARCHAR(96),
-                    last_name VARCHAR(96),
-                    email VARCHAR(72),
-                    roles VARCHAR(32)[],
-                    register_date TIMESTAMP NOT NULL,
-                    community_score REAL NOT NULL DEFAULT 0
-                );"""
-                cursor.execute(memberData_sql)
+                execute_migration(cursor, "001_member_data.sql")
                 connection.commit()
                 
                 # Create the member telegram table if it doesn't exist
-                memberTelegramTable_sql = """CREATE TABLE IF NOT EXISTS member_telegram (
-                    record_id SERIAL PRIMARY KEY,
-                    member_id INT UNIQUE NOT NULL,
-                    first_name VARCHAR(96),
-                    last_name VARCHAR(96),
-                    username VARCHAR(96),
-                    user_id BIGINT UNIQUE NOT NULL,
-                    CONSTRAINT member_link
-                        FOREIGN KEY(member_id)
-                        REFERENCES member_data(member_id)
-                        ON DELETE CASCADE
-                );"""
-                cursor.execute(memberTelegramTable_sql)
+                execute_migration(cursor, "002_member_telegram.sql")
+                connection.commit()
+
+                # Allow web-only accounts that are not yet linked to a Telegram user id.
+                execute_migration(cursor, "003_member_telegram_user_id_nullable.sql")
                 connection.commit()
 
                 # Create the member password hash table
-                memberSecureTable_sql = """CREATE TABLE IF NOT EXISTS member_secure (
-                    secure_id SERIAL PRIMARY KEY,
-                    member_id INTEGER UNIQUE NOT NULL,
-                    secure_hash BYTEA,
-                    CONSTRAINT member_link
-                        FOREIGN KEY(member_id)
-                        REFERENCES member_data(member_id)
-                        ON DELETE CASCADE
-                );"""
-                cursor.execute(memberSecureTable_sql)
+                execute_migration(cursor, "004_member_secure.sql")
                 connection.commit()
 
                 # Check for an empty member data table
@@ -194,7 +446,7 @@ class MemberManager:
                     connection.commit()
                     logger.info("Owner account added.")
                 else:
-                    logger.info(f"There are {rowCount.get("total_members")} registered users.")
+                    logger.info(f"There are {rowCount.get('total_members')} registered users.")
                 
                 connection.commit()
                 # Close the cursor
@@ -311,9 +563,10 @@ class MemberManager:
             
             return response
 
-    def addMemberFromTelegram(self, memberData: dict):
+    def addMemberFromTelegram(self, memberData: dict) -> int | None:
         logger.info(f"Adding a new member from telegram.")
         connection = None
+        memberID = None
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
@@ -326,7 +579,10 @@ class MemberManager:
             
             cursor.execute(insertMember_sql, memberData)
             result = cursor.fetchone()
-            memberID = result.get("member_id")
+            memberID = result.get("member_id") if result else None
+            if memberID is None:
+                cursor.close()
+                return None
 
             memberTelegramData = {
                 "member_id": memberID,
@@ -349,6 +605,113 @@ class MemberManager:
             if (connection):
                 connection.close()
                 logger.debug(f"PostgreSQL connection is closed.")
+        
+        return memberID
+
+    def registerWebMember(
+        self,
+        username: str,
+        password: str,
+        firstName: str | None = None,
+        lastName: str | None = None,
+        email: str | None = None,
+    ) -> tuple[dict | None, str | None]:
+        logger.info("Register a new member from web signup.")
+        cleanUsername = str(username or "").strip().lstrip("@")
+        if cleanUsername == "":
+            return None, "Username is required."
+        if str(password or "").strip() == "":
+            return None, "Password is required."
+
+        connection = None
+        memberID = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+
+            cursor.execute(
+                """SELECT mem.member_id
+                FROM member_data AS mem
+                JOIN member_telegram AS tg
+                ON mem.member_id = tg.member_id
+                WHERE LOWER(tg.username) = LOWER(%s)
+                LIMIT 1;""",
+                (cleanUsername,),
+            )
+            existing = cursor.fetchone()
+            if existing is not None:
+                cursor.close()
+                return None, "Username is already in use."
+
+            memberData = {
+                "first_name": str(firstName or cleanUsername).strip(),
+                "last_name": str(lastName).strip() if lastName else None,
+                "email": str(email).strip() if email else None,
+                "roles": ["user"],
+                "register_date": datetime.now(),
+                "community_score": 0,
+            }
+
+            cursor.execute(
+                """INSERT INTO member_data (first_name, last_name, email, roles, register_date, community_score)
+                VALUES (%(first_name)s, %(last_name)s, %(email)s, %(roles)s, %(register_date)s, %(community_score)s)
+                RETURNING member_id;""",
+                memberData,
+            )
+            result = cursor.fetchone()
+            memberID = result.get("member_id") if result else None
+            if memberID is None:
+                cursor.close()
+                return None, "Unable to allocate member id."
+
+            cursor.execute(
+                """INSERT INTO member_telegram (member_id, first_name, last_name, username, user_id)
+                VALUES (%s, %s, %s, %s, %s);""",
+                (
+                    memberID,
+                    memberData["first_name"],
+                    memberData["last_name"],
+                    cleanUsername,
+                    None,
+                ),
+            )
+            connection.commit()
+            cursor.close()
+        except psycopg.Error as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+            return None, "Database error during signup."
+        finally:
+            if connection:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+
+        if memberID is None:
+            return None, "Signup failed."
+
+        configuredPassword = self.setPassword(memberID, password=password)
+        if configuredPassword is None:
+            cleanupConnection = None
+            try:
+                cleanupConnection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
+                cleanupCursor = cleanupConnection.cursor()
+                cleanupCursor.execute("DELETE FROM member_data WHERE member_id = %s;", (memberID,))
+                cleanupConnection.commit()
+                cleanupCursor.close()
+            except psycopg.Error as error:
+                logger.error(f"Exception while cleaning up failed signup:\n{error}")
+            finally:
+                if cleanupConnection:
+                    cleanupConnection.close()
+            minPasswordLength = ConfigManager().runtimeInt("security.password_min_length", 12)
+            return (
+                None,
+                "Password does not meet policy. "
+                f"Use at least {max(8, minPasswordLength)} chars with uppercase, lowercase, digits, and symbols.",
+            )
+
+        member = self.getMemberByID(memberID)
+        return member, None
 
     def loginMember(self, username: str, password: str) -> dict:
         logger.info(f"Login member with username and password.")
@@ -364,7 +727,7 @@ class MemberManager:
             FROM member_data AS mem
             JOIN member_telegram AS tg
             ON mem.member_id = tg.member_id
-            WHERE tg.username = %s
+            WHERE LOWER(tg.username) = LOWER(%s)
             LIMIT 1;"""
 
             cursor.execute(getSaltQuery_sql, (username, ))
@@ -403,19 +766,24 @@ class MemberManager:
         member = self.getMemberByID(memberID)
         if member is None:
             return None
+        minPasswordLength = ConfigManager().runtimeInt("security.password_min_length", 12)
         
         # Create a random password if none was sent
         if password is None:
             alphabet = string.ascii_letters + string.digits
             while True:
-                password = ''.join(secrets.choice(alphabet) for i in range(12))
+                password = ''.join(secrets.choice(alphabet) for i in range(max(8, minPasswordLength)))
                 if (any(c.islower() for c in password)
                         and any(c.isupper() for c in password)
                         and sum(c.isdigit() for c in password) >= 2):
                     break
         else:
             # Return None if the password does not meet minimum requirements
-            pattern = re.compile(r"(?=.*\d)(?=.*[a-z])(?=.*[A-Z])(?=.*[-+_!@#$%^&*.,?]).{12,}")
+            pattern = re.compile(
+                r"(?=.*\d)(?=.*[a-z])(?=.*[A-Z])(?=.*[-+_!@#$%^&*.,?]).{"
+                + str(max(8, minPasswordLength))
+                + r",}"
+            )
             validPassword = pattern.search(password)
             if validPassword is None:
                 logger.error("Invalid password.")
@@ -503,6 +871,7 @@ class MemberManager:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                 cursor = connection.cursor()
                 logger.debug(f"PostgreSQL connection established.")
+                vectorDimensions = max(1, ConfigManager().runtimeInt("vectors.embedding_dimensions", 768))
                 
                 updateRoles_sql = "UPDATE member_data SET roles = %s WHERE member_id = %s;"
                 valueTuple = (roles, memberID)
@@ -543,26 +912,54 @@ class MemberManager:
 
     def validateMiniappData(self, telegramInitData: str):
         logger.info(f"Validating the data sent via telegram miniapp.")
+        if not telegramInitData:
+            logger.warning("Miniapp validation failed: missing init data payload.")
+            return None
+
         # Parse the telegram initData query string
         queryDict = parse_qs(telegramInitData)
-        knownHash = queryDict["hash"][0]
+        knownHashValues = queryDict.get("hash")
+        userValues = queryDict.get("user")
+        if not knownHashValues or not userValues:
+            logger.warning("Miniapp validation failed: required payload fields are missing.")
+            return None
 
-        telegramUserData = json.loads(queryDict["user"][0])
-        memberTelegramID = telegramUserData["id"]
+        knownHash = knownHashValues[0]
+
+        try:
+            telegramUserData = json.loads(userValues[0])
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Miniapp validation failed: malformed user payload.")
+            return None
+
+        memberTelegramID = telegramUserData.get("id")
+        if memberTelegramID is None:
+            logger.warning("Miniapp validation failed: user id not found in payload.")
+            return None
 
         # Create a data check string from the query string
         # Data Check String must have the hash propoerty removed
-        initData = sorted([chunk.split("=") for chunk in unquote(telegramInitData).split("&") if chunk[:len("hash=")] != "hash="], key=lambda x: x[0])
-        initData = "\n".join([f"{rec[0]}={rec[1]}" for rec in initData])
+        initDataChunks = []
+        for chunk in unquote(telegramInitData).split("&"):
+            if chunk[:len("hash=")] == "hash=" or "=" not in chunk:
+                continue
+            key, value = chunk.split("=", 1)
+            initDataChunks.append((key, value))
+        initDataChunks = sorted(initDataChunks, key=lambda x: x[0])
+        initData = "\n".join([f"{rec[0]}={rec[1]}" for rec in initDataChunks])
 
         # Create the Secret Key
         key = "WebAppData".encode()
-        token = ConfigManager().bot_token.encode()
-        secretKey = hmac.new(key, token, hashlib.sha256)
+        token = ConfigManager().bot_token
+        if token is None or str(token).strip() == "":
+            logger.warning("Miniapp validation unavailable: bot_token is missing from config.")
+            return None
+
+        secretKey = hmac.new(key, str(token).encode(), hashlib.sha256)
         digest = hmac.new(secretKey.digest(), initData.encode(), hashlib.sha256)
 
         if hmac.compare_digest(knownHash, digest.hexdigest()):
-            print("data validated!")
+            logger.info("Miniapp payload hash validated.")
             member = MemberManager().getMemberByTelegramID(memberTelegramID)
             if member is not None:
                 return member["member_id"]
@@ -575,6 +972,1036 @@ class MemberManager:
     @property
     def rolesList(self):
         return self.__rolesList
+
+
+class CollaborationWorkspaceManager:
+    _instance = None
+    _ALLOWED_PROCESS_STATUS = {"active", "paused", "blocked", "completed", "cancelled"}
+    _ALLOWED_STEP_STATUS = {"pending", "in_progress", "blocked", "completed", "skipped", "cancelled"}
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(CollaborationWorkspaceManager, cls).__new__(cls)
+            connection = None
+            try:
+                connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+                cursor = connection.cursor()
+                logger.debug("PostgreSQL connection established for collaboration workspace.")
+                execute_migration(cursor, "084_agent_process_workspace.sql")
+                connection.commit()
+                execute_migration(cursor, "085_member_outbox.sql")
+                connection.commit()
+                cursor.close()
+            except psycopg.Error as error:
+                logger.error(f"Exception while preparing collaboration workspace tables:\n{error}")
+            finally:
+                if connection:
+                    connection.close()
+                    logger.debug("PostgreSQL connection is closed.")
+        return cls._instance
+
+    @staticmethod
+    def _as_int(value: Any, fallback: int | None = None) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    @staticmethod
+    def _as_text(value: Any, fallback: str = "") -> str:
+        text = str(value if value is not None else "").strip()
+        return text if text else fallback
+
+    @staticmethod
+    def _coerce_dict(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        return {}
+
+    @staticmethod
+    def _coerce_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return list(value)
+        return []
+
+    @staticmethod
+    def _timestamp_iso(value: Any) -> str | None:
+        if isinstance(value, datetime):
+            return value.replace(microsecond=0).isoformat()
+        return None
+
+    def _connect(self) -> psycopg.Connection:
+        return psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+
+    def _normalize_process_status(self, value: Any, default: str = "active") -> str:
+        status = self._as_text(value, default).lower()
+        if status not in self._ALLOWED_PROCESS_STATUS:
+            return default
+        return status
+
+    def _normalize_step_status(self, value: Any, default: str = "pending") -> str:
+        status = self._as_text(value, default).lower()
+        if status not in self._ALLOWED_STEP_STATUS:
+            return default
+        return status
+
+    def _normalize_steps(self, raw_steps: Any) -> list[dict[str, Any]]:
+        steps_input: list[Any]
+        if isinstance(raw_steps, str):
+            cleaned = raw_steps.strip()
+            if cleaned == "":
+                steps_input = []
+            else:
+                try:
+                    parsed = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    parsed = []
+                if isinstance(parsed, dict):
+                    steps_input = self._coerce_list(parsed.get("steps"))
+                elif isinstance(parsed, list):
+                    steps_input = parsed
+                else:
+                    steps_input = []
+        elif isinstance(raw_steps, dict):
+            steps_input = self._coerce_list(raw_steps.get("steps"))
+        else:
+            steps_input = self._coerce_list(raw_steps)
+
+        normalized: list[dict[str, Any]] = []
+        for item in steps_input[:400]:
+            if isinstance(item, str):
+                label = self._as_text(item)
+                details = ""
+                status = "pending"
+                required = True
+                payload = {}
+            elif isinstance(item, dict):
+                label = self._as_text(
+                    item.get("label")
+                    or item.get("title")
+                    or item.get("name")
+                    or item.get("step")
+                )
+                details = self._as_text(item.get("details") or item.get("description"))
+                status = self._normalize_step_status(item.get("status"), "pending")
+                required = bool(item.get("required", True))
+                payload = self._coerce_dict(item.get("payload") or item.get("metadata"))
+            else:
+                continue
+
+            if label == "":
+                continue
+            normalized.append(
+                {
+                    "label": label[:240],
+                    "details": details,
+                    "status": status,
+                    "required": required,
+                    "payload": payload,
+                }
+            )
+        return normalized
+
+    def _refresh_process_progress(self, cursor: Any, process_id: int) -> dict[str, Any]:
+        cursor.execute(
+            """SELECT process_status
+            FROM agent_processes
+            WHERE process_id = %s
+            LIMIT 1;""",
+            (process_id,),
+        )
+        process_row = cursor.fetchone()
+        if process_row is None:
+            return {"steps_total": 0, "steps_completed": 0, "completion_percent": 0.0}
+
+        current_status = self._normalize_process_status(process_row.get("process_status"), "active")
+        cursor.execute(
+            """SELECT
+                COUNT(*)::INT AS total_steps,
+                COALESCE(SUM(CASE WHEN step_status IN ('completed', 'skipped') THEN 1 ELSE 0 END), 0)::INT AS completed_steps
+            FROM agent_process_steps
+            WHERE process_id = %s;""",
+            (process_id,),
+        )
+        counts = cursor.fetchone() or {}
+        total_steps = max(0, self._as_int(counts.get("total_steps"), 0) or 0)
+        completed_steps = max(0, self._as_int(counts.get("completed_steps"), 0) or 0)
+        completion_percent = 0.0 if total_steps <= 0 else round((completed_steps / total_steps) * 100.0, 2)
+
+        next_status = current_status
+        completed_at = None
+        if current_status not in {"cancelled"}:
+            if total_steps > 0 and completed_steps >= total_steps:
+                next_status = "completed"
+                completed_at = datetime.now()
+            elif current_status == "completed" and completed_steps < total_steps:
+                next_status = "active"
+
+        cursor.execute(
+            """UPDATE agent_processes
+            SET process_status = %s,
+                steps_total = %s,
+                steps_completed = %s,
+                completion_percent = %s,
+                updated_at = NOW(),
+                completed_at = CASE
+                    WHEN %s = 'completed' THEN COALESCE(completed_at, NOW())
+                    WHEN %s != 'completed' THEN NULL
+                    ELSE completed_at
+                END
+            WHERE process_id = %s;""",
+            (
+                next_status,
+                total_steps,
+                completed_steps,
+                completion_percent,
+                next_status,
+                next_status,
+                process_id,
+            ),
+        )
+        return {
+            "steps_total": total_steps,
+            "steps_completed": completed_steps,
+            "completion_percent": completion_percent,
+            "process_status": next_status,
+        }
+
+    def listKnownUsers(
+        self,
+        queryString: str | None = None,
+        count: int = 20,
+        include_without_username: bool = False,
+    ) -> list[dict[str, Any]]:
+        limit = min(100, max(1, self._as_int(count, 20) or 20))
+        query = self._as_text(queryString).lower()
+        include_no_username = bool(include_without_username)
+
+        connection = None
+        response: list[dict[str, Any]] = []
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            where_parts = []
+            values: list[Any] = []
+            if not include_no_username:
+                where_parts.append("COALESCE(tg.username, '') <> ''")
+
+            if query:
+                like = f"%{query}%"
+                where_parts.append(
+                    "("
+                    "LOWER(COALESCE(tg.username, '')) LIKE %s "
+                    "OR LOWER(COALESCE(mem.first_name, '')) LIKE %s "
+                    "OR LOWER(COALESCE(mem.last_name, '')) LIKE %s "
+                    "OR CAST(mem.member_id AS TEXT) = %s "
+                    "OR CAST(COALESCE(tg.user_id, 0) AS TEXT) = %s"
+                    ")"
+                )
+                values.extend([like, like, like, query, query])
+
+            where_sql = ""
+            if where_parts:
+                where_sql = "WHERE " + " AND ".join(where_parts)
+
+            cursor.execute(
+                f"""SELECT mem.member_id, mem.first_name, mem.last_name, mem.community_score, mem.roles, tg.username, tg.user_id
+                FROM member_data AS mem
+                LEFT JOIN member_telegram AS tg
+                ON mem.member_id = tg.member_id
+                {where_sql}
+                ORDER BY LOWER(COALESCE(tg.username, '')), mem.member_id
+                LIMIT %s;""",
+                (*values, limit),
+            )
+            records = cursor.fetchall() or []
+            for row in records:
+                row_map = self._coerce_dict(row)
+                response.append(
+                    {
+                        "member_id": row_map.get("member_id"),
+                        "username": self._as_text(row_map.get("username")),
+                        "user_id": row_map.get("user_id"),
+                        "first_name": row_map.get("first_name"),
+                        "last_name": row_map.get("last_name"),
+                        "community_score": row_map.get("community_score"),
+                        "roles": row_map.get("roles") if isinstance(row_map.get("roles"), list) else [],
+                        "has_telegram_user_id": row_map.get("user_id") is not None,
+                    }
+                )
+            cursor.close()
+        except psycopg.Error as error:
+            logger.error(f"Exception while listing known users:\n{error}")
+        finally:
+            if connection:
+                connection.close()
+        return response
+
+    def resolveKnownUser(
+        self,
+        *,
+        username: str | None = None,
+        memberID: int | None = None,
+    ) -> dict[str, Any] | None:
+        clean_username = self._as_text(username).lstrip("@")
+        member_id = self._as_int(memberID)
+
+        if member_id is None and clean_username == "":
+            return None
+
+        connection = None
+        response = None
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            if member_id is not None:
+                cursor.execute(
+                    """SELECT mem.member_id, mem.first_name, mem.last_name, mem.community_score, mem.roles, tg.username, tg.user_id
+                    FROM member_data AS mem
+                    LEFT JOIN member_telegram AS tg
+                    ON mem.member_id = tg.member_id
+                    WHERE mem.member_id = %s
+                    LIMIT 1;""",
+                    (member_id,),
+                )
+            else:
+                cursor.execute(
+                    """SELECT mem.member_id, mem.first_name, mem.last_name, mem.community_score, mem.roles, tg.username, tg.user_id
+                    FROM member_data AS mem
+                    LEFT JOIN member_telegram AS tg
+                    ON mem.member_id = tg.member_id
+                    WHERE LOWER(COALESCE(tg.username, '')) = LOWER(%s)
+                    LIMIT 1;""",
+                    (clean_username,),
+                )
+            result = cursor.fetchone()
+            cursor.close()
+            if result is not None:
+                result_map = self._coerce_dict(result)
+                response = {
+                    "member_id": result_map.get("member_id"),
+                    "username": self._as_text(result_map.get("username")),
+                    "user_id": result_map.get("user_id"),
+                    "first_name": result_map.get("first_name"),
+                    "last_name": result_map.get("last_name"),
+                    "community_score": result_map.get("community_score"),
+                    "roles": result_map.get("roles") if isinstance(result_map.get("roles"), list) else [],
+                }
+        except psycopg.Error as error:
+            logger.error(f"Exception while resolving known user:\n{error}")
+        finally:
+            if connection:
+                connection.close()
+        return response
+
+    def createOrUpdateProcess(
+        self,
+        *,
+        ownerMemberID: int,
+        processLabel: str,
+        processDescription: str | None = None,
+        processSpec: Any = None,
+        processID: int | None = None,
+        processStatus: str = "active",
+        replaceSteps: bool = True,
+    ) -> dict[str, Any]:
+        owner_id = self._as_int(ownerMemberID)
+        if owner_id is None or owner_id <= 0:
+            return {"status": "error", "error": "owner_member_id_required"}
+
+        label = self._as_text(processLabel)
+        if label == "":
+            return {"status": "error", "error": "process_label_required"}
+        description = self._as_text(processDescription)
+        normalized_status = self._normalize_process_status(processStatus, "active")
+        normalized_steps = self._normalize_steps(processSpec)
+
+        parsed_spec: Any = processSpec
+        if isinstance(processSpec, str):
+            try:
+                parsed_spec = json.loads(processSpec)
+            except json.JSONDecodeError:
+                parsed_spec = {"raw_text": processSpec}
+        if isinstance(parsed_spec, list):
+            parsed_spec = {"steps": parsed_spec}
+        if not isinstance(parsed_spec, dict):
+            parsed_spec = {"spec": parsed_spec}
+        if "steps" not in parsed_spec and normalized_steps:
+            parsed_spec["steps"] = normalized_steps
+
+        connection = None
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            process_id = self._as_int(processID)
+            if process_id is not None and process_id > 0:
+                cursor.execute(
+                    """SELECT process_id
+                    FROM agent_processes
+                    WHERE process_id = %s AND owner_member_id = %s
+                    LIMIT 1;""",
+                    (process_id, owner_id),
+                )
+                existing = cursor.fetchone()
+                if existing is None:
+                    cursor.close()
+                    connection.rollback()
+                    return {"status": "error", "error": "process_not_found"}
+
+                cursor.execute(
+                    """UPDATE agent_processes
+                    SET process_label = %s,
+                        process_description = %s,
+                        process_status = %s,
+                        process_payload = %s::jsonb,
+                        updated_at = NOW()
+                    WHERE process_id = %s
+                    RETURNING process_id;""",
+                    (label[:160], description, normalized_status, json.dumps(parsed_spec), process_id),
+                )
+                updated = cursor.fetchone()
+                process_id = self._as_int(updated.get("process_id") if isinstance(updated, dict) else None)
+            else:
+                cursor.execute(
+                    """INSERT INTO agent_processes (
+                        owner_member_id,
+                        process_label,
+                        process_description,
+                        process_status,
+                        process_payload,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s::jsonb, NOW(), NOW())
+                    RETURNING process_id;""",
+                    (owner_id, label[:160], description, normalized_status, json.dumps(parsed_spec)),
+                )
+                inserted = cursor.fetchone()
+                process_id = self._as_int(inserted.get("process_id") if isinstance(inserted, dict) else None)
+
+            if process_id is None:
+                cursor.close()
+                connection.rollback()
+                return {"status": "error", "error": "process_write_failed"}
+
+            if replaceSteps:
+                cursor.execute(
+                    "DELETE FROM agent_process_steps WHERE process_id = %s;",
+                    (process_id,),
+                )
+
+            if normalized_steps:
+                for index, step in enumerate(normalized_steps, start=1):
+                    step_status = self._normalize_step_status(step.get("status"), "pending")
+                    cursor.execute(
+                        """INSERT INTO agent_process_steps (
+                            process_id,
+                            step_order,
+                            step_label,
+                            step_details,
+                            step_status,
+                            is_required,
+                            step_payload,
+                            created_at,
+                            updated_at,
+                            completed_at
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, %s::jsonb, NOW(), NOW(),
+                            CASE WHEN %s = 'completed' THEN NOW() ELSE NULL END
+                        );""",
+                        (
+                            process_id,
+                            index,
+                            self._as_text(step.get("label"))[:240],
+                            self._as_text(step.get("details")),
+                            step_status,
+                            bool(step.get("required", True)),
+                            json.dumps(self._coerce_dict(step.get("payload"))),
+                            step_status,
+                        ),
+                    )
+
+            self._refresh_process_progress(cursor, process_id)
+            connection.commit()
+            cursor.close()
+            result = self.getProcessByID(owner_id, process_id, include_steps=True)
+            if result is None:
+                return {"status": "error", "error": "process_lookup_failed"}
+            return {"status": "ok", "process": result}
+        except psycopg.Error as error:
+            if connection:
+                connection.rollback()
+            logger.error(f"Exception while creating/updating process workspace:\n{error}")
+            return {"status": "error", "error": "database_error", "detail": str(error)}
+        finally:
+            if connection:
+                connection.close()
+
+    def getProcessByID(
+        self,
+        ownerMemberID: int,
+        processID: int,
+        include_steps: bool = True,
+    ) -> dict[str, Any] | None:
+        owner_id = self._as_int(ownerMemberID)
+        process_id = self._as_int(processID)
+        if owner_id is None or process_id is None:
+            return None
+
+        connection = None
+        response = None
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            cursor.execute(
+                """SELECT
+                    process_id,
+                    owner_member_id,
+                    process_label,
+                    process_description,
+                    process_status,
+                    completion_percent,
+                    steps_total,
+                    steps_completed,
+                    process_payload,
+                    created_at,
+                    updated_at,
+                    completed_at
+                FROM agent_processes
+                WHERE process_id = %s
+                AND owner_member_id = %s
+                LIMIT 1;""",
+                (process_id, owner_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                cursor.close()
+                return None
+            process_row = self._coerce_dict(row)
+            response = {
+                "process_id": process_row.get("process_id"),
+                "owner_member_id": process_row.get("owner_member_id"),
+                "process_label": process_row.get("process_label"),
+                "process_description": process_row.get("process_description"),
+                "process_status": process_row.get("process_status"),
+                "completion_percent": process_row.get("completion_percent"),
+                "steps_total": process_row.get("steps_total"),
+                "steps_completed": process_row.get("steps_completed"),
+                "process_payload": self._coerce_dict(process_row.get("process_payload")),
+                "created_at": self._timestamp_iso(process_row.get("created_at")),
+                "updated_at": self._timestamp_iso(process_row.get("updated_at")),
+                "completed_at": self._timestamp_iso(process_row.get("completed_at")),
+            }
+
+            steps: list[dict[str, Any]] = []
+            if include_steps:
+                cursor.execute(
+                    """SELECT
+                        step_id,
+                        process_id,
+                        step_order,
+                        step_label,
+                        step_details,
+                        step_status,
+                        is_required,
+                        step_payload,
+                        created_at,
+                        updated_at,
+                        completed_at
+                    FROM agent_process_steps
+                    WHERE process_id = %s
+                    ORDER BY step_order ASC, step_id ASC;""",
+                    (process_id,),
+                )
+                rows = cursor.fetchall() or []
+                for step_row in rows:
+                    step_map = self._coerce_dict(step_row)
+                    steps.append(
+                        {
+                            "step_id": step_map.get("step_id"),
+                            "step_order": step_map.get("step_order"),
+                            "step_label": step_map.get("step_label"),
+                            "step_details": step_map.get("step_details"),
+                            "step_status": step_map.get("step_status"),
+                            "is_required": bool(step_map.get("is_required", True)),
+                            "step_payload": self._coerce_dict(step_map.get("step_payload")),
+                            "created_at": self._timestamp_iso(step_map.get("created_at")),
+                            "updated_at": self._timestamp_iso(step_map.get("updated_at")),
+                            "completed_at": self._timestamp_iso(step_map.get("completed_at")),
+                        }
+                    )
+                response["steps"] = steps
+                response["next_missing_steps"] = [
+                    step for step in steps if step.get("step_status") not in {"completed", "skipped", "cancelled"}
+                ][:5]
+            cursor.close()
+        except psycopg.Error as error:
+            logger.error(f"Exception while getting process workspace data:\n{error}")
+        finally:
+            if connection:
+                connection.close()
+        return response
+
+    def listProcesses(
+        self,
+        ownerMemberID: int,
+        processStatus: str | None = "active",
+        count: int = 12,
+        include_steps: bool = False,
+    ) -> list[dict[str, Any]]:
+        owner_id = self._as_int(ownerMemberID)
+        if owner_id is None or owner_id <= 0:
+            return []
+        limit = min(100, max(1, self._as_int(count, 12) or 12))
+        status_filter = self._as_text(processStatus, "active").lower()
+
+        connection = None
+        output: list[dict[str, Any]] = []
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            if status_filter in {"all", "*", ""}:
+                cursor.execute(
+                    """SELECT process_id
+                    FROM agent_processes
+                    WHERE owner_member_id = %s
+                    ORDER BY updated_at DESC, process_id DESC
+                    LIMIT %s;""",
+                    (owner_id, limit),
+                )
+            else:
+                cursor.execute(
+                    """SELECT process_id
+                    FROM agent_processes
+                    WHERE owner_member_id = %s
+                    AND process_status = %s
+                    ORDER BY updated_at DESC, process_id DESC
+                    LIMIT %s;""",
+                    (owner_id, status_filter, limit),
+                )
+            rows = cursor.fetchall() or []
+            cursor.close()
+            for row in rows:
+                process_id = self._as_int(self._coerce_dict(row).get("process_id"))
+                if process_id is None:
+                    continue
+                process_data = self.getProcessByID(owner_id, process_id, include_steps=include_steps)
+                if process_data is not None:
+                    output.append(process_data)
+        except psycopg.Error as error:
+            logger.error(f"Exception while listing process workspace records:\n{error}")
+        finally:
+            if connection:
+                connection.close()
+        return output
+
+    def updateProcessStep(
+        self,
+        *,
+        ownerMemberID: int,
+        processID: int,
+        stepID: int | None = None,
+        stepOrder: int | None = None,
+        stepLabel: str | None = None,
+        stepStatus: str = "completed",
+        stepDetails: str | None = None,
+        stepPayload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        owner_id = self._as_int(ownerMemberID)
+        process_id = self._as_int(processID)
+        if owner_id is None or process_id is None:
+            return {"status": "error", "error": "invalid_process_reference"}
+
+        normalized_status = self._normalize_step_status(stepStatus, "completed")
+        normalized_label = self._as_text(stepLabel)
+        payload_map = self._coerce_dict(stepPayload)
+
+        connection = None
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            cursor.execute(
+                """SELECT process_id
+                FROM agent_processes
+                WHERE process_id = %s AND owner_member_id = %s
+                LIMIT 1;""",
+                (process_id, owner_id),
+            )
+            process_row = cursor.fetchone()
+            if process_row is None:
+                cursor.close()
+                connection.rollback()
+                return {"status": "error", "error": "process_not_found"}
+
+            target_step_id = self._as_int(stepID)
+            step_row = None
+            if target_step_id is not None:
+                cursor.execute(
+                    """SELECT step_id, step_details, step_payload
+                    FROM agent_process_steps
+                    WHERE process_id = %s AND step_id = %s
+                    LIMIT 1;""",
+                    (process_id, target_step_id),
+                )
+                step_row = cursor.fetchone()
+            elif self._as_int(stepOrder) is not None:
+                cursor.execute(
+                    """SELECT step_id, step_details, step_payload
+                    FROM agent_process_steps
+                    WHERE process_id = %s AND step_order = %s
+                    LIMIT 1;""",
+                    (process_id, self._as_int(stepOrder)),
+                )
+                step_row = cursor.fetchone()
+            elif normalized_label:
+                cursor.execute(
+                    """SELECT step_id, step_details, step_payload
+                    FROM agent_process_steps
+                    WHERE process_id = %s
+                    AND LOWER(step_label) = LOWER(%s)
+                    LIMIT 1;""",
+                    (process_id, normalized_label),
+                )
+                step_row = cursor.fetchone()
+
+            if step_row is None and normalized_label:
+                cursor.execute(
+                    """SELECT COALESCE(MAX(step_order), 0)::INT AS max_step_order
+                    FROM agent_process_steps
+                    WHERE process_id = %s;""",
+                    (process_id,),
+                )
+                max_row = cursor.fetchone() or {}
+                next_order = (self._as_int(self._coerce_dict(max_row).get("max_step_order"), 0) or 0) + 1
+                cursor.execute(
+                    """INSERT INTO agent_process_steps (
+                        process_id,
+                        step_order,
+                        step_label,
+                        step_details,
+                        step_status,
+                        is_required,
+                        step_payload,
+                        created_at,
+                        updated_at,
+                        completed_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, TRUE, %s::jsonb, NOW(), NOW(),
+                        CASE WHEN %s = 'completed' THEN NOW() ELSE NULL END
+                    )
+                    RETURNING step_id;""",
+                    (
+                        process_id,
+                        next_order,
+                        normalized_label[:240],
+                        self._as_text(stepDetails),
+                        normalized_status,
+                        json.dumps(payload_map),
+                        normalized_status,
+                    ),
+                )
+                inserted = cursor.fetchone() or {}
+                target_step_id = self._as_int(self._coerce_dict(inserted).get("step_id"))
+            elif step_row is None:
+                cursor.close()
+                connection.rollback()
+                return {"status": "error", "error": "step_not_found"}
+            else:
+                step_map = self._coerce_dict(step_row)
+                target_step_id = self._as_int(step_map.get("step_id"))
+                existing_details = self._as_text(step_map.get("step_details"))
+                existing_payload = self._coerce_dict(step_map.get("step_payload"))
+                merged_payload = dict(existing_payload)
+                merged_payload.update(payload_map)
+                next_details = existing_details if stepDetails is None else self._as_text(stepDetails)
+                cursor.execute(
+                    """UPDATE agent_process_steps
+                    SET step_status = %s,
+                        step_details = %s,
+                        step_payload = %s::jsonb,
+                        updated_at = NOW(),
+                        completed_at = CASE
+                            WHEN %s = 'completed' THEN NOW()
+                            WHEN %s != 'completed' THEN NULL
+                            ELSE completed_at
+                        END
+                    WHERE process_id = %s AND step_id = %s;""",
+                    (
+                        normalized_status,
+                        next_details,
+                        json.dumps(merged_payload),
+                        normalized_status,
+                        normalized_status,
+                        process_id,
+                        target_step_id,
+                    ),
+                )
+
+            self._refresh_process_progress(cursor, process_id)
+            connection.commit()
+            cursor.close()
+            process_data = self.getProcessByID(owner_id, process_id, include_steps=True)
+            if process_data is None:
+                return {"status": "error", "error": "process_lookup_failed"}
+            return {"status": "ok", "process": process_data, "updated_step_id": target_step_id}
+        except psycopg.Error as error:
+            if connection:
+                connection.rollback()
+            logger.error(f"Exception while updating process step:\n{error}")
+            return {"status": "error", "error": "database_error", "detail": str(error)}
+        finally:
+            if connection:
+                connection.close()
+
+    def queueOrSendUserMessage(
+        self,
+        *,
+        senderMemberID: int | None,
+        targetUsername: str | None = None,
+        targetMemberID: int | None = None,
+        messageText: str,
+        deliveryChannel: str = "telegram",
+        processID: int | None = None,
+        sendNow: bool = True,
+    ) -> dict[str, Any]:
+        clean_message = self._as_text(messageText)
+        if clean_message == "":
+            return {"status": "error", "error": "message_text_required"}
+
+        target_member = self.resolveKnownUser(username=targetUsername, memberID=targetMemberID)
+        if target_member is None:
+            suggestions = self.listKnownUsers(queryString=targetUsername, count=5)
+            return {
+                "status": "error",
+                "error": "target_member_not_found",
+                "target_username": self._as_text(targetUsername),
+                "target_member_id": self._as_int(targetMemberID),
+                "known_user_suggestions": suggestions,
+            }
+
+        sender_id = self._as_int(senderMemberID)
+        target_member_id = self._as_int(target_member.get("member_id"))
+        target_telegram_id = self._as_int(target_member.get("user_id"))
+        channel = self._as_text(deliveryChannel, "telegram").lower()
+        process_id = self._as_int(processID)
+
+        connection = None
+        outbox_row: dict[str, Any] | None = None
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            cursor.execute(
+                """INSERT INTO member_outbox (
+                    sender_member_id,
+                    target_member_id,
+                    target_username,
+                    delivery_channel,
+                    message_text,
+                    delivery_status,
+                    process_id,
+                    metadata,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s::jsonb, NOW(), NOW())
+                RETURNING
+                    outbox_id,
+                    sender_member_id,
+                    target_member_id,
+                    target_username,
+                    delivery_channel,
+                    message_text,
+                    delivery_status,
+                    process_id,
+                    metadata,
+                    created_at,
+                    updated_at,
+                    delivered_at,
+                    failure_reason;""",
+                (
+                    sender_id,
+                    target_member_id,
+                    self._as_text(target_member.get("username")),
+                    channel,
+                    clean_message,
+                    process_id,
+                    json.dumps({"send_now_requested": bool(sendNow)}),
+                ),
+            )
+            inserted = cursor.fetchone()
+            outbox_row = self._coerce_dict(inserted)
+            outbox_id = self._as_int(outbox_row.get("outbox_id"))
+
+            delivery_status = "queued"
+            failure_reason = None
+            metadata_update = self._coerce_dict(outbox_row.get("metadata"))
+            delivery_result = None
+
+            if sendNow and channel == "telegram":
+                bot_token = self._as_text(ConfigManager()._instance.bot_token)
+                if bot_token == "":
+                    delivery_status = "failed"
+                    failure_reason = "bot_token_missing"
+                elif target_telegram_id is None:
+                    delivery_status = "failed"
+                    failure_reason = "target_user_missing_telegram_id"
+                else:
+                    send_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                    try:
+                        telegram_response = requests.post(
+                            send_url,
+                            json={"chat_id": target_telegram_id, "text": clean_message},
+                            timeout=12.0,
+                        )
+                        response_payload = telegram_response.json()
+                        delivery_result = response_payload
+                        metadata_update["telegram_http_status"] = telegram_response.status_code
+                        metadata_update["telegram_response"] = response_payload
+                        if telegram_response.ok and isinstance(response_payload, dict) and bool(response_payload.get("ok")):
+                            delivery_status = "sent"
+                        else:
+                            delivery_status = "failed"
+                            failure_reason = self._as_text(
+                                self._coerce_dict(response_payload).get("description"),
+                                f"telegram_send_http_{telegram_response.status_code}",
+                            )
+                    except Exception as error:  # noqa: BLE001
+                        delivery_status = "failed"
+                        failure_reason = f"telegram_send_exception:{error}"
+
+            if outbox_id is not None and delivery_status != "queued":
+                cursor.execute(
+                    """UPDATE member_outbox
+                    SET delivery_status = %s,
+                        updated_at = NOW(),
+                        delivered_at = CASE WHEN %s = 'sent' THEN NOW() ELSE delivered_at END,
+                        failure_reason = %s,
+                        metadata = %s::jsonb
+                    WHERE outbox_id = %s
+                    RETURNING
+                        outbox_id,
+                        sender_member_id,
+                        target_member_id,
+                        target_username,
+                        delivery_channel,
+                        message_text,
+                        delivery_status,
+                        process_id,
+                        metadata,
+                        created_at,
+                        updated_at,
+                        delivered_at,
+                        failure_reason;""",
+                    (
+                        delivery_status,
+                        delivery_status,
+                        failure_reason,
+                        json.dumps(metadata_update),
+                        outbox_id,
+                    ),
+                )
+                outbox_row = self._coerce_dict(cursor.fetchone())
+            connection.commit()
+            cursor.close()
+
+            outbox = {
+                "outbox_id": outbox_row.get("outbox_id"),
+                "sender_member_id": outbox_row.get("sender_member_id"),
+                "target_member_id": outbox_row.get("target_member_id"),
+                "target_username": outbox_row.get("target_username"),
+                "delivery_channel": outbox_row.get("delivery_channel"),
+                "message_text": outbox_row.get("message_text"),
+                "delivery_status": outbox_row.get("delivery_status"),
+                "process_id": outbox_row.get("process_id"),
+                "metadata": self._coerce_dict(outbox_row.get("metadata")),
+                "created_at": self._timestamp_iso(outbox_row.get("created_at")),
+                "updated_at": self._timestamp_iso(outbox_row.get("updated_at")),
+                "delivered_at": self._timestamp_iso(outbox_row.get("delivered_at")),
+                "failure_reason": outbox_row.get("failure_reason"),
+            }
+            return {
+                "status": "ok",
+                "target_member": target_member,
+                "outbox": outbox,
+                "delivery_result": delivery_result,
+            }
+        except psycopg.Error as error:
+            if connection:
+                connection.rollback()
+            logger.error(f"Exception while queueing/sending user message:\n{error}")
+            return {"status": "error", "error": "database_error", "detail": str(error)}
+        finally:
+            if connection:
+                connection.close()
+
+    def listOutboxForMember(
+        self,
+        *,
+        memberID: int,
+        count: int = 20,
+        deliveryStatus: str | None = None,
+    ) -> list[dict[str, Any]]:
+        member_id = self._as_int(memberID)
+        if member_id is None or member_id <= 0:
+            return []
+        limit = min(100, max(1, self._as_int(count, 20) or 20))
+        status_filter = self._as_text(deliveryStatus).lower()
+
+        connection = None
+        output: list[dict[str, Any]] = []
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            if status_filter:
+                cursor.execute(
+                    """SELECT outbox_id, sender_member_id, target_member_id, target_username, delivery_channel,
+                    message_text, delivery_status, process_id, metadata, created_at, updated_at, delivered_at, failure_reason
+                    FROM member_outbox
+                    WHERE (sender_member_id = %s OR target_member_id = %s)
+                    AND delivery_status = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s;""",
+                    (member_id, member_id, status_filter, limit),
+                )
+            else:
+                cursor.execute(
+                    """SELECT outbox_id, sender_member_id, target_member_id, target_username, delivery_channel,
+                    message_text, delivery_status, process_id, metadata, created_at, updated_at, delivered_at, failure_reason
+                    FROM member_outbox
+                    WHERE (sender_member_id = %s OR target_member_id = %s)
+                    ORDER BY created_at DESC
+                    LIMIT %s;""",
+                    (member_id, member_id, limit),
+                )
+            rows = cursor.fetchall() or []
+            cursor.close()
+            for row in rows:
+                row_map = self._coerce_dict(row)
+                output.append(
+                    {
+                        "outbox_id": row_map.get("outbox_id"),
+                        "sender_member_id": row_map.get("sender_member_id"),
+                        "target_member_id": row_map.get("target_member_id"),
+                        "target_username": row_map.get("target_username"),
+                        "delivery_channel": row_map.get("delivery_channel"),
+                        "message_text": row_map.get("message_text"),
+                        "delivery_status": row_map.get("delivery_status"),
+                        "process_id": row_map.get("process_id"),
+                        "metadata": self._coerce_dict(row_map.get("metadata")),
+                        "created_at": self._timestamp_iso(row_map.get("created_at")),
+                        "updated_at": self._timestamp_iso(row_map.get("updated_at")),
+                        "delivered_at": self._timestamp_iso(row_map.get("delivered_at")),
+                        "failure_reason": row_map.get("failure_reason"),
+                    }
+                )
+        except psycopg.Error as error:
+            logger.error(f"Exception while listing outbox messages:\n{error}")
+        finally:
+            if connection:
+                connection.close()
+        return output
 
 
 class ChatHistoryManager:
@@ -593,31 +2020,29 @@ class ChatHistoryManager:
                 logger.debug(f"PostgreSQL connection established.")
                 
                 # Create the chat history table if it does not exist
-                memberHistory_sql = """CREATE TABLE IF NOT EXISTS chat_history (
-                    history_id SERIAL PRIMARY KEY,
-                    member_id INT,
-                    community_id INT,
-                    chat_host_id INT,
-                    topic_id INT,
-                    chat_type VARCHAR(16),
-                    platform VARCHAR(24),
-                    message_id INT NOT NULL,
-                    message_text TEXT,
-                    message_timestamp TIMESTAMP
-                );"""
-                cursor.execute(memberHistory_sql)
-
-                createHistorySQL = """CREATE TABLE IF NOT EXISTS chat_history_embeddings (
-                    embedding_id SERIAL PRIMARY KEY,
-                    history_id INT NOT NULL,
-                    embeddings vector(768),
-                    CONSTRAINT message_link
-                        FOREIGN KEY(history_id)
-                        REFERENCES chat_history(history_id)
-                        ON DELETE CASCADE
-                );"""
-                cursor.execute(createHistorySQL)
+                execute_migration(cursor, "010_chat_history.sql")
                 connection.commit()
+
+                # pgvector can be unavailable in some local environments. Keep
+                # base chat history available even if embeddings setup fails.
+                vectorDimensions = max(1, ConfigManager().runtimeInt("vectors.embedding_dimensions", 768))
+                try:
+                    execute_migration(cursor, "011_create_vector_extension.sql")
+                    connection.commit()
+                except (Exception, psycopg.DatabaseError) as error:
+                    connection.rollback()
+                    logger.warning(f"Unable to ensure pgvector extension. Continuing without vector features:\n{error}")
+
+                try:
+                    execute_migration(
+                        cursor,
+                        "012_chat_history_embeddings.sql",
+                        context={"vector_dimensions": vectorDimensions},
+                    )
+                    connection.commit()
+                except (Exception, psycopg.DatabaseError) as error:
+                    connection.rollback()
+                    logger.warning(f"Unable to create chat_history_embeddings table. Continuing without embeddings persistence:\n{error}")
 
                 # close the communication with the PostgreSQL
                 cursor.close()
@@ -631,15 +2056,33 @@ class ChatHistoryManager:
         
         return cls._instance
     
-    def addChatHistory(self, messageID: int, messageText: str, platform: str, memberID: int = None, communityID: int = None, chatHostID: int = None, topicID: int = None, timestamp: datetime = datetime.now()) -> int:
+    def addChatHistory(
+        self,
+        messageID: int,
+        messageText: str,
+        platform: str,
+        memberID: int = None,
+        communityID: int = None,
+        chatHostID: int = None,
+        topicID: int = None,
+        timestamp: datetime | None = None,
+    ) -> int:
         logger.info(f"Adding a new chat history record.")
         chatHostID = chatHostID if chatHostID else communityID if communityID else memberID
         if not chatHostID:
             return
         
         chatType = "community" if communityID is not None else "member"
-        
-        embedding = getEmbeddings(messageText)
+        deferEmbeddings = _defer_embeddings_on_write_enabled()
+        embedding = None if deferEmbeddings else getEmbeddings(messageText)
+
+        if isinstance(timestamp, datetime):
+            timestampValue = timestamp
+        else:
+            timestampValue = datetime.now(timezone.utc)
+        if timestampValue.tzinfo is not None:
+            # Persist UTC wall-clock without timezone to match existing TIMESTAMP column.
+            timestampValue = timestampValue.astimezone(timezone.utc).replace(tzinfo=None)
 
         connection = None
         response = None
@@ -651,17 +2094,34 @@ class ChatHistoryManager:
             insertHistory_sql = """INSERT INTO chat_history (member_id, community_id, chat_host_id, topic_id, chat_type, platform, message_id, message_text, message_timestamp)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING history_id;"""
-            cursor.execute(insertHistory_sql, (memberID, communityID, chatHostID, topicID, chatType, platform, messageID, messageText, timestamp))
+            cursor.execute(
+                insertHistory_sql,
+                (memberID, communityID, chatHostID, topicID, chatType, platform, messageID, messageText, timestampValue),
+            )
             result = cursor.fetchone()
             historyID = result.get("history_id")
-            
-            insertEmbeddings_sql = """INSERT INTO chat_history_embeddings (history_id, embeddings)
-            VALUES (%s, %s);"""
-            cursor.execute(insertEmbeddings_sql, (historyID, embedding))
-
             response = historyID
 
             connection.commit()
+
+            if deferEmbeddings:
+                enqueued = _enqueue_chat_embedding(historyID, messageText)
+                if not enqueued:
+                    logger.warning(
+                        "Deferred embedding enqueue failed for history id %s; falling back to synchronous persistence.",
+                        historyID,
+                    )
+                    _persist_chat_embedding(historyID, messageText, source="sync-fallback")
+            elif embedding is not None:
+                try:
+                    insertEmbeddings_sql = """INSERT INTO chat_history_embeddings (history_id, embeddings)
+                    VALUES (%s, %s);"""
+                    cursor.execute(insertEmbeddings_sql, (historyID, embedding))
+                    connection.commit()
+                except (Exception, psycopg.DatabaseError) as error:
+                    connection.rollback()
+                    logger.warning(f"Unable to persist chat embeddings for history id {historyID}:\n{error}")
+
             # close the communication with the PostgreSQL
             cursor.close()
         except (Exception, psycopg.DatabaseError) as error:
@@ -763,9 +2223,21 @@ class ChatHistoryManager:
             
             return response
 
-    def getChatHistory(self, chatHostID: int, chatType: str, platform: str, topicID: int = None, timeInHours: int = 12, limit: int = 1) -> list:
+    def getChatHistory(
+        self,
+        chatHostID: int,
+        chatType: str,
+        platform: str,
+        topicID: int = None,
+        timeInHours: int | None = None,
+        limit: int | None = None,
+    ) -> list:
         logger.info(f"Getting chat history records.")
-        timePeriod = datetime.now() - timedelta(hours=timeInHours)
+        if timeInHours is None:
+            timeInHours = ConfigManager().runtimeInt("retrieval.chat_history_window_hours", 12)
+        if limit is None:
+            limit = ConfigManager().runtimeInt("retrieval.chat_history_default_limit", 1)
+        timePeriod = datetime.now() - timedelta(hours=max(0, int(timeInHours)))
         
         connection = None
         results = None
@@ -774,25 +2246,34 @@ class ChatHistoryManager:
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
             
-            beginQuery_sql = """SELECT history_id, member_id, message_id, message_text, message_timestamp
+            baseQuery_sql = """SELECT history_id, member_id, message_id, message_text, message_timestamp
                 FROM chat_history
                 WHERE chat_host_id = %s
                 AND chat_type = %s
                 AND platform = %s
                 AND message_timestamp > %s"""
-            
-            endQuery_sql = " ORDER BY message_timestamp;"
 
             valueArray = [chatHostID, chatType, platform, timePeriod]
 
             if topicID:
-                beginQuery_sql = beginQuery_sql + " AND topic_id = %s"
+                baseQuery_sql = baseQuery_sql + " AND topic_id = %s"
                 valueArray.append(topicID)
             else:
-                beginQuery_sql = beginQuery_sql + " AND topic_id IS NULL"
-            
+                baseQuery_sql = baseQuery_sql + " AND topic_id IS NULL"
 
-            historyQuery_sql = beginQuery_sql + endQuery_sql
+            if int(limit) > 0:
+                # Fetch the most recent N records, then reorder chronologically for downstream prompt assembly.
+                historyQuery_sql = (
+                    "SELECT history_id, member_id, message_id, message_text, message_timestamp "
+                    "FROM ("
+                    + baseQuery_sql
+                    + " ORDER BY message_timestamp DESC LIMIT %s"
+                    + ") AS recent_history "
+                    "ORDER BY message_timestamp;"
+                )
+                valueArray.append(int(limit))
+            else:
+                historyQuery_sql = baseQuery_sql + " ORDER BY message_timestamp;"
             cursor.execute(historyQuery_sql, valueArray)
 
             results = cursor.fetchall()
@@ -807,9 +2288,21 @@ class ChatHistoryManager:
             
             return results
 
-    def getChatHistoryWithSenderData(self, chatHostID: int, chatType: str, platform: str, topicID: int = None, timeInHours: int = 12, limit: int = 0) -> list:
+    def getChatHistoryWithSenderData(
+        self,
+        chatHostID: int,
+        chatType: str,
+        platform: str,
+        topicID: int = None,
+        timeInHours: int | None = None,
+        limit: int | None = None,
+    ) -> list:
         logger.info(f"Getting chat history records.")
-        timePeriod = datetime.now() - timedelta(hours=timeInHours)
+        if timeInHours is None:
+            timeInHours = ConfigManager().runtimeInt("retrieval.chat_history_sender_window_hours", 12)
+        if limit is None:
+            limit = ConfigManager().runtimeInt("retrieval.chat_history_sender_default_limit", 0)
+        timePeriod = datetime.now() - timedelta(hours=max(0, int(timeInHours)))
         
         connection = None
         results = None
@@ -818,7 +2311,7 @@ class ChatHistoryManager:
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
             
-            beginQuery_sql = """SELECT ch.history_id, ch.message_id, ch.message_text, ch.message_timestamp, mem.member_id, mem.first_name, mem.last_name
+            baseQuery_sql = """SELECT ch.history_id, ch.message_id, ch.message_text, ch.message_timestamp, mem.member_id, mem.first_name, mem.last_name
                 FROM chat_history AS ch
                 LEFT JOIN member_data AS mem
                 ON ch.member_id = mem.member_id
@@ -826,19 +2319,27 @@ class ChatHistoryManager:
                 AND chat_type = %s
                 AND platform = %s
                 AND message_timestamp > %s"""
-            
-            endQuery_sql = " ORDER BY message_timestamp;"
 
             valueArray = [chatHostID, chatType, platform, timePeriod]
 
             if topicID:
-                beginQuery_sql = beginQuery_sql + " AND topic_id = %s"
+                baseQuery_sql = baseQuery_sql + " AND topic_id = %s"
                 valueArray.append(topicID)
             else:
-                beginQuery_sql = beginQuery_sql + " AND topic_id IS NULL"
-            
+                baseQuery_sql = baseQuery_sql + " AND topic_id IS NULL"
 
-            historyQuery_sql = beginQuery_sql + endQuery_sql
+            if int(limit) > 0:
+                historyQuery_sql = (
+                    "SELECT history_id, message_id, message_text, message_timestamp, member_id, first_name, last_name "
+                    "FROM ("
+                    + baseQuery_sql
+                    + " ORDER BY ch.message_timestamp DESC LIMIT %s"
+                    + ") AS recent_history "
+                    "ORDER BY message_timestamp;"
+                )
+                valueArray.append(int(limit))
+            else:
+                historyQuery_sql = baseQuery_sql + " ORDER BY ch.message_timestamp;"
             cursor.execute(historyQuery_sql, valueArray)
 
             results = cursor.fetchall()
@@ -916,9 +2417,27 @@ class ChatHistoryManager:
             
             return response
 
-    def searchChatHistory(self, text: str, limit: int=1) -> list:
+    def searchChatHistory(
+        self,
+        text: str,
+        limit: int | None = None,
+        chatHostID: int | None = None,
+        chatType: str | None = None,
+        platform: str | None = None,
+        topicID: int | None = None,
+        scopeTopic: bool = False,
+        timeInHours: int | None = None,
+    ) -> list:
         logger.info(f"Searching chat history records.")
         embedding = getEmbeddings(text)
+        if embedding is None:
+            logger.warning("Skipping chat history search because embeddings are unavailable.")
+            return list()
+        if limit is None:
+            limit = ConfigManager().runtimeInt("retrieval.chat_history_default_limit", 1)
+        if timeInHours is None:
+            timeInHours = ConfigManager().runtimeInt("retrieval.chat_history_window_hours", 12)
+        timePeriod = datetime.now() - timedelta(hours=max(0, int(timeInHours)))
         
         connection = None
         response = None
@@ -926,14 +2445,39 @@ class ChatHistoryManager:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
-            
-            querySQL = """SELECT ch.history_id, ch.message_id, ch.message_text, ch.message_timestamp, che.embeddings <-> %s::vector AS distance
+
+            whereClauses = ["ch.message_timestamp > %s"]
+            values: list[Any] = [embedding, timePeriod]
+
+            if chatHostID is not None:
+                whereClauses.append("ch.chat_host_id = %s")
+                values.append(chatHostID)
+            if isinstance(chatType, str) and chatType.strip():
+                whereClauses.append("ch.chat_type = %s")
+                values.append(chatType.strip())
+            if isinstance(platform, str) and platform.strip():
+                whereClauses.append("ch.platform = %s")
+                values.append(platform.strip())
+
+            if scopeTopic:
+                if topicID:
+                    whereClauses.append("ch.topic_id = %s")
+                    values.append(topicID)
+                else:
+                    whereClauses.append("ch.topic_id IS NULL")
+            elif topicID:
+                whereClauses.append("ch.topic_id = %s")
+                values.append(topicID)
+
+            querySQL = f"""SELECT ch.history_id, ch.message_id, ch.message_text, ch.message_timestamp, che.embeddings <-> %s::vector AS distance
             FROM chat_history AS ch
             JOIN chat_history_embeddings AS che
             ON ch.history_id = che.history_id
+            WHERE {" AND ".join(whereClauses)}
             ORDER BY distance
             LIMIT %s"""
-            cursor.execute(querySQL, (embedding, limit))
+            values.append(max(1, int(limit)))
+            cursor.execute(querySQL, values)
             results = cursor.fetchall()
             response = results
             # close the communication with the PostgreSQL
@@ -968,33 +2512,10 @@ class CommunityManager:
                 logger.debug(f"PostgreSQL connection established.")
 
                 # Create the new community data table
-                communityData_sql = """CREATE TABLE IF NOT EXISTS community_data (
-                    community_id SERIAL PRIMARY KEY,
-                    community_name VARCHAR(96),
-                    community_link VARCHAR(256),
-                    roles VARCHAR(32)[],
-                    created_by INT,
-                    register_date TIMESTAMP NOT NULL,
-                    CONSTRAINT member_link
-                        FOREIGN KEY(created_by)
-                        REFERENCES member_data(member_id)
-                        ON DELETE SET NULL
-                );"""
-                cursor.execute(communityData_sql)
+                execute_migration(cursor, "020_community_data.sql")
                 
                 # Create the community telegram table if it doesn't exist
-                communityTelegramTable_sql = """CREATE TABLE IF NOT EXISTS community_telegram (
-                    record_id SERIAL PRIMARY KEY,
-                    community_id INT UNIQUE NOT NULL,
-                    chat_id BIGINT UNIQUE NOT NULL,
-                    chat_title VARCHAR(96),
-                    has_topics BOOL,
-                    CONSTRAINT community_link
-                        FOREIGN KEY(community_id)
-                        REFERENCES community_data(community_id)
-                        ON DELETE CASCADE
-                );"""
-                cursor.execute(communityTelegramTable_sql)
+                execute_migration(cursor, "021_community_telegram.sql")
                 connection.commit()
                 # Close the cursor
                 cursor.close()
@@ -1144,7 +2665,7 @@ class CommunityScoreManager:
     _instance = None
 
     # Set community score rules
-    communityScoreRules = [
+    defaultCommunityScoreRules = [
         {
             "private" : {
                 "min" : 50
@@ -1210,6 +2731,11 @@ class CommunityScoreManager:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(CommunityScoreManager, cls).__new__(cls)
+            configuredRules = ConfigManager().runtimeValue("community.score_rules", cls.defaultCommunityScoreRules)
+            if isinstance(configuredRules, list) and len(configuredRules) > 0:
+                cls._instance.communityScoreRules = configuredRules
+            else:
+                cls._instance.communityScoreRules = cls.defaultCommunityScoreRules
 
             connection = None
             try:
@@ -1218,20 +2744,7 @@ class CommunityScoreManager:
                 logger.debug(f"PostgreSQL connection established.")
                 
                 # Create the individual accounts table if it doesn't exist
-                communityScoreTable_sql = """CREATE TABLE IF NOT EXISTS community_score (
-                    score_id SERIAL PRIMARY KEY,
-                    history_id INTEGER NOT NULL,
-                    event TEXT NOT NULL,
-                    read_score REAL,
-                    points_awarded REAL NOT NULL,
-                    awarded_from_id INTEGER NOT NULL,
-                    multiplier REAL NOT NULL,
-                    CONSTRAINT history_link
-                        FOREIGN KEY(history_id)
-                        REFERENCES chat_history(history_id)
-                        ON DELETE SET NULL
-                );"""
-                cursor.execute(communityScoreTable_sql)
+                execute_migration(cursor, "030_community_score.sql")
 
                 connection.commit()
                 # Close the cursor
@@ -1343,15 +2856,27 @@ class CommunityScoreManager:
 
     def getRateLimits(self, memberID: int, chatType: str) -> int:
         logger.info(f"Get message rate for member id:  {memberID}.")
-        member = MemberManager().getMemberByID(memberID)
+        if isinstance(memberID, dict):
+            member = memberID
+        else:
+            member = MemberManager().getMemberByID(memberID)
 
-        memberScore = member.get("community_score")
+        if member is None:
+            logger.warning(f"Unable to resolve member for rate-limit lookup: {memberID}")
+            return {
+                "message": 0,
+                "image": 0
+            }
+
+        memberScore = member.get("community_score", 0) or 0
         rateLimits = {
             "message": 0,
             "image": 0
         }
         for rule in self.communityScoreRules:
-            if memberScore >= rule[chatType]["min"]:
+            scoreRule = rule.get(chatType) if isinstance(rule.get(chatType), dict) else rule.get("community", {})
+            minScore = scoreRule.get("min", 0)
+            if memberScore >= minScore:
                 rateLimits["message"] = rule["message_per_hour"]
                 rateLimits["image"] = rule["image_per_hour"]
             else:
@@ -1363,33 +2888,275 @@ class CommunityScoreManager:
 class ConfigManager:
     _instance = None
 
+    @staticmethod
+    def _env_db(prefix: str) -> dict | None:
+        db_name = os.getenv(f"{prefix}DB")
+        user = os.getenv(f"{prefix}USER")
+        password = os.getenv(f"{prefix}PASSWORD")
+        host = os.getenv(f"{prefix}HOST")
+        port = os.getenv(f"{prefix}PORT")
+
+        required = (db_name, user, password, host)
+        if any(value is None or value == "" for value in required):
+            return None
+
+        output = {
+            "db_name": db_name,
+            "user": user,
+            "password": password,
+            "host": host,
+        }
+        if port:
+            output["port"] = port
+        return output
+
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _as_non_empty_string(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text if text else None
+
+    @staticmethod
+    def _hydrate_inference_config(
+        inferenceConfig: dict | None,
+        runtimeSettings: dict[str, Any],
+    ) -> dict[str, dict[str, str]]:
+        inferenceConfig = inferenceConfig if isinstance(inferenceConfig, dict) else {}
+        defaultHost = ConfigManager._as_non_empty_string(
+            get_runtime_setting(runtimeSettings, "inference.default_ollama_host", "http://127.0.0.1:11434")
+        ) or "http://127.0.0.1:11434"
+        def _section_model(section_name: str) -> str:
+            section = inferenceConfig.get(section_name)
+            if isinstance(section, dict):
+                return ConfigManager._as_non_empty_string(section.get("model")) or ""
+            return ""
+        fallbackModelFromConfig = (
+            _section_model("chat")
+            or _section_model("tool")
+            or _section_model("generate")
+            or _section_model("multimodal")
+            or _section_model("embedding")
+            or ""
+        )
+        modelDefaults = {
+            "embedding": ConfigManager._as_non_empty_string(
+                get_runtime_setting(runtimeSettings, "inference.default_embedding_model", "")
+            ) or fallbackModelFromConfig,
+            "generate": ConfigManager._as_non_empty_string(
+                get_runtime_setting(runtimeSettings, "inference.default_generate_model", "")
+            ) or fallbackModelFromConfig,
+            "chat": ConfigManager._as_non_empty_string(
+                get_runtime_setting(runtimeSettings, "inference.default_chat_model", "")
+            ) or fallbackModelFromConfig,
+            "tool": ConfigManager._as_non_empty_string(
+                get_runtime_setting(runtimeSettings, "inference.default_tool_model", "")
+            ) or fallbackModelFromConfig,
+            "multimodal": ConfigManager._as_non_empty_string(
+                get_runtime_setting(runtimeSettings, "inference.default_multimodal_model", "")
+            ) or fallbackModelFromConfig,
+        }
+
+        hydrated: dict[str, dict[str, str]] = {}
+        for key, modelDefault in modelDefaults.items():
+            section = inferenceConfig.get(key)
+            if not isinstance(section, dict):
+                section = {}
+            hostValue = ConfigManager._as_non_empty_string(section.get("url")) or defaultHost
+            modelValue = ConfigManager._as_non_empty_string(section.get("model")) or modelDefault
+            hydrated[key] = {
+                "url": hostValue.rstrip("/"),
+                "model": modelValue,
+            }
+        return hydrated
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(ConfigManager, cls).__new__(cls)
+            load_dotenv_file(".env", override=False)
+            configPath = os.getenv("RYO_CONFIG_PATH", "config.json")
             # Open the config file
-            f = open("config.json", "r")
-            config_json = json.load(f)
+            with open(configPath, "r", encoding="utf-8") as f:
+                config_json = json.load(f)
+            runtimeSettings = build_runtime_settings(config_json)
+
             database = config_json.get("database")
-            # Create Database connection string
-            connectionString = f"dbname={database.get('db_name')} user={database.get('user')} password={database.get('password')} host={database.get('host')}"
-            if database.get("port") is not None:
-                connectionString = connectionString + f" port={database.get('port')}"
+            if database is None:
+                database = cls._env_db("POSTGRES_")
+            if not isinstance(database, dict):
+                database = {}
+            if not database.get("host"):
+                database["host"] = cls._as_non_empty_string(
+                    get_runtime_setting(runtimeSettings, "database.default_primary_host", "127.0.0.1")
+                ) or "127.0.0.1"
+            if not database.get("port"):
+                database["port"] = cls._as_non_empty_string(
+                    get_runtime_setting(runtimeSettings, "database.default_primary_port", "5432")
+                ) or "5432"
+
+            databaseFallback = config_json.get("database_fallback")
+            if databaseFallback is None:
+                envFallback = cls._env_db("POSTGRES_FALLBACK_")
+                if envFallback is not None:
+                    envFallback["enabled"] = cls._env_bool("POSTGRES_FALLBACK_ENABLED", default=False)
+                    envFallback["mode"] = os.getenv("POSTGRES_FALLBACK_MODE", "local")
+                    databaseFallback = envFallback
+            if not isinstance(databaseFallback, dict):
+                databaseFallback = {}
+            if not databaseFallback.get("host"):
+                databaseFallback["host"] = cls._as_non_empty_string(
+                    get_runtime_setting(runtimeSettings, "database.default_fallback_host", "127.0.0.1")
+                ) or "127.0.0.1"
+            if not databaseFallback.get("port"):
+                databaseFallback["port"] = cls._as_non_empty_string(
+                    get_runtime_setting(runtimeSettings, "database.default_fallback_port", "5433")
+                ) or "5433"
+
+            fallbackEnabled = None
+            if isinstance(databaseFallback, dict) and "enabled" in databaseFallback:
+                fallbackEnabled = bool(databaseFallback.get("enabled"))
+            connectTimeout = get_runtime_setting(runtimeSettings, "database.connect_timeout_seconds", 2)
+            try:
+                connectTimeoutInt = int(connectTimeout)
+            except (TypeError, ValueError):
+                connectTimeoutInt = 2
+
+            dbRouter = DatabaseRouter(
+                primary_database=database,
+                fallback_database=databaseFallback,
+                fallback_enabled=fallbackEnabled,
+                connect_timeout=connectTimeoutInt,
+            )
+            dbRoute = dbRouter.resolve()
+            connectionString = (
+                dbRoute.active_conninfo
+                or dbRoute.primary_conninfo
+                or dbRoute.fallback_conninfo
+                or ""
+            )
+            defaults = config_json.get("defaults")
+            if not isinstance(defaults, dict):
+                defaults = {}
+
+            inference = cls._hydrate_inference_config(config_json.get("inference"), runtimeSettings)
+            apiKeys = config_json.get("api_keys")
+            if not isinstance(apiKeys, dict):
+                apiKeys = {}
+            twitterKeys = config_json.get("twitter_keys")
+            if not isinstance(twitterKeys, dict):
+                twitterKeys = {}
+            rolesList = config_json.get("roles_list")
+            if not isinstance(rolesList, list):
+                rolesList = ["user", "tester", "marketing", "admin", "owner"]
 
             cls._instance.bot_name = config_json.get("bot_name")
             cls._instance.bot_id = config_json.get("bot_id")
             cls._instance.bot_token = config_json.get("bot_token")
             cls._instance.web_ui_url = config_json.get("web_ui_url")
             cls._instance.owner_info = config_json.get("owner_info")
+            cls._instance.config_path = configPath
+            cls._instance.config_json = config_json
+            cls._instance.config = config_json
+            cls._instance.runtime_settings = runtimeSettings
             cls._instance.database = database
+            cls._instance.database_fallback = databaseFallback
             cls._instance.knowledge_domains = None if config_json.get("knowledge") is None else config_json.get("knowledge").get("domains")
-            cls._instance.roles_list = config_json.get("roles_list")
+            cls._instance.roles_list = rolesList
             cls._instance.db_conninfo = connectionString
-            cls._instance.defaults = config_json.get("defaults")
-            cls._instance.inference = config_json.get("inference")
-            cls._instance.twitter_keys = config_json.get("twitter_keys")
-            cls._instance.brave_keys = config_json["api_keys"].get("brave_search")
+            cls._instance.database_route = dbRoute.to_dict()
+            cls._instance.defaults = defaults
+            cls._instance.inference = inference
+            cls._instance.twitter_keys = twitterKeys
+            cls._instance.brave_keys = apiKeys.get("brave_search", os.getenv("BRAVE_SEARCH_API_KEY"))
+
+            if cls._instance.database_route["status"] == "fallback":
+                logger.warning(
+                    "Database router selected fallback target. "
+                    f"Status={cls._instance.database_route['status']}, "
+                    f"Errors={cls._instance.database_route['errors']}"
+                )
+            elif cls._instance.database_route["status"] == "failed_all":
+                logger.error(
+                    "Database router failed to validate primary/fallback connections. "
+                    f"Errors={cls._instance.database_route['errors']}"
+                )
         
         return cls._instance
+
+    @staticmethod
+    def _is_valid_http_url(value: str | None) -> bool:
+        if value is None:
+            return False
+        parsed = urlparse(str(value).strip())
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    @staticmethod
+    def _is_numeric_id(value) -> bool:
+        if isinstance(value, int):
+            return value > 0
+        if value is None:
+            return False
+        text = str(value).strip()
+        return text.isdigit() and int(text) > 0
+
+    def getTelegramConfigIssues(self, require_owner: bool = True, require_web_ui_url: bool = True) -> list[str]:
+        issues: list[str] = []
+        if not str(self._instance.bot_name or "").strip():
+            issues.append("bot_name")
+        if not self._is_numeric_id(self._instance.bot_id):
+            issues.append("bot_id")
+        if not str(self._instance.bot_token or "").strip():
+            issues.append("bot_token")
+        if require_web_ui_url and not self._is_valid_http_url(self._instance.web_ui_url):
+            issues.append("web_ui_url")
+
+        if require_owner:
+            owner = self._instance.owner_info if isinstance(self._instance.owner_info, dict) else {}
+            if not str(owner.get("first_name", "")).strip():
+                issues.append("owner_info.first_name")
+            if not str(owner.get("last_name", "")).strip():
+                issues.append("owner_info.last_name")
+            if not self._is_numeric_id(owner.get("user_id")):
+                issues.append("owner_info.user_id")
+            if not str(owner.get("username", "")).strip():
+                issues.append("owner_info.username")
+
+        return issues
+
+    def isTelegramConfigValid(self, require_owner: bool = True, require_web_ui_url: bool = True) -> bool:
+        return len(self.getTelegramConfigIssues(require_owner=require_owner, require_web_ui_url=require_web_ui_url)) == 0
+
+    def runtimeValue(self, path: str, default: Any = None) -> Any:
+        return get_runtime_setting(self._instance.runtime_settings, path, default)
+
+    def runtimeInt(self, path: str, default: int) -> int:
+        value = self.runtimeValue(path, default)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(default)
+
+    def runtimeFloat(self, path: str, default: float) -> float:
+        value = self.runtimeValue(path, default)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def runtimeBool(self, path: str, default: bool) -> bool:
+        value = self.runtimeValue(path, default)
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     def updateConfig(self, key, value):
         self.config[key] = value
@@ -1412,6 +3179,14 @@ class ConfigManager:
     def webUIUrl(self) -> str:
         return self._instance.web_ui_url
 
+    @property
+    def databaseRoute(self) -> dict:
+        return self._instance.database_route
+
+    @property
+    def runtimeSettings(self) -> dict:
+        return self._instance.runtime_settings
+
 
 class KnowledgeManager:
     _instance = None
@@ -1426,43 +3201,17 @@ class KnowledgeManager:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                 cursor = connection.cursor()
                 logger.debug(f"PostgreSQL connection established.")
+                vectorDimensions = max(1, ConfigManager().runtimeInt("vectors.embedding_dimensions", 768))
                 
                 # Create the knowledge table if it does not exist
-                createKnowledgeSQL = """CREATE TABLE IF NOT EXISTS knowledge (
-                    knowledge_id SERIAL PRIMARY KEY,
-                    domains TEXT[],
-                    roles TEXT[],
-                    categories TEXT[],
-                    knowledge_document TEXT,
-                    document_metadata JSON,
-                    embeddings vector(768),
-                    record_timestamp TIMESTAMP,
-                    record_metadata JSON
-                );"""
-                cursor.execute(createKnowledgeSQL)
+                execute_migration(
+                    cursor,
+                    "040_knowledge.sql",
+                    context={"vector_dimensions": vectorDimensions},
+                )
 
                 # Create the knowledge retrieval table if it does not exist
-                createRetrievalsSQL = """CREATE TABLE IF NOT EXISTS knowledge_retrievals (
-                    retrieval_id SERIAL PRIMARY KEY,
-                    prompt_id INT,
-                    response_id INT,
-                    knowledge_id INT,
-                    distance DOUBLE PRECISION,
-                    retrieval_timestamp TIMESTAMP,
-                    CONSTRAINT prompt_link
-                        FOREIGN KEY(prompt_id)
-                        REFERENCES chat_history(history_id)
-                        ON DELETE SET NULL,
-                    CONSTRAINT response_link
-                        FOREIGN KEY(response_id)
-                        REFERENCES chat_history(history_id)
-                        ON DELETE SET NULL,
-                    CONSTRAINT knowledge_link
-                        FOREIGN KEY(knowledge_id)
-                        REFERENCES knowledge(knowledge_id)
-                        ON DELETE CASCADE
-                );"""
-                cursor.execute(createRetrievalsSQL)
+                execute_migration(cursor, "041_knowledge_retrievals.sql")
 
                 connection.commit()
 
@@ -1542,10 +3291,11 @@ class KnowledgeManager:
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
 
+            queryLimit = max(1, ConfigManager().runtimeInt("retrieval.knowledge_list_limit", 10))
             querySQL = """SELECT knowledge_id, domains, roles, categories, knowledge_document, document_metadata, record_timestamp, record_metadata
             FROM knowledge
-            LIMIT 10"""
-            cursor.execute(querySQL)
+            LIMIT %s"""
+            cursor.execute(querySQL, (queryLimit,))
             results = cursor.fetchall()
 
             response = results
@@ -1560,9 +3310,14 @@ class KnowledgeManager:
             
             return response
 
-    def searchKnowledge(self, text: str, limit: int=1) -> list:
+    def searchKnowledge(self, text: str, limit: int | None = None) -> list:
         logger.info(f"Searching knowledge documents.")
         embedding = getEmbeddings(text)
+        if embedding is None:
+            logger.warning("Skipping knowledge search because embeddings are unavailable.")
+            return list()
+        if limit is None:
+            limit = ConfigManager().runtimeInt("retrieval.knowledge_search_default_limit", 1)
 
         connection = None
         response = None
@@ -1575,7 +3330,7 @@ class KnowledgeManager:
             FROM knowledge
             ORDER BY distance
             LIMIT %s"""
-            cursor.execute(querySQL, (embedding, limit))
+            cursor.execute(querySQL, (embedding, max(1, int(limit))))
             results = cursor.fetchall()
 
             response = results
@@ -1607,24 +3362,10 @@ class ProposalManager:
                 logger.debug(f"PostgreSQL connection established.")
 
                 # Create the proposals table if it doesn't exist
-                proposalsTable_sql = """CREATE TABLE IF NOT EXISTS proposals (
-                    proposal_id SERIAL PRIMARY KEY,
-                    submitted_from TEXT,
-                    project_title TEXT,
-                    project_description TEXT,
-                    filename TEXT,
-                    submit_date timestamp
-                );"""
-                cursor.execute(proposalsTable_sql)
+                execute_migration(cursor, "050_proposals.sql")
 
                 # Create the proposal disclosure table if it doesn't exist
-                proposalDisclosure_sql = """CREATE TABLE IF NOT EXISTS proposal_disclosure (
-                    disclosure_id SERIAL PRIMARY KEY,
-                    user_id INT,
-                    proposal_id INT,
-                    agreement_date timestamp
-                );"""
-                cursor.execute(proposalDisclosure_sql)
+                execute_migration(cursor, "051_proposal_disclosure.sql")
                 
                 connection.commit()
                 # Close the cursor
@@ -1711,20 +3452,14 @@ class SpamManager:
                 connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
                 cursor = connection.cursor()
                 logger.debug(f"PostgreSQL connection established.")
+                vectorDimensions = max(1, ConfigManager().runtimeInt("vectors.embedding_dimensions", 768))
                 
                 # Create the knowledge table if it does not exist
-                createSpamSQL = """CREATE TABLE IF NOT EXISTS spam (
-                    spam_id SERIAL PRIMARY KEY,
-                    spam_text TEXT,
-                    embeddings vector(768),
-                    record_timestamp TIMESTAMP,
-                    added_by INT,
-                    CONSTRAINT member_link
-                        FOREIGN KEY(added_by)
-                        REFERENCES member_data(member_id)
-                        ON DELETE SET NULL
-                );"""
-                cursor.execute(createSpamSQL)
+                execute_migration(
+                    cursor,
+                    "060_spam.sql",
+                    context={"vector_dimensions": vectorDimensions},
+                )
                 connection.commit()
 
                 # close the communication with the PostgreSQL
@@ -1780,10 +3515,11 @@ class SpamManager:
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
 
+            queryLimit = max(1, ConfigManager().runtimeInt("retrieval.spam_list_limit", 10))
             querySQL = """SELECT spam_id, spam_text, record_timestamp, added_by
             FROM spam
-            LIMIT 10"""
-            cursor.execute(querySQL)
+            LIMIT %s"""
+            cursor.execute(querySQL, (queryLimit,))
             results = cursor.fetchall()
 
             response = results
@@ -1798,9 +3534,14 @@ class SpamManager:
             
             return response
 
-    def searchSpam(self, text: str, limit: int=1) -> list:
+    def searchSpam(self, text: str, limit: int | None = None) -> list:
         logger.info(f"Searching spam messages.")
         embedding = getEmbeddings(text)
+        if embedding is None:
+            logger.warning("Skipping spam search because embeddings are unavailable.")
+            return list()
+        if limit is None:
+            limit = ConfigManager().runtimeInt("retrieval.spam_search_default_limit", 1)
 
         connection = None
         response = None
@@ -1813,7 +3554,7 @@ class SpamManager:
             FROM spam
             ORDER BY distance
             LIMIT %s"""
-            cursor.execute(querySQL, (embedding, limit))
+            cursor.execute(querySQL, (embedding, max(1, int(limit))))
             results = cursor.fetchall()
 
             response = results
@@ -1845,26 +3586,7 @@ class UsageManager:
                 logger.debug(f"PostgreSQL connection established.")
                 
                 # Create the individual accounts table if it doesn't exist
-                usageTable_sql = """CREATE TABLE IF NOT EXISTS inference_usage (
-                    usage_id SERIAL PRIMARY KEY,
-                    prompt_history_id INT NOT NULL,
-                    response_history_id INT NOT NULL,
-                    load_duration BIGINT NOT NULL,
-                    prompt_eval_count INTEGER NOT NULL,
-                    prompt_eval_duration BIGINT NOT NULL,
-                    eval_count INTEGER NOT NULL,
-                    eval_duration BIGINT NOT NULL,
-                    total_duration BIGINT NOT NULL,
-                    CONSTRAINT prompt_history
-                        FOREIGN KEY(prompt_history_id)
-                        REFERENCES chat_history(history_id)
-                        ON DELETE CASCADE,
-                    CONSTRAINT response_history
-                        FOREIGN KEY(response_history_id)
-                        REFERENCES chat_history(history_id)
-                        ON DELETE CASCADE
-                );"""
-                cursor.execute(usageTable_sql)
+                execute_migration(cursor, "070_inference_usage.sql")
                 
                 connection.commit()
                 # Close the cursor
@@ -1878,17 +3600,54 @@ class UsageManager:
         
         return cls._instance
 
+    @staticmethod
+    def _usage_stat_int(stats: dict | None, key: str, default: int = 0) -> int:
+        payload = stats if isinstance(stats, dict) else {}
+        raw_value = payload.get(key, default)
+        if raw_value is None:
+            return int(default)
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            return int(default)
+        return max(0, value)
+
     def addUsage(self, promptHistoryID: int, responseHistoryID: int, stats: dict):
         logger.info("Add usage data.")
+        if promptHistoryID is None or responseHistoryID is None:
+            logger.warning(
+                "Skipping usage insert because prompt/response history id is missing "
+                f"(prompt={promptHistoryID}, response={responseHistoryID})."
+            )
+            return
         
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
+
+            loadDuration = self._usage_stat_int(stats, "load_duration", 0)
+            promptEvalCount = self._usage_stat_int(stats, "prompt_eval_count", 0)
+            promptEvalDuration = self._usage_stat_int(stats, "prompt_eval_duration", 0)
+            evalCount = self._usage_stat_int(stats, "eval_count", 0)
+            evalDuration = self._usage_stat_int(stats, "eval_duration", 0)
+            totalDuration = self._usage_stat_int(stats, "total_duration", 0)
             
             addUsage_sql = """INSERT INTO inference_usage (prompt_history_id, response_history_id, load_duration, prompt_eval_count, prompt_eval_duration, eval_count, eval_duration, total_duration) 
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s);"""
-            cursor.execute(addUsage_sql, (promptHistoryID, responseHistoryID, stats["load_duration"], stats["prompt_eval_count"], stats["prompt_eval_duration"], stats["eval_count"], stats["eval_duration"], stats["total_duration"]))
+            cursor.execute(
+                addUsage_sql,
+                (
+                    promptHistoryID,
+                    responseHistoryID,
+                    loadDuration,
+                    promptEvalCount,
+                    promptEvalDuration,
+                    evalCount,
+                    evalDuration,
+                    totalDuration,
+                ),
+            )
             
             connection.commit()
             # Close the cursor
@@ -1905,7 +3664,9 @@ class UsageManager:
         logger.info(f"Get a list of usage data for user.")
 
         connection = None
-        response = None
+        response = list()
+        if MemberID is None:
+            return response
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
@@ -1941,13 +3702,78 @@ class UsageManager:
 
 def getEmbeddings(text: str) -> list:
     logger.info("Getting embeddings.")
-    try:
-        results = Client(host=ConfigManager().inference["embedding"]["url"]).embeddings(
-            model=ConfigManager().inference["embedding"]["model"],
-            prompt=text
-        )
-        return results.embedding
-    except Exception as error:
-        logger.error(f"Exception while getting embeddings from Ollama:\n{error}")
+    promptText = str(text or "").strip()
+    if promptText == "":
+        logger.debug("Skipping embeddings request because input text is empty.")
         return None
 
+    configManager = ConfigManager()
+    embeddingConfig = configManager.inference.get("embedding", {})
+    host = embeddingConfig.get("url") if embeddingConfig.get("url") else configManager.runtimeValue(
+        "inference.default_ollama_host", "http://127.0.0.1:11434"
+    )
+    host = str(host or "http://127.0.0.1:11434").rstrip("/")
+
+    probeTimeout = configManager.runtimeFloat("inference.probe_timeout_seconds", 3.0)
+    embeddingTimeout = configManager.runtimeFloat("inference.embedding_timeout_seconds", max(3.0, probeTimeout))
+    if embeddingTimeout <= 0:
+        embeddingTimeout = max(3.0, probeTimeout)
+
+    maxInputChars = configManager.runtimeInt("inference.embedding_max_input_chars", 6000)
+    if maxInputChars > 0 and len(promptText) > maxInputChars:
+        logger.info(
+            f"Truncating embedding input from {len(promptText)} to {maxInputChars} chars."
+        )
+        promptText = promptText[:maxInputChars]
+
+    configuredModel = embeddingConfig.get("model")
+    fallbackModel = configManager.runtimeValue("inference.default_embedding_model", "nomic-embed-text:latest")
+    fallbackModel = fallbackModel or "nomic-embed-text:latest"
+    candidateModels = list()
+    for modelName in (configuredModel, fallbackModel, "nomic-embed-text:latest"):
+        if isinstance(modelName, str):
+            cleaned = modelName.strip()
+            if cleaned and cleaned not in candidateModels:
+                candidateModels.append(cleaned)
+
+    if not candidateModels:
+        logger.error("Embedding model is missing from config inference settings.")
+        return None
+
+    lastError = None
+    for index, model in enumerate(candidateModels):
+        started = time.monotonic()
+        try:
+            results = Client(host=host, timeout=float(embeddingTimeout)).embeddings(
+                model=model,
+                prompt=promptText,
+            )
+            embeddingVector = getattr(results, "embedding", None)
+            if embeddingVector is None and isinstance(results, dict):
+                embeddingVector = results.get("embedding")
+            if not isinstance(embeddingVector, list) or len(embeddingVector) == 0:
+                raise ValueError("embedding response did not include a vector payload")
+
+            elapsed = time.monotonic() - started
+            if index > 0:
+                logger.warning(f"Embedding model fallback succeeded with: {model} ({elapsed:.2f}s)")
+            else:
+                logger.debug(f"Embedding model '{model}' completed in {elapsed:.2f}s")
+            return embeddingVector
+        except Exception as error:  # noqa: BLE001
+            elapsed = time.monotonic() - started
+            lastError = error
+            if index < (len(candidateModels) - 1):
+                logger.warning(
+                    f"Embedding model '{model}' failed after {elapsed:.2f}s "
+                    f"(timeout={embeddingTimeout:.1f}s); trying fallback model."
+                )
+                continue
+            logger.error(
+                f"Exception while getting embeddings from Ollama after {elapsed:.2f}s "
+                f"(timeout={embeddingTimeout:.1f}s):\n{error}"
+            )
+
+    if lastError is not None:
+        logger.debug(f"Last embedding model error: {lastError}")
+    return None

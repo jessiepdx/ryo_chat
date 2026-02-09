@@ -18,9 +18,14 @@
 ###########
 
 import base64
+import asyncio
 from datetime import datetime, timedelta, timezone
+import html
+import httpx
 import json
 import logging
+import time
+from typing import Any
 from ollama import AsyncClient
 import os
 import re
@@ -50,6 +55,7 @@ from telegram.ext import (
     MessageReactionHandler,
     filters
 )
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from hypermindlabs.utils import (
     ChatHistoryManager, 
     CommunityManager, 
@@ -62,7 +68,12 @@ from hypermindlabs.utils import (
     SpamManager,
     UsageManager
 )
-from hypermindlabs.agents import ConversationOrchestrator, ConversationalAgent, ImageAgent, TweetAgent
+from hypermindlabs.agents import (
+    ConversationOrchestrator,
+    ConversationalAgent,
+    TweetAgent,
+    loadAgentSystemPrompt,
+)
 
 
 
@@ -119,6 +130,1145 @@ proposals = ProposalManager()
 spam = SpamManager()
 usage = UsageManager()
 
+logger.info(f"Database route status: {config.databaseRoute}")
+
+_TELEGRAM_MESSAGE_GUARD_LOCK = asyncio.Lock()
+_TELEGRAM_INFLIGHT_MESSAGE_KEYS: set[str] = set()
+_TELEGRAM_COMPLETED_MESSAGE_KEYS: dict[str, float] = {}
+_TELEGRAM_INSPECTOR_LOCK = asyncio.Lock()
+_TELEGRAM_RUN_INSPECTOR_CACHE: dict[str, dict[str, Any]] = {}
+_TELEGRAM_RUN_INSPECTOR_TTL_SECONDS = 6 * 60 * 60
+_TELEGRAM_RUN_INSPECTOR_MAX_RECORDS = 512
+
+
+def _runtime_int(path: str, default: int) -> int:
+    return config.runtimeInt(path, default)
+
+
+def _runtime_float(path: str, default: float) -> float:
+    return config.runtimeFloat(path, default)
+
+
+def _runtime_bool(path: str, default: bool) -> bool:
+    return config.runtimeBool(path, default)
+
+
+def _runtime_str(path: str, default: str) -> str:
+    value = config.runtimeValue(path, default)
+    text = default if value is None else str(value).strip()
+    return text if text else default
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _coerce_telegram_timestamp(value: datetime | None) -> datetime:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return _utc_now()
+
+
+def _message_temporal_context(message) -> dict[str, datetime]:
+    sent_at = _coerce_telegram_timestamp(getattr(message, "date", None))
+    received_at = _utc_now()
+    return {
+        "message_timestamp": sent_at,
+        "message_received_timestamp": received_at,
+    }
+
+
+def _default_generate_system_prompt() -> str:
+    try:
+        prompt = str(loadAgentSystemPrompt("chat_conversation") or "").strip()
+        if prompt:
+            return prompt
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"Falling back to default generate prompt after policy load failure: {error}")
+
+    fallback = config.defaults.get("system_prompt")
+    if isinstance(fallback, str) and fallback.strip():
+        return fallback.strip()
+    return "You are a helpful AI assistant."
+
+
+def _message_word_threshold() -> int:
+    return _runtime_int("conversation.community_score_message_word_threshold", 20)
+
+
+def _new_member_grace_delta() -> timedelta:
+    return timedelta(seconds=_runtime_int("conversation.new_member_grace_period_seconds", 60))
+
+
+def _password_min_length() -> int:
+    return max(8, _runtime_int("security.password_min_length", 12))
+
+
+def _database_unavailable() -> bool:
+    route = config.databaseRoute if isinstance(config.databaseRoute, dict) else {}
+    return str(route.get("status", "")).strip().lower() == "failed_all"
+
+
+def _database_unavailable_message() -> str:
+    return (
+        "Account services are temporarily unavailable because database "
+        "connection/authentication failed. Run setup to fix PostgreSQL "
+        "credentials, then send /start again."
+    )
+
+
+def _message_guard_key(chat_id: int, message_id: int) -> str:
+    return f"{int(chat_id)}:{int(message_id)}"
+
+
+async def _claim_message_processing(chat_id: int, message_id: int) -> bool:
+    key = _message_guard_key(chat_id, message_id)
+    now = time.monotonic()
+    ttl_seconds = max(30, _runtime_int("telegram.message_guard_completed_ttl_seconds", 180))
+    async with _TELEGRAM_MESSAGE_GUARD_LOCK:
+        stale_keys = [
+            stale_key
+            for stale_key, completed_at in _TELEGRAM_COMPLETED_MESSAGE_KEYS.items()
+            if (now - completed_at) > float(ttl_seconds)
+        ]
+        for stale_key in stale_keys:
+            _TELEGRAM_COMPLETED_MESSAGE_KEYS.pop(stale_key, None)
+
+        if key in _TELEGRAM_INFLIGHT_MESSAGE_KEYS:
+            return False
+        if key in _TELEGRAM_COMPLETED_MESSAGE_KEYS:
+            return False
+
+        _TELEGRAM_INFLIGHT_MESSAGE_KEYS.add(key)
+        return True
+
+
+async def _release_message_processing(chat_id: int, message_id: int) -> None:
+    key = _message_guard_key(chat_id, message_id)
+    async with _TELEGRAM_MESSAGE_GUARD_LOCK:
+        _TELEGRAM_INFLIGHT_MESSAGE_KEYS.discard(key)
+        _TELEGRAM_COMPLETED_MESSAGE_KEYS[key] = time.monotonic()
+
+
+def _guard_message_handler(handler):
+    async def _wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.effective_message
+        chat = update.effective_chat
+        message_id = getattr(message, "message_id", None)
+        chat_id = getattr(chat, "id", None)
+        if message_id is None or chat_id is None:
+            return await handler(update, context)
+
+        claimed = await _claim_message_processing(chat_id=int(chat_id), message_id=int(message_id))
+        if not claimed:
+            logger.info(
+                "Skipping duplicate/replayed telegram update (chat_id=%s, message_id=%s).",
+                chat_id,
+                message_id,
+            )
+            return
+
+        try:
+            return await handler(update, context)
+        finally:
+            await _release_message_processing(chat_id=int(chat_id), message_id=int(message_id))
+
+    _wrapped.__name__ = f"{getattr(handler, '__name__', 'handler')}_guarded"
+    return _wrapped
+
+
+_ORCHESTRATION_STAGE_LABELS = {
+    "orchestrator.start": "Accepted request",
+    "orchestrator.fast_path": "Fast path",
+    "orchestrator.fast_path_blocked": "Fast path blocked",
+    "context.workspace": "Workspace context",
+    "context.built": "Context built",
+    "persona.load": "Persona loaded",
+    "persona.directive": "Persona directive",
+    "persona.inject": "Persona injected",
+    "persona.style": "Persona style",
+    "persona.adapt": "Persona adapted",
+    "persona.rollup": "Narrative rollup",
+    "persona.error": "Persona warning",
+    "analysis.start": "Analyzing message",
+    "analysis.progress": "Analyzing message",
+    "analysis.complete": "Analysis complete",
+    "analysis.timeout": "Analysis timeout",
+    "analysis.error": "Analysis error",
+    "analysis.payload": "Analysis payload",
+    "tools.suggested": "Tool suggestions",
+    "process.directive": "Process directive",
+    "tools.start": "Evaluating tools",
+    "tools.model_output": "Tool model output",
+    "tools.complete": "Tools complete",
+    "process.state": "Process state",
+    "response.start": "Generating response",
+    "response.progress": "Generating response",
+    "response.timeout": "Response timeout",
+    "response.error": "Response error",
+    "response.complete": "Response generated",
+    "response.fallback": "Fallback response",
+    "response.sanitized": "Sanitized response",
+    "orchestrator.complete": "Wrapping up",
+}
+
+_TELEGRAM_STAGE_DETAIL_LEVELS = {"minimal", "normal", "debug"}
+_TELEGRAM_MAX_MESSAGE_CHARS = 4096
+_TELEGRAM_FALLBACK_FINAL_REPLY = "I could not generate a complete reply this turn. Please try again."
+_MINIMAL_VISIBLE_STAGES = {
+    "orchestrator.start",
+    "orchestrator.fast_path",
+    "orchestrator.fast_path_blocked",
+    "context.workspace",
+    "persona.load",
+    "persona.directive",
+    "persona.inject",
+    "persona.style",
+    "analysis.start",
+    "analysis.progress",
+    "analysis.complete",
+    "analysis.timeout",
+    "analysis.error",
+    "tools.suggested",
+    "process.directive",
+    "tools.start",
+    "tools.model_output",
+    "tools.complete",
+    "process.state",
+    "response.start",
+    "response.progress",
+    "response.timeout",
+    "response.error",
+    "response.complete",
+    "persona.adapt",
+    "persona.rollup",
+    "persona.error",
+}
+_NORMAL_HIDDEN_STAGES = {
+    "analysis.payload",
+}
+
+
+def _inspector_json_safe(value: Any) -> Any:
+    try:
+        serialized = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        return str(value)
+    try:
+        return json.loads(serialized)
+    except Exception:  # noqa: BLE001
+        return serialized
+
+
+def _inspector_trim_text(text: str, max_chars: int = 3900) -> str:
+    cleaned = str(text or "").strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    suffix = "\n\n... (truncated)"
+    keep = max(1, int(max_chars) - len(suffix))
+    return cleaned[:keep].rstrip() + suffix
+
+
+def _inspector_json_block(payload: Any, max_chars: int = 2800) -> str:
+    text = json.dumps(_inspector_json_safe(payload), ensure_ascii=False, indent=2, default=str)
+    if len(text) > max_chars:
+        text = _inspector_trim_text(text, max_chars=max_chars)
+    return text
+
+
+def _stage_event_snapshot(event: dict[str, Any] | None) -> dict[str, Any]:
+    payload = event if isinstance(event, dict) else {}
+    snapshot = {
+        "stage": str(payload.get("stage") or ""),
+        "detail": str(payload.get("detail") or ""),
+        "timestamp": str(payload.get("timestamp") or _utc_now().isoformat().replace("+00:00", "Z")),
+        "meta": _inspector_json_safe(payload.get("meta") if isinstance(payload.get("meta"), dict) else {}),
+    }
+    return snapshot
+
+
+def _append_stage_event(stage_events: list[dict[str, Any]], event: dict[str, Any] | None) -> None:
+    stage_events.append(_stage_event_snapshot(event))
+    if len(stage_events) > 200:
+        del stage_events[: len(stage_events) - 200]
+
+
+def _tool_entries_from_summary(run_summary: dict[str, Any]) -> list[dict[str, Any]]:
+    summary = run_summary if isinstance(run_summary, dict) else {}
+    tool_summary = summary.get("tool_summary")
+    tool_summary = tool_summary if isinstance(tool_summary, dict) else {}
+    requested = tool_summary.get("requested_tools")
+    requested_tools = requested if isinstance(requested, list) else []
+    results = summary.get("tool_results")
+    tool_results = results if isinstance(results, list) else []
+    max_len = max(len(requested_tools), len(tool_results))
+    entries: list[dict[str, Any]] = []
+    for idx in range(max_len):
+        request_item = requested_tools[idx] if idx < len(requested_tools) and isinstance(requested_tools[idx], dict) else {}
+        result_item = tool_results[idx] if idx < len(tool_results) and isinstance(tool_results[idx], dict) else {}
+        tool_name = str(request_item.get("name") or result_item.get("tool_name") or f"tool_{idx + 1}")
+        entries.append(
+            {
+                "tool_name": tool_name,
+                "arguments": _inspector_json_safe(request_item.get("arguments", {})),
+                "status": str(result_item.get("status") or "unknown"),
+                "tool_results": _inspector_json_safe(result_item.get("tool_results")),
+                "error": _inspector_json_safe(result_item.get("error")),
+            }
+        )
+    return entries
+
+
+def _render_tool_page_text(
+    *,
+    tool_entry: dict[str, Any],
+    tool_index: int,
+    total_tools: int,
+) -> str:
+    title = f"Tool Call {tool_index + 1}/{max(1, total_tools)}"
+    lines = [
+        title,
+        f"Tool: {tool_entry.get('tool_name', 'unknown')}",
+        f"Status: {tool_entry.get('status', 'unknown')}",
+        "",
+        "Arguments:",
+        _inspector_json_block(tool_entry.get("arguments", {}), max_chars=1200),
+    ]
+    error_payload = tool_entry.get("error")
+    if isinstance(error_payload, dict) and error_payload:
+        lines.extend(["", "Error:", _inspector_json_block(error_payload, max_chars=1000)])
+    else:
+        lines.extend(
+            [
+                "",
+                "Response:",
+                _inspector_json_block(tool_entry.get("tool_results"), max_chars=1600),
+            ]
+        )
+    return _inspector_trim_text("\n".join(lines), max_chars=_TELEGRAM_MAX_MESSAGE_CHARS - 32)
+
+
+def _render_stage_page_text(
+    *,
+    stage_entry: dict[str, Any],
+    stage_index: int,
+    total_stages: int,
+) -> str:
+    stage_key = str(stage_entry.get("stage") or "")
+    stage_label = _ORCHESTRATION_STAGE_LABELS.get(stage_key, stage_key or "stage")
+    stage_detail = str(stage_entry.get("detail") or "")
+    timestamp = str(stage_entry.get("timestamp") or "")
+    lines = [
+        f"Context Stage {stage_index + 1}/{max(1, total_stages)}",
+        f"Stage: {stage_label}",
+        f"Key: {stage_key}",
+        f"Time: {timestamp}",
+    ]
+    if stage_detail:
+        lines.extend(["", "Detail:", stage_detail])
+
+    meta_payload = stage_entry.get("meta")
+    if isinstance(meta_payload, dict) and meta_payload:
+        lines.extend(["", "Meta:", _inspector_json_block(meta_payload, max_chars=2200)])
+    return _inspector_trim_text("\n".join(lines), max_chars=_TELEGRAM_MAX_MESSAGE_CHARS - 32)
+
+
+async def _cleanup_run_inspector_cache() -> None:
+    now = time.time()
+    stale_keys = [
+        key
+        for key, payload in _TELEGRAM_RUN_INSPECTOR_CACHE.items()
+        if now - float(payload.get("created_at", now)) > _TELEGRAM_RUN_INSPECTOR_TTL_SECONDS
+    ]
+    for key in stale_keys:
+        _TELEGRAM_RUN_INSPECTOR_CACHE.pop(key, None)
+    if len(_TELEGRAM_RUN_INSPECTOR_CACHE) > _TELEGRAM_RUN_INSPECTOR_MAX_RECORDS:
+        overflow = len(_TELEGRAM_RUN_INSPECTOR_CACHE) - _TELEGRAM_RUN_INSPECTOR_MAX_RECORDS
+        ordered_keys = sorted(
+            _TELEGRAM_RUN_INSPECTOR_CACHE.keys(),
+            key=lambda item: float(_TELEGRAM_RUN_INSPECTOR_CACHE[item].get("created_at", 0.0)),
+        )
+        for key in ordered_keys[:overflow]:
+            _TELEGRAM_RUN_INSPECTOR_CACHE.pop(key, None)
+
+
+def _build_run_inspector_keyboard(token: str, payload: dict[str, Any]) -> InlineKeyboardMarkup | None:
+    tool_entries = payload.get("tool_entries")
+    tools = tool_entries if isinstance(tool_entries, list) else []
+    rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
+    for idx, entry in enumerate(tools):
+        tool_name = str((entry if isinstance(entry, dict) else {}).get("tool_name") or f"tool_{idx + 1}")
+        label = f"Tool {idx + 1}: {tool_name}"
+        label = label if len(label) <= 28 else f"Tool {idx + 1}: {tool_name[:24]}..."
+        current_row.append(InlineKeyboardButton(label, callback_data=f"diag:{token}:tool:{idx}"))
+        if len(current_row) == 2:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+    rows.append([InlineKeyboardButton("Context", callback_data=f"diag:{token}:ctx:0")])
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_tool_view_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Back", callback_data=f"diag:{token}:back"),
+                InlineKeyboardButton("Context", callback_data=f"diag:{token}:ctx:0"),
+            ]
+        ]
+    )
+
+
+def _build_context_view_keyboard(token: str, stage_index: int, total_stages: int) -> InlineKeyboardMarkup:
+    left_index = stage_index - 1
+    right_index = stage_index + 1
+    left_data = f"diag:{token}:ctx:{left_index}" if left_index >= 0 else f"diag:{token}:noop"
+    right_data = (
+        f"diag:{token}:ctx:{right_index}"
+        if right_index < max(0, total_stages)
+        else f"diag:{token}:noop"
+    )
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("◀", callback_data=left_data),
+                InlineKeyboardButton("▶", callback_data=right_data),
+            ],
+            [InlineKeyboardButton("Back", callback_data=f"diag:{token}:back")],
+        ]
+    )
+
+
+async def _register_run_inspector_payload(
+    *,
+    chat_id: int,
+    message_id: int,
+    final_text: str,
+    run_summary: dict[str, Any] | None,
+    stage_events: list[dict[str, Any]] | None,
+) -> str | None:
+    summary = run_summary if isinstance(run_summary, dict) else {}
+    events = stage_events if isinstance(stage_events, list) else []
+    tool_entries = _tool_entries_from_summary(summary)
+    stage_entries = [entry for entry in events if isinstance(entry, dict)]
+    if not tool_entries and not stage_entries:
+        return None
+
+    token = os.urandom(6).hex()
+    async with _TELEGRAM_INSPECTOR_LOCK:
+        await _cleanup_run_inspector_cache()
+        _TELEGRAM_RUN_INSPECTOR_CACHE[token] = {
+            "created_at": time.time(),
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "final_text": str(final_text or ""),
+            "tool_entries": tool_entries,
+            "stage_entries": stage_entries,
+        }
+    return token
+
+
+async def _lookup_run_inspector_payload(token: str) -> dict[str, Any] | None:
+    async with _TELEGRAM_INSPECTOR_LOCK:
+        await _cleanup_run_inspector_cache()
+        payload = _TELEGRAM_RUN_INSPECTOR_CACHE.get(token)
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+async def _attach_run_inspector_controls(
+    *,
+    response_message,
+    final_text: str,
+    run_summary: dict[str, Any] | None,
+    stage_events: list[dict[str, Any]] | None,
+) -> None:
+    if response_message is None:
+        return
+    chat = getattr(response_message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(response_message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return
+
+    token = await _register_run_inspector_payload(
+        chat_id=int(chat_id),
+        message_id=int(message_id),
+        final_text=final_text,
+        run_summary=run_summary,
+        stage_events=stage_events,
+    )
+    if not token:
+        return
+
+    keyboard = _build_run_inspector_keyboard(token, await _lookup_run_inspector_payload(token) or {})
+    if keyboard is None:
+        return
+    try:
+        await response_message.edit_reply_markup(reply_markup=keyboard)
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"Unable to attach inspector controls to telegram message {message_id}: {error}")
+
+
+class TelegramStageStatus:
+    def __init__(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        chat_id: int,
+        thread_id: int | None = None,
+        reply_message=None,
+        enabled: bool = True,
+        show_json_details: bool = True,
+        detail_level: str = "minimal",
+        history_limit: int = 8,
+        json_char_limit: int = 1400,
+        message_char_limit: int = 3800,
+        update_min_interval_seconds: float = 1.0,
+    ):
+        self._context = context
+        self._chat_id = chat_id
+        self._thread_id = thread_id
+        self._reply_message = reply_message
+        self._enabled = bool(enabled)
+        self._show_json_details = bool(show_json_details)
+        detail_level_clean = str(detail_level or "minimal").strip().lower()
+        if detail_level_clean not in _TELEGRAM_STAGE_DETAIL_LEVELS:
+            detail_level_clean = "minimal"
+        self._detail_level = detail_level_clean
+        self._history_limit = max(3, int(history_limit))
+        self._json_char_limit = max(200, int(json_char_limit))
+        self._message_char_limit = max(800, int(message_char_limit))
+        self._update_min_interval_seconds = max(0.1, float(update_min_interval_seconds))
+        self._message = None
+        self._lines: list[str] = []
+        self._last_text: str = ""
+        self._last_edit_monotonic = 0.0
+        self._edit_lock = asyncio.Lock()
+        self._flush_task: asyncio.Task | None = None
+        self._flush_pending = False
+        self._flush_shutdown = False
+        self._network_retry_attempts = max(1, _runtime_int("telegram.network_retry_attempts", 3))
+        self._network_retry_base_delay_seconds = max(
+            0.1,
+            _runtime_float("telegram.network_retry_base_delay_seconds", 0.5),
+        )
+        self._network_retry_max_delay_seconds = max(
+            self._network_retry_base_delay_seconds,
+            _runtime_float("telegram.network_retry_max_delay_seconds", 4.0),
+        )
+
+    def _is_transient_telegram_error(self, error: Exception) -> bool:
+        return isinstance(
+            error,
+            (
+                RetryAfter,
+                TimedOut,
+                NetworkError,
+                httpx.RemoteProtocolError,
+                httpx.TimeoutException,
+                httpx.TransportError,
+            ),
+        )
+
+    def _retry_delay_seconds(self, error: Exception, attempt: int) -> float:
+        if isinstance(error, RetryAfter):
+            retry_after = getattr(error, "retry_after", None)
+            if isinstance(retry_after, (int, float)):
+                return min(
+                    max(float(retry_after), self._network_retry_base_delay_seconds),
+                    self._network_retry_max_delay_seconds,
+                )
+        backoff = self._network_retry_base_delay_seconds * (2 ** max(0, attempt - 1))
+        return min(backoff, self._network_retry_max_delay_seconds)
+
+    async def _with_telegram_retry(self, operation, *, operation_name: str) -> Any:
+        attempts = self._network_retry_attempts
+        for attempt in range(1, attempts + 1):
+            try:
+                return await operation()
+            except Exception as error:  # noqa: BLE001
+                if (not self._is_transient_telegram_error(error)) or attempt >= attempts:
+                    raise
+                delay_seconds = self._retry_delay_seconds(error, attempt)
+                logger.warning(
+                    "Transient telegram error during %s (attempt %s/%s): %s; retrying in %.2fs",
+                    operation_name,
+                    attempt,
+                    attempts,
+                    error,
+                    delay_seconds,
+                )
+                await asyncio.sleep(delay_seconds)
+        return None
+
+    def _stage_visible(self, stage: str, meta: dict[str, Any]) -> bool:
+        if self._detail_level == "debug":
+            return True
+        if self._detail_level == "normal":
+            return stage not in _NORMAL_HIDDEN_STAGES
+        if stage not in _MINIMAL_VISIBLE_STAGES:
+            return False
+        return True
+
+    @staticmethod
+    def _truncate_text(value: str, max_chars: int) -> str:
+        text = str(value or "").strip()
+        if max_chars <= 0:
+            return ""
+        if len(text) <= max_chars:
+            return text
+        if max_chars <= 3:
+            return text[:max_chars]
+        return text[: max_chars - 3] + "..."
+
+    @staticmethod
+    def _looks_like_structured_fragment(text: str) -> bool:
+        candidate = str(text or "").strip()
+        if not candidate:
+            return False
+        if candidate[0] in {"{", "["}:
+            return True
+        if "```" in candidate:
+            return True
+        if ":" in candidate and "{" in candidate:
+            return True
+        return False
+
+    @staticmethod
+    def _extract_from_meta_json(meta: dict[str, Any], *path: str) -> Any:
+        cursor: Any = meta.get("json")
+        for key in path:
+            if not isinstance(cursor, dict):
+                return None
+            cursor = cursor.get(key)
+        return cursor
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _format_stage_timestamp(self, raw: Any) -> str:
+        raw_text = str(raw or "").strip()
+        if raw_text:
+            try:
+                parsed = datetime.fromisoformat(raw_text.replace("Z", "+00:00"))
+                return parsed.astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+            except ValueError:
+                return self._truncate_text(raw_text, 32)
+        return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+    def _extract_stats_payload(self, meta: dict[str, Any]) -> dict[str, Any]:
+        stats: dict[str, Any] = {}
+        for key in (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "prompt_tokens_per_second",
+            "completion_tokens_per_second",
+            "total_tokens_per_second",
+        ):
+            if key in meta:
+                stats[key] = meta.get(key)
+        nested_stats = self._extract_from_meta_json(meta, "stats")
+        if isinstance(nested_stats, dict):
+            for key in (
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "prompt_tokens_per_second",
+                "completion_tokens_per_second",
+                "total_tokens_per_second",
+            ):
+                if key not in stats and key in nested_stats:
+                    stats[key] = nested_stats.get(key)
+        return stats
+
+    def _stage_meta_summary_line(self, stage: str, meta: dict[str, Any]) -> str:
+        if not isinstance(meta, dict):
+            return ""
+
+        pieces: list[str] = []
+        selected_model = str(meta.get("selected_model") or meta.get("model") or "").strip()
+        if not selected_model:
+            routing_selected = self._extract_from_meta_json(meta, "routing", "selected_model")
+            if isinstance(routing_selected, str) and routing_selected.strip():
+                selected_model = routing_selected.strip()
+        if selected_model:
+            pieces.append(f"model={selected_model}")
+
+        requested = meta.get("requested_tool_calls")
+        executed = meta.get("executed_tool_calls")
+        tool_calls = meta.get("tool_calls")
+        if isinstance(requested, int) or isinstance(executed, int):
+            req_text = str(requested) if isinstance(requested, int) else "-"
+            exe_text = str(executed) if isinstance(executed, int) else "-"
+            pieces.append(f"tools={req_text}->{exe_text}")
+        elif isinstance(tool_calls, int):
+            pieces.append(f"tools={tool_calls}")
+
+        execution_mode = self._extract_from_meta_json(meta, "summary", "execution_mode")
+        if isinstance(execution_mode, str) and execution_mode.strip():
+            pieces.append(f"mode={execution_mode.strip()}")
+
+        process_action = str(meta.get("action") or "").strip()
+        if process_action:
+            pieces.append(f"action={process_action}")
+        active_process_count = meta.get("active_process_count")
+        if isinstance(active_process_count, int):
+            pieces.append(f"active_processes={active_process_count}")
+        pending_outbox_count = meta.get("pending_outbox_count")
+        if isinstance(pending_outbox_count, int):
+            pieces.append(f"pending_outbox={pending_outbox_count}")
+        suggestion_count = meta.get("suggestion_count")
+        if not isinstance(suggestion_count, int):
+            nested_suggestion_count = self._extract_from_meta_json(meta, "suggestion_count")
+            if isinstance(nested_suggestion_count, int):
+                suggestion_count = nested_suggestion_count
+        if isinstance(suggestion_count, int):
+            pieces.append(f"suggestions={suggestion_count}")
+
+        stats = self._extract_stats_payload(meta)
+        total_tps = self._coerce_float(stats.get("total_tokens_per_second"))
+        completion_tps = self._coerce_float(stats.get("completion_tokens_per_second"))
+        if total_tps and total_tps > 0:
+            pieces.append(f"tps={total_tps:.2f}")
+        elif completion_tps and completion_tps > 0:
+            pieces.append(f"tps={completion_tps:.2f}")
+
+        if self._detail_level == "debug":
+            prompt_tokens = stats.get("prompt_tokens")
+            completion_tokens = stats.get("completion_tokens")
+            total_tokens = stats.get("total_tokens")
+            if isinstance(prompt_tokens, int) or isinstance(completion_tokens, int):
+                pieces.append(
+                    f"tok={prompt_tokens if isinstance(prompt_tokens, int) else '-'}+"
+                    f"{completion_tokens if isinstance(completion_tokens, int) else '-'}"
+                )
+            elif isinstance(total_tokens, int):
+                pieces.append(f"tok={total_tokens}")
+
+        if stage.endswith(".progress"):
+            chunks = meta.get("chunks")
+            chars = meta.get("chars")
+            if isinstance(chunks, int) and chunks >= 0:
+                pieces.append(f"chunks={chunks}")
+            if isinstance(chars, int) and chars >= 0:
+                pieces.append(f"chars={chars}")
+
+        # Keep summaries short in stage stream updates.
+        summary = " | ".join(piece for piece in pieces if piece)
+        return self._truncate_text(summary, 160)
+
+    def _human_readable_stage_message(self, stage: str, detail: str, meta: dict[str, Any]) -> str:
+        snippet = str(meta.get("snippet") or "").strip()
+        snippet_structured = self._looks_like_structured_fragment(snippet)
+        if snippet and not snippet_structured:
+            return self._truncate_text(snippet, 320)
+
+        if stage == "orchestrator.start":
+            return "Accepted request and preparing context."
+
+        if stage == "context.workspace":
+            active = meta.get("active_process_count")
+            pending = meta.get("pending_outbox_count")
+            if isinstance(active, int) and isinstance(pending, int):
+                if active > 0 or pending > 0:
+                    return (
+                        f"Loaded workspace continuity context ({active} active process(es), "
+                        f"{pending} pending outbox item(s))."
+                    )
+                return "No active workspace processes; starting with a clean process context."
+            return "Loaded workspace continuity context."
+
+        if stage == "analysis.start":
+            return "Running message analysis and model routing."
+
+        if stage == "persona.load":
+            chunk_count = meta.get("chunk_count")
+            if isinstance(chunk_count, int):
+                return f"Loaded personality profile and {chunk_count} narrative chunk(s)."
+            return "Loaded personality profile and narrative context."
+
+        if stage == "persona.inject":
+            return "Injected style and narrative guidance into downstream stages."
+
+        if stage == "persona.directive":
+            return "Applied explicit per-user personality directive update."
+
+        if stage == "persona.style":
+            tone = str(meta.get("tone") or "").strip()
+            verbosity = str(meta.get("verbosity") or "").strip()
+            if tone and verbosity:
+                return f"Applied style targets (tone={tone}, verbosity={verbosity})."
+            return "Applied personality style targets for this response."
+
+        if stage == "persona.adapt":
+            changed_fields = meta.get("changed_fields")
+            if isinstance(changed_fields, list) and changed_fields:
+                return self._truncate_text(
+                    "Adaptive profile updated: " + ", ".join(str(item) for item in changed_fields[:4]),
+                    320,
+                )
+            return "Updated adaptation signal state for this user."
+
+        if stage == "persona.rollup":
+            chunk_index = meta.get("chunk_index")
+            if isinstance(chunk_index, int) and chunk_index > 0:
+                return f"Narrative continuity rolled up into chunk #{chunk_index}."
+            return "Narrative continuity rolled up into compact memory."
+
+        if stage == "persona.error":
+            return "Personality subsystem degraded this turn; using fallback style behavior."
+
+        if stage == "analysis.progress":
+            chunks = meta.get("chunks")
+            chars = meta.get("chars")
+            if isinstance(chunks, int) and isinstance(chars, int):
+                return f"Reasoning over intent/topic and routing model ({chunks} chunks, {chars} chars)."
+            return "Reasoning over intent/topic and routing model."
+
+        if stage == "tools.model_output":
+            excerpt = self._extract_from_meta_json(meta, "execution_summary", "model_output_excerpt")
+            if isinstance(excerpt, str) and excerpt.strip():
+                return self._truncate_text(excerpt, 320)
+
+        if stage == "tools.start":
+            return "Determining whether tools are needed for this request."
+
+        if stage == "process.directive":
+            action = str(meta.get("action") or "").strip()
+            process_id = meta.get("process_id")
+            if action:
+                if process_id:
+                    return f"Selected process action '{action}' (process_id={process_id})."
+                return f"Selected process action '{action}'."
+            return "Selected a process workspace action from analysis."
+
+        if stage == "tools.complete":
+            model_error = self._extract_from_meta_json(meta, "summary", "model_error")
+            if isinstance(model_error, dict):
+                error_message = str(model_error.get("message") or "").strip()
+                if error_message:
+                    return self._truncate_text(f"Tool stage degraded: {error_message}", 320)
+            executed = meta.get("executed_tool_calls")
+            if isinstance(executed, int):
+                tool_names = self._extract_from_meta_json(meta, "summary", "executed_tools")
+                if isinstance(tool_names, list) and tool_names:
+                    names = ", ".join(str(name) for name in tool_names[:4])
+                    return self._truncate_text(f"Executed {executed} tool call(s): {names}", 320)
+                return f"Executed {executed} tool call(s)."
+            return "No tool calls were executed for this request."
+
+        if stage == "process.state":
+            process_tools = self._extract_from_meta_json(meta, "process_tools_executed")
+            process_ids = self._extract_from_meta_json(meta, "process_ids")
+            if isinstance(process_tools, list) and process_tools:
+                labels = ", ".join(str(name) for name in process_tools[:3])
+                if isinstance(process_ids, list) and process_ids:
+                    process_label = ", ".join(str(pid) for pid in process_ids[:3])
+                    return self._truncate_text(
+                        f"Workspace updated via {labels}; active process ids: {process_label}.",
+                        320,
+                    )
+                return self._truncate_text(f"Workspace updated via {labels}.", 320)
+            return "Workspace state synchronized from tool execution."
+
+        if stage == "analysis.complete":
+            selected_model = str(meta.get("selected_model") or "").strip()
+            stats = self._extract_stats_payload(meta)
+            tps = self._coerce_float(stats.get("completion_tokens_per_second"))
+            completion_tokens = stats.get("completion_tokens")
+            if isinstance(completion_tokens, int) and tps and tps > 0:
+                return f"Analysis complete ({completion_tokens} tokens @ {tps:.2f} tok/s)."
+            if selected_model:
+                return f"Analysis model: {selected_model}"
+            return "Analysis complete."
+
+        if stage == "tools.suggested":
+            suggested = self._extract_from_meta_json(meta, "suggested_tools")
+            if isinstance(suggested, list) and suggested:
+                tool_names = [
+                    str(_inspector_json_safe(entry).get("tool_name") or "")
+                    for entry in suggested
+                    if isinstance(entry, dict)
+                ]
+                tool_names = [name for name in tool_names if name]
+                if tool_names:
+                    return self._truncate_text(
+                        "Suggested tools: " + ", ".join(tool_names[:4]),
+                        320,
+                    )
+            return "Prepared a suggested tool sequence before execution."
+
+        if stage == "response.start":
+            return "Generating final response."
+
+        if stage == "response.progress":
+            chars = meta.get("chars")
+            if isinstance(chars, int):
+                return f"Drafting response ({chars} chars generated)."
+
+        if stage == "response.complete":
+            stats = self._extract_stats_payload(meta)
+            tps = self._coerce_float(stats.get("completion_tokens_per_second"))
+            completion_tokens = stats.get("completion_tokens")
+            if isinstance(completion_tokens, int) and tps and tps > 0:
+                return f"Final response generated ({completion_tokens} tokens @ {tps:.2f} tok/s)."
+            return "Final response generated."
+
+        cleaned_detail = str(detail or "").strip()
+        if cleaned_detail:
+            return self._truncate_text(cleaned_detail, 320)
+        return ""
+
+    def _build_stage_entry(
+        self,
+        *,
+        stage: str,
+        detail: str,
+        meta: dict[str, Any],
+        timestamp: Any,
+    ) -> str:
+        label = _ORCHESTRATION_STAGE_LABELS.get(stage, stage if stage else "Processing")
+
+        message = self._human_readable_stage_message(stage, detail, meta)
+        summary = self._stage_meta_summary_line(stage, meta)
+        entry = f"<b>{html.escape(label)}</b>"
+        if message:
+            entry += f"\n<i>{html.escape(message)}</i>"
+        if summary and self._detail_level in {"normal", "debug"}:
+            entry += f"\n<code>{html.escape(summary)}</code>"
+        entry += f"\n<code>{html.escape(self._format_stage_timestamp(timestamp))}</code>"
+        return self._truncate_text(entry, self._message_char_limit)
+
+    def _render(self) -> str:
+        if not self._lines:
+            return "Processing your request..."
+        if self._detail_level == "minimal":
+            return self._lines[-1]
+
+        lines = self._lines[-self._history_limit :]
+        rendered = "\n\n".join(lines)
+        while len(lines) > 1 and len(rendered) > self._message_char_limit:
+            lines = lines[1:]
+            rendered = "\n\n".join(lines)
+        if len(rendered) <= self._message_char_limit:
+            return rendered
+        return lines[-1]
+
+    def _render_json_block(self, payload, *, max_chars: int | None = None) -> str:
+        if max_chars is None:
+            max_chars = self._json_char_limit
+        try:
+            json_text = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+        except TypeError:
+            json_text = json.dumps(str(payload), ensure_ascii=False)
+        if len(json_text) > max_chars:
+            suffix = "\n... (truncated)"
+            keep = max(1, int(max_chars) - len(suffix))
+            json_text = json_text[:keep].rstrip() + suffix
+        return f"<pre>{html.escape(json_text)}</pre>"
+
+    def _normalize_final_reply_text(self, text: str) -> str:
+        normalized = str(text or "").strip()
+        if not normalized:
+            normalized = _TELEGRAM_FALLBACK_FINAL_REPLY
+        if len(normalized) > _TELEGRAM_MAX_MESSAGE_CHARS:
+            suffix = "\n\n[truncated]"
+            keep = max(1, _TELEGRAM_MAX_MESSAGE_CHARS - len(suffix))
+            normalized = normalized[:keep].rstrip() + suffix
+        return normalized
+
+    async def _safe_edit(self, text: str, *, parse_html: bool = False) -> bool:
+        if self._message is None:
+            return False
+        if text == self._last_text:
+            return True
+        if str(text or "").strip() == "":
+            logger.warning("Failed to update stage status message: Message text is empty")
+            return False
+        async with self._edit_lock:
+            try:
+                kwargs: dict[str, Any] = {}
+                if parse_html:
+                    kwargs["parse_mode"] = constants.ParseMode.HTML
+                    kwargs["disable_web_page_preview"] = True
+                await self._with_telegram_retry(
+                    lambda: self._message.edit_text(text=text, **kwargs),
+                    operation_name="edit_text(stage_status)",
+                )
+                self._last_text = text
+                self._last_edit_monotonic = time.monotonic()
+                return True
+            except Exception as error:  # noqa: BLE001
+                logger.warning(f"Failed to update stage status message: {error}")
+                return False
+
+    async def _flush_stage_loop(self) -> None:
+        while not self._flush_shutdown:
+            if not self._flush_pending:
+                break
+            self._flush_pending = False
+            elapsed = time.monotonic() - self._last_edit_monotonic
+            if elapsed < self._update_min_interval_seconds:
+                await asyncio.sleep(self._update_min_interval_seconds - elapsed)
+            await self._safe_edit(self._render(), parse_html=True)
+
+    def _schedule_stage_flush(self) -> None:
+        if self._flush_shutdown:
+            return
+        self._flush_pending = True
+        if self._flush_task is not None and not self._flush_task.done():
+            return
+        self._flush_task = asyncio.create_task(self._flush_stage_loop())
+
+    async def _stop_stage_flush(self) -> None:
+        self._flush_shutdown = True
+        task = self._flush_task
+        self._flush_task = None
+        if task is None:
+            return
+        if task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def start(self) -> None:
+        if not self._enabled:
+            return
+        initial_line = self._build_stage_entry(
+            stage="orchestrator.start",
+            detail="Accepted request.",
+            meta={},
+            timestamp=_utc_now().isoformat().replace("+00:00", "Z"),
+        )
+        self._lines = [initial_line]
+        text = self._render()
+        try:
+            if self._reply_message is not None:
+                self._message = await self._with_telegram_retry(
+                    lambda: self._reply_message.reply_text(
+                        text=text,
+                        parse_mode=constants.ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    ),
+                    operation_name="reply_text(stage_start)",
+                )
+            else:
+                self._message = await self._with_telegram_retry(
+                    lambda: self._context.bot.send_message(
+                        chat_id=self._chat_id,
+                        message_thread_id=self._thread_id,
+                        text=text,
+                        parse_mode=constants.ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    ),
+                    operation_name="send_message(stage_start)",
+                )
+            self._last_text = text
+            self._last_edit_monotonic = time.monotonic()
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Unable to send stage status message: {error}")
+            self._message = None
+
+    async def emit(self, event: dict | None = None) -> None:
+        if not self._enabled or self._message is None:
+            return
+        payload = event if isinstance(event, dict) else {}
+        stage = str(payload.get("stage") or "").strip()
+        detail = str(payload.get("detail") or "").strip()
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        timestamp = payload.get("timestamp")
+        if stage and not self._stage_visible(stage, meta):
+            return
+
+        entry = self._build_stage_entry(stage=stage, detail=detail, meta=meta, timestamp=timestamp)
+        if self._show_json_details and self._detail_level == "debug" and "json" in meta:
+            json_payload = meta.get("json")
+            json_block = self._render_json_block(json_payload)
+            candidate = f"{entry}\n{json_block}"
+            if len(candidate) > self._message_char_limit:
+                available = max(180, self._message_char_limit - len(entry) - 24)
+                json_block = self._render_json_block(json_payload, max_chars=available)
+                candidate = f"{entry}\n{json_block}"
+            if len(candidate) > self._message_char_limit:
+                candidate = f"{entry}\n<code>json payload omitted (too large)</code>"
+            entry = candidate
+
+        if self._lines and self._lines[-1] == entry:
+            return
+        self._lines.append(entry)
+        if len(self._lines) > max(self._history_limit * 4, 24):
+            self._lines = self._lines[-max(self._history_limit * 4, 24) :]
+        self._schedule_stage_flush()
+
+    async def finalize(self, final_text: str):
+        await self._stop_stage_flush()
+        final_text_safe = self._normalize_final_reply_text(final_text)
+        if self._message is not None:
+            edited = await self._safe_edit(final_text_safe, parse_html=False)
+            if edited:
+                return self._message
+
+        try:
+            if self._reply_message is not None:
+                return await self._with_telegram_retry(
+                    lambda: self._reply_message.reply_text(text=final_text_safe),
+                    operation_name="reply_text(finalize)",
+                )
+            return await self._with_telegram_retry(
+                lambda: self._context.bot.send_message(
+                    chat_id=self._chat_id,
+                    message_thread_id=self._thread_id,
+                    text=final_text_safe,
+                ),
+                operation_name="send_message(finalize)",
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Unable to send final response message: {error}")
+            if self._message is not None:
+                # Return existing status message as best effort fallback.
+                return self._message
+            raise
+
+    async def fail(self, error_text: str) -> None:
+        await self._stop_stage_flush()
+        if self._message is not None:
+            await self._safe_edit(error_text)
+            return
+        try:
+            if self._reply_message is not None:
+                await self._with_telegram_retry(
+                    lambda: self._reply_message.reply_text(text=error_text),
+                    operation_name="reply_text(fail)",
+                )
+            else:
+                await self._with_telegram_retry(
+                    lambda: self._context.bot.send_message(
+                        chat_id=self._chat_id,
+                        message_thread_id=self._thread_id,
+                        text=error_text,
+                    ),
+                    operation_name="send_message(fail)",
+                )
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Unable to send failure status message: {error}")
+
 
 
 ###########################
@@ -151,12 +1301,32 @@ async def startBot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "roles": ["user"],
                 "register_date": datetime.now()
             }
-            members.addMemberFromTelegram(newAccount)
+            createdMemberID = members.addMemberFromTelegram(newAccount)
+            if createdMemberID is None:
+                logger.error(
+                    "Unable to register %s (user_id: %s) because account persistence failed.",
+                    user.name,
+                    user.id,
+                )
+                await message.reply_text(_database_unavailable_message())
+                return
+
+            # Re-read the account to ensure registration committed.
+            member = members.getMemberByTelegramID(user.id)
+            if member is None:
+                logger.error(
+                    "Registration for %s (user_id: %s) did not persist after create.",
+                    user.name,
+                    user.id,
+                )
+                await message.reply_text(_database_unavailable_message())
+                return
 
         
             # TODO get official community chat links from config and insert into the welcome message
+            minimumCommunityScore = _runtime_int("telegram.minimum_community_score_private_chat", 50)
             welcomeMessage = f"""Welcome {user.name}, I am the {config.botName} chatbot. 
-You will need to have a minimum community score of 50 to chat with me in private. 
+You will need to have a minimum community score of {minimumCommunityScore} to chat with me in private. 
 Engage with the community in one of our group chats to increase your community score. 
             
 Use the /help command for more information."""
@@ -210,7 +1380,11 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Help command issued by {user.name} (user_id: {user.id}).")
 
-    helpMsg = """The following commands are available:\n\n"""
+    helpMsg = """The following commands are available:
+
+/botid to display the chatbot Telegram ID
+/userid to display your Telegram user ID
+"""
 
     if chat.type == "private":
         member = members.getMemberByTelegramID(user.id)
@@ -219,6 +1393,8 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             helpMsg = helpMsg + """/info to display your user account info
 -------------------------------
 Send a message to begin chatting with the chatbot."""
+        elif _database_unavailable():
+            helpMsg = helpMsg + _database_unavailable_message() + "\n"
         else:
             helpMsg = helpMsg + "Use the /start command to get started.\n"
     elif chat.type == "group" or chat.type == "supergroup":
@@ -294,6 +1470,47 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as err:
             logger.error(f"Exception while replying to a telegram message\n{err}")
+
+
+async def botID(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Display this bot's Telegram identifier."""
+    message = update.effective_message
+    user = update.effective_user
+    username = "unknown" if user is None else user.name
+    userID = "unknown" if user is None else user.id
+
+    logger.info(f"BotID command issued by {username} (user_id: {userID}).")
+
+    try:
+        bot = await context.bot.get_me()
+        botUsername = f"@{bot.username}" if bot.username else "not set"
+        await message.reply_text(
+            text=f"Bot ID: {bot.id}\nBot Username: {botUsername}"
+        )
+    except Exception as err:
+        logger.error(f"Exception while replying to a telegram message:\n{err}")
+
+
+async def userID(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Display the caller's Telegram user identifier."""
+    message = update.effective_message
+    user = update.effective_user
+    username = "unknown" if user is None else user.name
+    userID = "unknown" if user is None else user.id
+
+    logger.info(f"UserID command issued by {username} (user_id: {userID}).")
+
+    if user is None:
+        try:
+            await message.reply_text(text="Unable to resolve a user id for this update.")
+        except Exception as err:
+            logger.error(f"Exception while replying to a telegram message:\n{err}")
+        return
+
+    try:
+        await message.reply_text(text=f"User ID: {user.id}")
+    except Exception as err:
+        logger.error(f"Exception while replying to a telegram message:\n{err}")
 
 
 
@@ -395,7 +1612,7 @@ async def skip_systemPrompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Store the system prompt
     gd = context.chat_data.get("generate_data")
-    gd["system_prompt"] = config.defaults["generate_sys_prompt"]
+    gd["system_prompt"] = ""
 
     try:
         # Get the prompt
@@ -419,31 +1636,95 @@ async def setPrompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topicID = message.message_thread_id if message.is_topic_message else None
 
     gd = context.chat_data.get("generate_data")
-    systemPromptText = config.defaults["system_prompt"] + gd["system_prompt"]
-    
-    generateClient = AsyncClient(host=config.inference["generate"]["url"])
-    
+    userSystemPrompt = str(gd.get("system_prompt") or "").strip()
+    baseSystemPrompt = _default_generate_system_prompt()
+    if userSystemPrompt:
+        systemPromptText = f"{baseSystemPrompt}\n\nAdditional user instruction:\n{userSystemPrompt}"
+    else:
+        systemPromptText = baseSystemPrompt
+
+    inferenceGenerate = config.inference.get("generate", {}) if isinstance(config.inference, dict) else {}
+    inferenceChat = config.inference.get("chat", {}) if isinstance(config.inference, dict) else {}
+    generateHost = str(inferenceGenerate.get("url") or inferenceChat.get("url") or "").strip()
+    generateModel = str(inferenceGenerate.get("model") or inferenceChat.get("model") or "").strip()
+    if not generateHost or not generateModel:
+        logger.error("Generate command cannot resolve model host/model from config.")
+        context.chat_data["generate_data"] = None
+        return ConversationHandler.END
+
+    generateClient = AsyncClient(host=generateHost)
+    statusMessage = None
+    responseParts: list[str] = []
+    lastEditMonotonic = 0.0
+    editIntervalSeconds = 0.75
+
     try:
-        output = await generateClient.generate(
-            model=config.inference["generate"]["model"], 
-            stream=False, 
-            system=systemPromptText, 
-            prompt=message.text
+        statusMessage = await context.bot.send_message(
+            chat_id=chat.id,
+            message_thread_id=topicID,
+            text="Generating response...",
         )
-        responseText = output["response"]
     except Exception as err:
-        logger.error(f"Exception while generating a response from Ollama:\n{err}")
+        logger.warning(f"Unable to send generate status message:\n{err}")
+        statusMessage = None
+
+    try:
+        stream = await generateClient.chat(
+            model=generateModel,
+            stream=True,
+            messages=[
+                {"role": "system", "content": systemPromptText},
+                {"role": "user", "content": message.text},
+            ],
+        )
+        chunk: Any
+        async for chunk in stream:
+            chunkText = str(getattr(getattr(chunk, "message", None), "content", "") or "")
+            if not chunkText:
+                continue
+            responseParts.append(chunkText)
+            if statusMessage is None:
+                continue
+            now = time.monotonic()
+            if (now - lastEditMonotonic) < editIntervalSeconds:
+                continue
+            previewText = "".join(responseParts).strip()
+            if not previewText:
+                continue
+            previewText = TelegramStageStatus._truncate_text(previewText, 3800)
+            try:
+                await statusMessage.edit_text(text=previewText)
+                lastEditMonotonic = now
+            except Exception as err:
+                logger.debug(f"Generate stream status update failed:\n{err}")
+    except Exception as err:
+        logger.error(f"Exception while generating a response from Ollama chat stream:\n{err}")
+        context.chat_data["generate_data"] = None
         return ConversationHandler.END
     finally:
         # Delete the generate data from telegram bot storage
         context.chat_data["generate_data"] = None
-    
+
+    responseText = "".join(responseParts).strip()
+    if not responseText:
+        responseText = _TELEGRAM_FALLBACK_FINAL_REPLY
+    if len(responseText) > _TELEGRAM_MAX_MESSAGE_CHARS:
+        suffix = "\n\n[truncated]"
+        keep = max(1, _TELEGRAM_MAX_MESSAGE_CHARS - len(suffix))
+        responseText = responseText[:keep].rstrip() + suffix
+
+    if statusMessage is not None:
+        try:
+            await statusMessage.delete()
+        except Exception:
+            pass
+
     try:
         await context.bot.send_message(
-            chat_id=chat.id, 
+            chat_id=chat.id,
             message_thread_id=topicID,
             reply_markup=ReplyKeyboardRemove(),
-            text=responseText
+            text=responseText,
         )
     except Exception as err:
         logger.error(f"Exception while sending a telegram message:\n{err}")
@@ -1789,6 +3070,110 @@ async def catchAllMessages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"A message was captured by the catch all function.")
 
 
+async def runInspectorView(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    data = str(query.data or "")
+    if not data.startswith("diag:"):
+        return
+
+    parts = data.split(":", 3)
+    if len(parts) < 3:
+        await query.answer("Invalid inspector action.", show_alert=False)
+        return
+
+    token = parts[1]
+    action = parts[2]
+    raw_arg = parts[3] if len(parts) > 3 else ""
+    if action == "noop":
+        await query.answer()
+        return
+
+    payload = await _lookup_run_inspector_payload(token)
+    if payload is None:
+        await query.answer("Inspector session expired.", show_alert=False)
+        return
+
+    message = query.message
+    message_chat_id = getattr(getattr(message, "chat", None), "id", None)
+    message_id = getattr(message, "message_id", None)
+    if message_chat_id is None or message_id is None:
+        await query.answer("Inspector unavailable for this message.", show_alert=False)
+        return
+
+    if int(payload.get("chat_id", -1)) != int(message_chat_id) or int(payload.get("message_id", -1)) != int(message_id):
+        await query.answer("Inspector data does not match this message.", show_alert=False)
+        return
+
+    try:
+        if action == "back":
+            final_text = str(payload.get("final_text") or _TELEGRAM_FALLBACK_FINAL_REPLY)
+            keyboard = _build_run_inspector_keyboard(token, payload)
+            await query.edit_message_text(
+                text=_inspector_trim_text(final_text, max_chars=_TELEGRAM_MAX_MESSAGE_CHARS - 8),
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            await query.answer()
+            return
+
+        if action == "tool":
+            tool_entries = payload.get("tool_entries")
+            tools = tool_entries if isinstance(tool_entries, list) else []
+            try:
+                tool_index = int(raw_arg)
+            except ValueError:
+                tool_index = 0
+            if tool_index < 0 or tool_index >= len(tools):
+                await query.answer("Tool view is out of range.", show_alert=False)
+                return
+            tool_entry = tools[tool_index] if isinstance(tools[tool_index], dict) else {}
+            tool_text = _render_tool_page_text(
+                tool_entry=tool_entry,
+                tool_index=tool_index,
+                total_tools=len(tools),
+            )
+            await query.edit_message_text(
+                text=tool_text,
+                reply_markup=_build_tool_view_keyboard(token),
+                disable_web_page_preview=True,
+            )
+            await query.answer()
+            return
+
+        if action == "ctx":
+            stage_entries = payload.get("stage_entries")
+            stages = stage_entries if isinstance(stage_entries, list) else []
+            if not stages:
+                await query.answer("No stage context captured for this run.", show_alert=False)
+                return
+            try:
+                stage_index = int(raw_arg)
+            except ValueError:
+                stage_index = 0
+            stage_index = max(0, min(stage_index, len(stages) - 1))
+            stage_entry = stages[stage_index] if isinstance(stages[stage_index], dict) else {}
+            stage_text = _render_stage_page_text(
+                stage_entry=stage_entry,
+                stage_index=stage_index,
+                total_stages=len(stages),
+            )
+            await query.edit_message_text(
+                text=stage_text,
+                reply_markup=_build_context_view_keyboard(token, stage_index, len(stages)),
+                disable_web_page_preview=True,
+            )
+            await query.answer()
+            return
+
+        await query.answer("Unknown inspector action.", show_alert=False)
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"Inspector callback failed: {error}")
+        await query.answer("Unable to update inspector view.", show_alert=False)
+
+
 async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Bot messaged in group chat.")
     chat = update.effective_chat
@@ -1824,12 +3209,14 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Check user usage
     memberUsage = usage.getUsageForMember(memberID)
+    memberUsage = memberUsage if isinstance(memberUsage, list) else list()
     rateLimits = communityScore.getRateLimits(memberID, "community")
 
     if (not any(role in rolesAvailable for role in allowedRoles)):
         # User does not have permission for non rate limited chat
         # Check if user has exceeded hourly rate
-        if len(memberUsage) >= rateLimits["message"]:
+        messageLimit = rateLimits.get("message", 0)
+        if messageLimit > 0 and len(memberUsage) >= messageLimit:
             logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly message rate in {community['chat_title']} group chat.")
             try:
                 await message.reply_text(text=f"You have reached your hourly rate limit.")
@@ -1841,13 +3228,38 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     messageContext = {
         "community_id": community.get("community_id"),
+        "chat_host_id": community.get("community_id"),
+        "chat_type": "community",
         "platform": "telegram",
         "topic_id" : topicID,
-        "message_timestamp": datetime.now()
+        **_message_temporal_context(message),
     }
     
+    stageStatus = TelegramStageStatus(
+        context,
+        chat_id=chat.id,
+        thread_id=topicID,
+        reply_message=None,
+        enabled=_runtime_bool("telegram.show_stage_progress", True),
+        show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
+        detail_level=_runtime_str("telegram.stage_detail_level", "minimal"),
+        update_min_interval_seconds=_runtime_float("telegram.stage_update_min_interval_seconds", 1.0),
+    )
+    await stageStatus.start()
+    stageEvents: list[dict[str, Any]] = []
+
+    async def _stage_callback(event: dict[str, Any]) -> None:
+        _append_stage_event(stageEvents, event)
+        await stageStatus.emit(event)
+
     # Create the conversational agent instance
-    conversation = ConversationOrchestrator(message.text, memberID, messageContext, message.message_id)
+    conversation = ConversationOrchestrator(
+        message.text,
+        memberID,
+        messageContext,
+        message.message_id,
+        options={"stage_callback": _stage_callback},
+    )
 
     try:
         # Shows the bot as "typing"
@@ -1860,22 +3272,33 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Exception while sending a chat action for typing:\n{err}")
         # Non critical to the overall function, continue
 
-    response = await conversation.runAgents()
+    try:
+        response = await conversation.runAgents()
+    except Exception:  # noqa: BLE001
+        logger.exception("Conversation orchestration failed in group chat.")
+        await stageStatus.fail("I hit an internal error while processing that request.")
+        return
     
     try:
         # Send the conversational agent response
-        responseMessage = await context.bot.send_message(
-            chat_id=chat.id,
-            message_thread_id=topicID,
-            text=f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
+        finalText = (
+            f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. "
+            "Responses may or may not be factually correct."
+        )
+        responseMessage = await stageStatus.finalize(finalText)
+        await _attach_run_inspector_controls(
+            response_message=responseMessage,
+            final_text=finalText,
+            run_summary=conversation.run_summary,
+            stage_events=stageEvents,
         )
     except Exception as err:
         logger.error(f"Exception while sending a telegram message:\n{err}")
         # Error is critical to the remaining functionality, exit
         return
 
-    # Score the message if the message is greater than 20 words
-    if len(message.text.split(" ")) > 20:
+    # Score the message if the message is greater than the configured threshold
+    if len(message.text.split(" ")) > _message_word_threshold():
         communityScore.scoreMessage(conversation.promptHistoryID)
 
     # Add the response to the chat history
@@ -1909,7 +3332,7 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = update.effective_user
 
-    minimumCommunityScore = 50
+    minimumCommunityScore = _runtime_int("telegram.minimum_community_score_private_chat", 50)
 
     # Get account information
     member = members.getMemberByTelegramID(user.id)
@@ -1917,7 +3340,10 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if member is None:
         logger.info(f"Unregistered user {user.name} (user_id: {user.id}) messaged the bot in a private message.")
         try:
-            await message.reply_text("Use the /start command to begin chatting with the chatbot.")
+            if _database_unavailable():
+                await message.reply_text(_database_unavailable_message())
+            else:
+                await message.reply_text("Use the /start command to begin chatting with the chatbot.")
         except Exception as err:
             logger.error(f"The following error occurred while sending a telegram message:\n{err}")
         finally:
@@ -1932,19 +3358,27 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Check user usage
     memberUsage = usage.getUsageForMember(memberID)
+    memberUsage = memberUsage if isinstance(memberUsage, list) else list()
     rateLimits = communityScore.getRateLimits(memberID, chat.type)
+    memberCommunityScore = member.get("community_score", 0) or 0
 
     if (not any(role in rolesAvailable for role in allowedRoles)):
+        if memberCommunityScore < minimumCommunityScore:
+            try:
+                logger.info(f"User {user.name} (user_id: {user.id}) does not meet the minimum community score to use private chat with the chatbot. Community score:  {memberCommunityScore}/{minimumCommunityScore}")
+                await message.reply_text(f"You need a minimum community score of {minimumCommunityScore} to use the private chat features. Please join one of our community chats to build your community score.")
+            except Exception as err:
+                logger.error(f"The following error occurred while sending a telegram message:\n{err}")
+            finally:
+                return
+
         # User does not have permission for non rate limited chat
         # Check if user has exceeded hourly rate
-        if len(memberUsage) >= rateLimits["message"]:
+        messageLimit = rateLimits.get("message", 0)
+        if messageLimit > 0 and len(memberUsage) >= messageLimit:
             try:
-                if member["community_score"] < minimumCommunityScore:
-                    logger.info(f"User {user.name} (user_id: {user.id}) does not meet the minimum community score to use private chat with the chatbot. Community score:  {member['community_score']}/{minimumCommunityScore}")
-                    await message.reply_text(f"You need a minimum community score of {minimumCommunityScore} to use the private chat features. Please join one of our community chats to build your community score.")
-                else:
-                    logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly message rate in private chat.")
-                    await message.reply_text(text=f"You have reached your hourly rate limit.")
+                logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly message rate in private chat.")
+                await message.reply_text(text=f"You have reached your hourly rate limit.")
             except Exception as err:
                 logger.error(f"The following error occurred while sending a telegram message:\n{err}")
             finally:
@@ -1953,13 +3387,38 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     messageData = {
         "community_id": None,
+        "chat_host_id": memberID,
+        "chat_type": "member",
         "member_id": member.get("member_id"),
         "platform": "telegram",
         "topic_id" : None,
-        "message_timestamp": datetime.now()
+        **_message_temporal_context(message),
     }
 
-    conversation = ConversationOrchestrator(message.text, memberID, messageData, message.message_id)
+    stageStatus = TelegramStageStatus(
+        context,
+        chat_id=chat.id,
+        thread_id=None,
+        reply_message=message,
+        enabled=_runtime_bool("telegram.show_stage_progress", True),
+        show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
+        detail_level=_runtime_str("telegram.stage_detail_level", "minimal"),
+        update_min_interval_seconds=_runtime_float("telegram.stage_update_min_interval_seconds", 1.0),
+    )
+    await stageStatus.start()
+    stageEvents: list[dict[str, Any]] = []
+
+    async def _stage_callback(event: dict[str, Any]) -> None:
+        _append_stage_event(stageEvents, event)
+        await stageStatus.emit(event)
+
+    conversation = ConversationOrchestrator(
+        message.text,
+        memberID,
+        messageData,
+        message.message_id,
+        options={"stage_callback": _stage_callback},
+    )
 
     try:
         # Shows the bot as "typing"
@@ -1971,19 +3430,29 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Exception while sending a chat action for typing:\n{err}")
         # Non critical to the remaining functionality, continue
     
-    response = await conversation.runAgents()
+    try:
+        response = await conversation.runAgents()
+    except Exception:  # noqa: BLE001
+        logger.exception("Conversation orchestration failed in private chat.")
+        await stageStatus.fail("I hit an internal error while processing that request.")
+        return
     
     try:
-        responseMessage = await message.reply_text(
-            text=response
+        finalText = str(response)
+        responseMessage = await stageStatus.finalize(finalText)
+        await _attach_run_inspector_controls(
+            response_message=responseMessage,
+            final_text=finalText,
+            run_summary=conversation.run_summary,
+            stage_events=stageEvents,
         )
     except Exception as err:
-        logger.error("Exception while replying to a telegram message:\n{err}")
+        logger.error(f"Exception while replying to a telegram message:\n{err}")
         # Error is critical to the remaining functionality, exit
         return
     
-    # Score the message if the message is greater than 20 words
-    if len(message.text.split(" ")) > 20:
+    # Score the message if the message is greater than the configured threshold
+    if len(message.text.split(" ")) > _message_word_threshold():
         communityScore.scoreMessage(conversation.promptHistoryID)
 
     conversation.storeResponse(responseMessage.message_id)
@@ -2001,51 +3470,71 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"The following error occurred while sending a telegram message:\n{err}")
 
 
-# TODO Still need to handle chat history and usage storage for images
 async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Image received.")
     chat = update.effective_chat
     message = update.effective_message
     user = update.effective_user
     topicID = message.message_thread_id if message.is_topic_message else None
+    bestPhoto = message.photo[-1] if message and message.photo else None
+    if bestPhoto is None:
+        return
+    captionText = str(message.caption or "").strip()
+    imagePrompt = (
+        captionText
+        if captionText
+        else "Please describe this image and answer in context of the current chat."
+    )
 
     # Need user account regardless of chat type
     member = members.getMemberByTelegramID(user.id)
     if member is None:
         logger.warning(f"Unregistered user {user.name} (user_id: {user.id}) sent an image in a {chat.type} chat.")
         try:
-            await message.delete()
-            # Ban user if they sent image within 60 seconds of joining the group chat
-            userJoined = context.chat_data.get(user.id)
-            if userJoined is not None:
-                # compare the timestamps
-                if userJoined > (datetime.now() - timedelta(seconds=60)):
+            if chat.type == "private":
+                if _database_unavailable():
+                    await message.reply_text(_database_unavailable_message())
+                else:
+                    await message.reply_text("Use the /start command to begin chatting with the chatbot.")
+            else:
+                await message.delete()
+                # Ban user if they sent image within 60 seconds of joining the group chat
+                userJoined = context.chat_data.get(user.id)
+                if userJoined is not None and userJoined > (datetime.now() - _new_member_grace_delta()):
                     logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
                     await chat.ban_member(user.id)
                     return
-
-            await context.bot.send_message(
-                chat_id=chat.id,
-                message_thread_id=topicID,
-                text=f"Start a private chat with the @{config.botName} to send images in this chat."
-            )
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    message_thread_id=topicID,
+                    text=f"Start a private chat with the @{config.botName} to send images in this chat."
+                )
         except Exception as err:
             logger.error(f"Exception while handling potential spam image:\n{err}")
         finally:
-            # Exit the function
             return
     
     memberID = member.get("member_id")
-    minimumCommunityScore = 70 if chat.type == "private" else 20
+    minimumCommunityScore = (
+        _runtime_int("telegram.minimum_community_score_private_image", 70)
+        if chat.type == "private"
+        else _runtime_int("telegram.minimum_community_score_group_image", 20)
+    )
     # Set the allowed roles
     allowedRoles = ["tester", "marketing", "admin", "owner"]
     
     # Get account information
+    communityID = None
+    chatHostID = memberID
+    chatType = "member"
+    threadID = None
+
     if chat.type == "private":
         # Set the rolesAvailable
-        rolesAvailable = member["roles"]
+        rolesAvailable = list(member.get("roles") or [])
         # Get rate limits for private chat
         rateLimits = communityScore.getRateLimits(memberID, chat.type)
+        threadID = None
 
     elif chat.type == "group" or chat.type == "supergroup":
         community = communities.getCommunityByTelegramID(chat.id)
@@ -2062,19 +3551,23 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Combine the user and group roles into rolesAvailable
         rolesAvailable = set(member["roles"] + community["roles"])
         # Get rate limits for group chat
-        rateLimits = communityScore.getRateLimits(memberID, "community") 
+        rateLimits = communityScore.getRateLimits(memberID, "community")
+        communityID = community.get("community_id")
+        chatHostID = communityID
+        chatType = "community"
+        threadID = topicID
     else:
         # Only chat types allowed are private, group, and supergroup
         return
     
     if (not any(role in rolesAvailable for role in allowedRoles)):
-        # User does not have permission for non rate limited chat
-        # Check if user has exceeded hourly rate
-        memberUsage = usage.getUsageForMember(memberID)
-        if len(memberUsage) >= rateLimits["image"]:
+        memberCommunityScore = member.get("community_score", 0) or 0
+        if memberCommunityScore < minimumCommunityScore:
             try:
-                if member["community_score"] < minimumCommunityScore:
-                    logger.info(f"User {user.name} (user_id: {user.id}) does not meet the minimum community score to send images in a {chat.type} chat.")
+                logger.info(
+                    f"User {user.name} (user_id: {user.id}) does not meet the minimum community score to send images in a {chat.type} chat."
+                )
+                if chat.type != "private":
                     await message.delete()
                     await context.bot.send_message(
                         chat_id=chat.id,
@@ -2082,56 +3575,140 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text=f"You need a minimum community score of {minimumCommunityScore} to send images in this chat."
                     )
                 else:
-                    logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly message rate in {community['chat_title']} group chat.")
-                    await message.reply_text(text=f"You have reached your hourly rate limit.")
+                    await message.reply_text(
+                        text=f"You need a minimum community score of {minimumCommunityScore} to use private image features."
+                    )
             except Exception as err:
                 logger.error(f"Exception while handling image rate limits in a group chat:\n{err}")
             finally:
-                # User has reach rate limit, exit function
+                return
+
+        # User does not have permission for non rate limited chat
+        # Check if user has exceeded hourly rate
+        memberUsage = usage.getUsageForMember(memberID)
+        memberUsage = memberUsage if isinstance(memberUsage, list) else list()
+        imageLimit = int(rateLimits.get("image", 0) or 0)
+        if imageLimit > 0 and len(memberUsage) >= imageLimit:
+            try:
+                logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly image rate limit.")
+                await message.reply_text(text="You have reached your hourly image rate limit.")
+            except Exception as err:
+                logger.error(f"Exception while handling image rate limits in a group chat:\n{err}")
+            finally:
                 return
 
     # Convert images to base64
-    photoFile = await message.effective_attachment[-1].get_file()
+    photoFile = await bestPhoto.get_file()
     photoBytes = await photoFile.download_as_bytearray()
     b64_photo = base64.b64encode(photoBytes)
     b64_string = b64_photo.decode()
     imageList = [b64_string]
-    imagePrompt = "Describe this image." if not message.caption else message.caption
+    imageContext = {
+        "present": True,
+        "image_count": len(imageList),
+        "caption_present": bool(captionText),
+        "caption": captionText,
+        "prompt_text": imagePrompt,
+        "telegram_file_id": getattr(bestPhoto, "file_id", None),
+        "telegram_file_size": getattr(bestPhoto, "file_size", None),
+        "width": getattr(bestPhoto, "width", None),
+        "height": getattr(bestPhoto, "height", None),
+    }
 
     messageData = {
-        "chat_id": chat.id,
-        "topic_id" : topicID,
+        "community_id": communityID,
+        "chat_host_id": chatHostID,
+        "chat_type": chatType,
+        "member_id": memberID,
+        "platform": "telegram",
+        "topic_id": topicID,
         "message_id": message.message_id,
-        "message_images": imageList,
-        "message_text": imagePrompt
+        "message_text": imagePrompt,
+        "image_context": imageContext,
+        **_message_temporal_context(message),
     }
-    
-    # Create the conversational agent instance
-    imageAgent = ImageAgent(messageData, memberID)
-    
+
+    stageStatus = TelegramStageStatus(
+        context,
+        chat_id=chat.id,
+        thread_id=threadID,
+        reply_message=message if chat.type == "private" else None,
+        enabled=_runtime_bool("telegram.show_stage_progress", True),
+        show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
+        detail_level=_runtime_str("telegram.stage_detail_level", "minimal"),
+        update_min_interval_seconds=_runtime_float("telegram.stage_update_min_interval_seconds", 1.0),
+    )
+    await stageStatus.start()
+    stageEvents: list[dict[str, Any]] = []
+
+    async def _stage_callback(event: dict[str, Any]) -> None:
+        _append_stage_event(stageEvents, event)
+        await stageStatus.emit(event)
+
+    conversation = ConversationOrchestrator(
+        imagePrompt,
+        memberID,
+        messageData,
+        message.message_id,
+        options={
+            "stage_callback": _stage_callback,
+            "ingress_images": imageList,
+            "image_context": imageContext,
+        },
+    )
+
     # Shows the bot as "typing"
     try:
         await context.bot.send_chat_action(
             chat_id=chat.id, 
             action=constants.ChatAction.TYPING,
-            message_thread_id=topicID
+            message_thread_id=threadID
         )
     except Exception as err:
         logger.error(f"Exception while sending a chat action for typing:\n{err}")
         # Non critical to the remaining functionality, continue
-    
-    response = await imageAgent.generateResponse()
 
-    # Send the conversational agent response
     try:
-        responseMessage = await context.bot.send_message(
-            chat_id=chat.id,
-            message_thread_id=topicID,
-            text=f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
+        response = await conversation.runAgents()
+    except Exception:  # noqa: BLE001
+        logger.exception("Conversation orchestration failed for image ingress.")
+        await stageStatus.fail("I hit an internal error while processing that image request.")
+        return
+
+    try:
+        finalText = (
+            str(response)
+            if chat.type == "private"
+            else f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
+        )
+        responseMessage = await stageStatus.finalize(finalText)
+        await _attach_run_inspector_controls(
+            response_message=responseMessage,
+            final_text=finalText,
+            run_summary=conversation.run_summary,
+            stage_events=stageEvents,
         )
     except Exception as err:
         logger.error(f"Exception while sending a telegram message:\n{err}")
-    # TODO Handle adding prompt and response into the chat history collection.
+        return
+
+    if captionText and len(captionText.split(" ")) > _message_word_threshold():
+        communityScore.scoreMessage(conversation.promptHistoryID)
+
+    conversation.storeResponse(responseMessage.message_id)
+    usage.addUsage(conversation.promptHistoryID, conversation.responseHistoryID, conversation.stats)
+
+    userDefaults = context.user_data["defaults"] = {} if "defaults" not in context.user_data else context.user_data["defaults"]
+    if userDefaults.get("send_stats"):
+        try:
+            await sendStats(
+                stats=conversation.stats,
+                chatID=chat.id,
+                context=context,
+                threadID=threadID,
+            )
+        except Exception as err:
+            logger.error(f"The following error occurred while sending a telegram message:\n{err}")
 
 
 async def otherGroupChat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2147,8 +3724,8 @@ async def otherGroupChat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     score = 0 if member is None else member.get("community_score")
     userJoined = context.chat_data.get(user.id)
 
-    minimumCommunityScore = 20
-    spamDistanceThreshold = 10
+    minimumCommunityScore = _runtime_int("telegram.minimum_community_score_other_group", 20)
+    spamDistanceThreshold = _runtime_float("conversation.spam_distance_threshold", 10.0)
     # Set the allowed roles
     allowedRoles = ["tester", "marketing", "admin", "owner"]
     rolesAvailable = list() if member is None else member.get("roles")
@@ -2167,7 +3744,7 @@ async def otherGroupChat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     # Check how long the user has been in the chat
                     if userJoined is not None:
-                        if userJoined > (datetime.now() - timedelta(seconds=60)):
+                        if userJoined > (datetime.now() - _new_member_grace_delta()):
                             logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
                             await chat.ban_member(user.id)
                             return
@@ -2196,8 +3773,8 @@ async def otherGroupChat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timestamp=datetime.now()
         )
 
-        # Score the message if the user account exist and the message is greater than 20 words
-        if len(message.text.split(" ")) > 20:
+        # Score the message if the user account exists and the message is above threshold
+        if len(message.text.split(" ")) > _message_word_threshold():
             communityScore.scoreMessage(messageHistoryID)
 
 
@@ -2267,8 +3844,10 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # User does not have permission for non rate limited chat
         # Check if user has exceeded hourly rate
         memberUsage = usage.getUsageForMember(memberID)
-        rateLimits = communityScore.getRateLimits(member, "community")
-        if len(memberUsage) >= rateLimits["message"]:
+        memberUsage = memberUsage if isinstance(memberUsage, list) else list()
+        rateLimits = communityScore.getRateLimits(memberID, "community")
+        messageLimit = rateLimits.get("message", 0)
+        if messageLimit > 0 and len(memberUsage) >= messageLimit:
             logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly message rate in {community['chat_title']} group chat.")
             try:
                 await message.reply_text(text=f"You have reached your hourly rate limit.")
@@ -2280,16 +3859,41 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     messageData = {
         "community_id": communityID,
+        "chat_host_id": communityID,
+        "chat_type": "community",
         "member_id": memberID,
         "platform": "telegram",
         "topic_id" : topicID,
         "message_id": message.message_id,
         "message_text": message.text,
-        "message_timestamp": datetime.now()
+        **_message_temporal_context(message),
     }
     
+    stageStatus = TelegramStageStatus(
+        context,
+        chat_id=chat.id,
+        thread_id=topicID,
+        reply_message=None,
+        enabled=_runtime_bool("telegram.show_stage_progress", True),
+        show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
+        detail_level=_runtime_str("telegram.stage_detail_level", "minimal"),
+        update_min_interval_seconds=_runtime_float("telegram.stage_update_min_interval_seconds", 1.0),
+    )
+    await stageStatus.start()
+    stageEvents: list[dict[str, Any]] = []
+
+    async def _stage_callback(event: dict[str, Any]) -> None:
+        _append_stage_event(stageEvents, event)
+        await stageStatus.emit(event)
+
     # Create the conversational agent instance
-    conversation = ConversationOrchestrator(message.text, memberID, messageData, message.message_id)
+    conversation = ConversationOrchestrator(
+        message.text,
+        memberID,
+        messageData,
+        message.message_id,
+        options={"stage_callback": _stage_callback},
+    )
     # Shows the bot as "typing"
     try:
         await context.bot.send_chat_action(
@@ -2301,22 +3905,33 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Exception while sending a chat action for typing:\n{err}")
         # Non critical to the remaining functionality, continue
 
-    response = await conversation.runAgents()
+    try:
+        response = await conversation.runAgents()
+    except Exception:  # noqa: BLE001
+        logger.exception("Conversation orchestration failed while replying in group chat.")
+        await stageStatus.fail("I hit an internal error while processing that request.")
+        return
 
     # Send the conversational agent response
     try:
-        responseMessage = await context.bot.send_message(
-            chat_id=chat.id,
-            message_thread_id=topicID,
-            text=f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
+        finalText = (
+            f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. "
+            "Responses may or may not be factually correct."
+        )
+        responseMessage = await stageStatus.finalize(finalText)
+        await _attach_run_inspector_controls(
+            response_message=responseMessage,
+            final_text=finalText,
+            run_summary=conversation.run_summary,
+            stage_events=stageEvents,
         )
     except Exception as err:
         logger.error(f"Exception while sending a telegram message:\n{err}")
         # Critical to the remaining functionality, exit
         return
 
-    # Score the message if the message is greater than 20 words
-    if len(message.text.split(" ")) > 20:
+    # Score the message if the message is greater than the configured threshold
+    if len(message.text.split(" ")) > _message_word_threshold():
         communityScore.scoreMessage(conversation.promptHistoryID)
 
     conversation.storeResponse(responseMessage.message_id)
@@ -2449,7 +4064,7 @@ async def linkHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             # Ban user if they sent image within 60 seconds of joining the group chat
             userJoined = context.chat_data.get(user.id)
             if userJoined is not None:
-                if userJoined > (datetime.now() - timedelta(seconds=60)):
+                if userJoined > (datetime.now() - _new_member_grace_delta()):
                     logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
                     await chat.ban_member(user.id)
                     return
@@ -2467,7 +4082,7 @@ async def linkHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         
     #memberID = member.get("member_id")
-    minimumCommunityScore = 20
+    minimumCommunityScore = _runtime_int("telegram.minimum_community_score_link", 20)
     # Set the allowed roles
     allowedRoles = ["tester", "marketing", "admin", "owner"]
 
@@ -2493,7 +4108,7 @@ async def linkHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await context.bot.send_message(
                 chat_id=chat.id,
                 message_thread_id=topicID,
-                text=f"You need a minimum community score of {minimumCommunityScore} to send links in the {community.get("community_name")} chat."
+                text=f"You need a minimum community score of {minimumCommunityScore} to send links in the {community.get('community_name')} chat."
             )
         except Exception as err:
             logger.error(f"Exception while handling potential spam message (containing a link):\n{err}")
@@ -2522,14 +4137,23 @@ async def setPassword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if len(context.args) == 1:
             password = context.args[0]
             # Do regular expression
-            pattern = re.compile(r"(?=.*\d)(?=.*[a-z])(?=.*[A-Z])(?=.*[-+_!@#$%^&*.,?]).{12,}")
+            minPasswordLength = _password_min_length()
+            pattern = re.compile(
+                r"(?=.*\d)(?=.*[a-z])(?=.*[A-Z])(?=.*[-+_!@#$%^&*.,?]).{"
+                + str(minPasswordLength)
+                + r",}"
+            )
             validPassword = pattern.search(password)
             if validPassword:
                 #password = accounts.setPassword(user.id, password=password)
                 password = members.setPassword(memberID, password)
                 response = f"Your password {password} has been stored"
             else:
-                response = "You must enter a valid password.\nHint:  passwords must by a minimum of 12 characters, contain at least one lowercase, uppercase, digit, and symbol."
+                response = (
+                    "You must enter a valid password.\n"
+                    f"Hint: passwords must be at least {minPasswordLength} characters, "
+                    "contain at least one lowercase, uppercase, digit, and symbol."
+                )
 
         else:
             # Generate a random password
@@ -2639,7 +4263,7 @@ async def handleForwardedMessage(update: Update, context: ContextTypes.DEFAULT_T
             userJoined = context.chat_data.get(user.id)
             if userJoined is not None:
                 # compare the timestamps
-                if userJoined > (datetime.now() - timedelta(seconds=60)):
+                if userJoined > (datetime.now() - _new_member_grace_delta()):
                     logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
                     await chat.ban_member(user.id)
                     return
@@ -2654,7 +4278,7 @@ async def handleForwardedMessage(update: Update, context: ContextTypes.DEFAULT_T
         finally:
             return
     
-    minimumCommunityScore = 20
+    minimumCommunityScore = _runtime_int("telegram.minimum_community_score_forward", 20)
     # Set the allowed roles
     allowedRoles = ["tester", "marketing", "admin", "owner"]
 
@@ -2680,7 +4304,7 @@ async def handleForwardedMessage(update: Update, context: ContextTypes.DEFAULT_T
             await context.bot.send_message(
                 chat_id=chat.id,
                 message_thread_id=topicID,
-                text=f"You need a minimum community score of {minimumCommunityScore} to forward messages in the {community.get("community_name")} chat."
+                text=f"You need a minimum community score of {minimumCommunityScore} to forward messages in the {community.get('community_name')} chat."
             )
         except Exception as err:
             logger.error(f"Exception while handling potential spam message (forwarded message):\n{err}")
@@ -2699,10 +4323,25 @@ async def errorHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def main() -> None:
     logger.info("RYO - begin telegram ui application.")
+    telegramConfigIssues = config.getTelegramConfigIssues()
+    if telegramConfigIssues:
+        logger.error(
+            "Telegram startup blocked: missing/invalid config values: %s",
+            ", ".join(telegramConfigIssues),
+        )
+        logger.error("Run setup wizard to fix Telegram config: python3 scripts/setup_wizard.py --telegram-only")
+        return
+
     # Run the bot
     # Create the Application and pass it your bot's token.
     # .get_updates_write_timeout(100)
-    application = Application.builder().token(config.bot_token).concurrent_updates(True).get_updates_write_timeout(500).build()
+    application = (
+        Application.builder()
+        .token(config.bot_token)
+        .concurrent_updates(True)
+        .get_updates_write_timeout(_runtime_int("telegram.get_updates_write_timeout", 500))
+        .build()
+    )
 
     # Generate command chain
     generateHandler = ConversationHandler(
@@ -2823,24 +4462,57 @@ def main() -> None:
     application.add_handler(CommandHandler("dashboard", dashboard, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("help", help))
     application.add_handler(CommandHandler("info", info))
+    application.add_handler(CommandHandler("botid", botID))
+    application.add_handler(CommandHandler("userid", userID))
     application.add_handler(CommandHandler("statistics", statisticsManager))
     application.add_handler(CommandHandler("password", setPassword, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CallbackQueryHandler(runInspectorView, pattern=r"^diag:"))
 
     application.add_handler(MessageReactionHandler(reactionsHandler))
     # Add spam checks
-    application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS & filters.FORWARDED, handleForwardedMessage))
-    application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS & (filters.Entity("url") | filters.Entity("text_link")), linkHandler))
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.ChatType.GROUPS & filters.FORWARDED,
+            _guard_message_handler(handleForwardedMessage),
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.ChatType.GROUPS & (filters.Entity("url") | filters.Entity("text_link")),
+            _guard_message_handler(linkHandler),
+        )
+    )
     
     # Add conversational chains
     application.add_handlers([generateHandler, knowledgeHandler, newsletterHandler, promoteHandler, proposalsHandler, tweetHandler])
 
 
     # Add message handlers
-    application.add_handler(MessageHandler(filters.Mention(config.botName) & filters.ChatType.GROUPS & ~filters.COMMAND, directChatGroup))
-    application.add_handler(MessageHandler(filters.REPLY & filters.ChatType.GROUPS & ~filters.COMMAND, replyToBot))
-    application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, directChatPrivate))
-    application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND, otherGroupChat))
-    application.add_handler(MessageHandler(filters.PHOTO, handleImage))
+    application.add_handler(
+        MessageHandler(
+            filters.Mention(config.botName) & filters.ChatType.GROUPS & ~filters.COMMAND,
+            _guard_message_handler(directChatGroup),
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.REPLY & filters.ChatType.GROUPS & ~filters.COMMAND,
+            _guard_message_handler(replyToBot),
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+            _guard_message_handler(directChatPrivate),
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND,
+            _guard_message_handler(otherGroupChat),
+        )
+    )
+    application.add_handler(MessageHandler(filters.PHOTO, _guard_message_handler(handleImage)))
     application.add_handler(MessageHandler(filters.ALL, catchAllMessages))
 
     # Other update type handlers

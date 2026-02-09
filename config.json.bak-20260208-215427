@@ -1,0 +1,98 @@
+{
+  "bot_name": "testbot",
+  "bot_id": 12345,
+  "bot_token": "8508837775:AAFzwT_5xRzOBofyWAGZiZSTS_kqdqLTZbk",
+  "web_ui_url": "https://web.ui.url/",
+  "owner_info": {
+    "first_name": "First",
+    "last_name": "Last",
+    "user_id": 12345,
+    "username": "telegram_username"
+  },
+  "database": {
+    "db_name": "ryo_chat",
+    "user": "postgres_user",
+    "password": "postgres_password",
+    "host": "127.0.0.1",
+    "port": "5434"
+  },
+  "database_fallback": {
+    "enabled": true,
+    "mode": "local",
+    "db_name": "ryo_chat_fallback",
+    "user": "postgres_user",
+    "password": "postgres_password",
+    "host": "127.0.0.1",
+    "port": "5435"
+  },
+  "knowledge": {
+    "domains": [
+      "General",
+      "Project",
+      "Operations"
+    ]
+  },
+  "roles_list": [
+    "user",
+    "tester",
+    "marketing",
+    "admin",
+    "owner"
+  ],
+  "defaults": {
+    "system_prompt": "You are a helpful chatbot. Respond truthfully and factually. If you do not know the answer, say so and ask for clarification when needed.",
+    "generate_sys_prompt": "Adjust response length to the user request: concise for quick asks, detailed for deeper asks.",
+    "chat_sys_prompt": "Use conversation history and retrieved context when relevant, while keeping answers on-topic."
+  },
+  "inference": {
+    "embedding": {
+      "url": "http://127.0.0.1:11434",
+      "model": "nomic-embed-text:latest"
+    },
+    "generate": {
+      "url": "http://127.0.0.1:11434",
+      "model": "qwen3-vl:4b"
+    },
+    "chat": {
+      "url": "http://127.0.0.1:11434",
+      "model": "qwen3-vl:4b"
+    },
+    "tool": {
+      "url": "http://127.0.0.1:11434",
+      "model": "qwen3-vl:4b"
+    },
+    "multimodal": {
+      "url": "http://127.0.0.1:11434",
+      "model": "qwen3-vl:4b"
+    }
+  },
+  "community_score_requirements": {
+    "private_chat": 0,
+    "private_image": 0,
+    "group_image": 0,
+    "other_group": 0,
+    "link_sharing": 0,
+    "message_forwarding": 0
+  },
+  "twitter_keys": {
+    "consumer_key": "",
+    "consumer_secret": "",
+    "access_token": "",
+    "access_token_secret": ""
+  },
+  "api_keys": {
+    "brave_search": "BSAeNtsRoD3GNWwbw7EZ7Qjr84qY3X0"
+  },
+  "runtime": {
+    "telegram": {
+      "minimum_community_score_private_chat": 0,
+      "minimum_community_score_private_image": 0,
+      "minimum_community_score_group_image": 0,
+      "minimum_community_score_other_group": 0,
+      "minimum_community_score_link": 0,
+      "minimum_community_score_forward": 0,
+      "show_stage_json_details": true,
+      "stage_detail_level": "normal"
+    }
+  }
+}

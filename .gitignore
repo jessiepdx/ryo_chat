@@ -3,3 +3,6 @@
 **/__pycache__/
 logs/
 config.json
+.env
+.env.*
+!.env.example
