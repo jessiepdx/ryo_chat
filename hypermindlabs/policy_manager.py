@@ -63,7 +63,7 @@ class PolicyManager:
 
     _policy_to_inference_key = {
         "tool_calling": "tool",
-        "message_analysis": "tool",
+        "message_analysis": "chat",
         "chat_conversation": "chat",
         "dev_test": "chat",
     }

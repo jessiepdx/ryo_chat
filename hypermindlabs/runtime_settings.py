@@ -95,6 +95,15 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
     "orchestrator": {
         "fast_path_small_talk_enabled": True,
         "fast_path_small_talk_max_chars": 96,
+        "analysis_bypass_small_talk_enabled": True,
+        "analysis_history_limit": 8,
+        "analysis_history_limit_on_switch": 4,
+        "analysis_history_limit_small_talk": 2,
+        "tool_history_limit": 6,
+        "response_history_limit": 10,
+        "auto_expand_tool_stage_enabled": True,
+        "auto_expand_max_rounds": 1,
+        "progress_stage_events_enabled": False,
         "analysis_max_output_tokens": 256,
         "analysis_temperature": 0.1,
         "analysis_context_summary_max_chars": 220,
@@ -274,6 +283,42 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "orchestrator.fast_path_small_talk_max_chars": (
         ("RYO_ORCHESTRATOR_FAST_PATH_BREVITY_MAX_CHARS", "RYO_ORCHESTRATOR_FAST_PATH_SMALL_TALK_MAX_CHARS"),
         "int",
+    ),
+    "orchestrator.analysis_bypass_small_talk_enabled": (
+        ("RYO_ORCHESTRATOR_ANALYSIS_BYPASS_SMALL_TALK_ENABLED",),
+        "bool",
+    ),
+    "orchestrator.analysis_history_limit": (
+        ("RYO_ORCHESTRATOR_ANALYSIS_HISTORY_LIMIT",),
+        "int",
+    ),
+    "orchestrator.analysis_history_limit_on_switch": (
+        ("RYO_ORCHESTRATOR_ANALYSIS_HISTORY_LIMIT_ON_SWITCH",),
+        "int",
+    ),
+    "orchestrator.analysis_history_limit_small_talk": (
+        ("RYO_ORCHESTRATOR_ANALYSIS_HISTORY_LIMIT_SMALL_TALK",),
+        "int",
+    ),
+    "orchestrator.tool_history_limit": (
+        ("RYO_ORCHESTRATOR_TOOL_HISTORY_LIMIT",),
+        "int",
+    ),
+    "orchestrator.response_history_limit": (
+        ("RYO_ORCHESTRATOR_RESPONSE_HISTORY_LIMIT",),
+        "int",
+    ),
+    "orchestrator.auto_expand_tool_stage_enabled": (
+        ("RYO_ORCHESTRATOR_AUTO_EXPAND_TOOL_STAGE_ENABLED",),
+        "bool",
+    ),
+    "orchestrator.auto_expand_max_rounds": (
+        ("RYO_ORCHESTRATOR_AUTO_EXPAND_MAX_ROUNDS",),
+        "int",
+    ),
+    "orchestrator.progress_stage_events_enabled": (
+        ("RYO_ORCHESTRATOR_PROGRESS_STAGE_EVENTS_ENABLED",),
+        "bool",
     ),
     "orchestrator.analysis_max_output_tokens": (
         ("RYO_ORCHESTRATOR_ANALYSIS_MAX_OUTPUT_TOKENS",),

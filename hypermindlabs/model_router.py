@@ -59,7 +59,7 @@ class ModelRouter:
     """Centralized model routing and fallback behavior for Ollama requests."""
 
     _capability_to_inference_key = {
-        "analysis": "tool",
+        "analysis": "chat",
         "tool": "tool",
         "chat": "chat",
         "conversation": "chat",
