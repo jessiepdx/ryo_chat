@@ -264,6 +264,12 @@ class ModelRouter:
         if metadata.selected_model in candidates:
             candidates.remove(metadata.selected_model)
             candidates.insert(0, metadata.selected_model)
+        if metadata.available_models:
+            available_set = set(metadata.available_models)
+            installed_candidates = [model for model in candidates if model in available_set]
+            missing_candidates = [model for model in candidates if model not in available_set]
+            if installed_candidates:
+                candidates = installed_candidates + missing_candidates
 
         for candidate in candidates:
             metadata.attempted_models.append(candidate)

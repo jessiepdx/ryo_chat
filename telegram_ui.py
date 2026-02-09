@@ -294,6 +294,7 @@ _ORCHESTRATION_STAGE_LABELS = {
     "analysis.progress": "Analyzing message",
     "analysis.complete": "Analysis complete",
     "analysis.timeout": "Analysis timeout",
+    "analysis.error": "Analysis error",
     "analysis.payload": "Analysis payload",
     "tools.suggested": "Tool suggestions",
     "process.directive": "Process directive",
@@ -304,6 +305,7 @@ _ORCHESTRATION_STAGE_LABELS = {
     "response.start": "Generating response",
     "response.progress": "Generating response",
     "response.timeout": "Response timeout",
+    "response.error": "Response error",
     "response.complete": "Response generated",
     "response.fallback": "Fallback response",
     "response.sanitized": "Sanitized response",
@@ -326,6 +328,7 @@ _MINIMAL_VISIBLE_STAGES = {
     "analysis.progress",
     "analysis.complete",
     "analysis.timeout",
+    "analysis.error",
     "tools.suggested",
     "process.directive",
     "tools.start",
@@ -335,6 +338,7 @@ _MINIMAL_VISIBLE_STAGES = {
     "response.start",
     "response.progress",
     "response.timeout",
+    "response.error",
     "response.complete",
     "persona.adapt",
     "persona.rollup",
@@ -3194,8 +3198,8 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = await conversation.runAgents()
-    except Exception as err:  # noqa: BLE001
-        logger.error(f"Conversation orchestration failed in group chat:\n{err}")
+    except Exception:  # noqa: BLE001
+        logger.exception("Conversation orchestration failed in group chat.")
         await stageStatus.fail("I hit an internal error while processing that request.")
         return
     
@@ -3352,8 +3356,8 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         response = await conversation.runAgents()
-    except Exception as err:  # noqa: BLE001
-        logger.error(f"Conversation orchestration failed in private chat:\n{err}")
+    except Exception:  # noqa: BLE001
+        logger.exception("Conversation orchestration failed in private chat.")
         await stageStatus.fail("I hit an internal error while processing that request.")
         return
     
@@ -3590,8 +3594,8 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = await conversation.runAgents()
-    except Exception as err:  # noqa: BLE001
-        logger.error(f"Conversation orchestration failed for image ingress:\n{err}")
+    except Exception:  # noqa: BLE001
+        logger.exception("Conversation orchestration failed for image ingress.")
         await stageStatus.fail("I hit an internal error while processing that image request.")
         return
 
@@ -3827,8 +3831,8 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = await conversation.runAgents()
-    except Exception as err:  # noqa: BLE001
-        logger.error(f"Conversation orchestration failed while replying in group chat:\n{err}")
+    except Exception:  # noqa: BLE001
+        logger.exception("Conversation orchestration failed while replying in group chat.")
         await stageStatus.fail("I hit an internal error while processing that request.")
         return
 

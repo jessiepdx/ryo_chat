@@ -431,6 +431,34 @@ def _as_bool(value: Any, fallback: bool = False) -> bool:
     return fallback
 
 
+def _chunk_field(chunk: Any, field: str, default: Any = None) -> Any:
+    if isinstance(chunk, dict):
+        return chunk.get(field, default)
+    return getattr(chunk, field, default)
+
+
+def _chunk_message_content(chunk: Any) -> str:
+    message_payload = _chunk_field(chunk, "message")
+    if isinstance(message_payload, dict):
+        return str(message_payload.get("content") or "")
+    return str(getattr(message_payload, "content", "") or "")
+
+
+def _chunk_done(chunk: Any) -> bool:
+    return _as_bool(_chunk_field(chunk, "done", False), False)
+
+
+def _chunk_stream_stats(chunk: Any) -> dict[str, Any]:
+    return {
+        "total_duration": _chunk_field(chunk, "total_duration"),
+        "load_duration": _chunk_field(chunk, "load_duration"),
+        "prompt_eval_count": _chunk_field(chunk, "prompt_eval_count"),
+        "prompt_eval_duration": _chunk_field(chunk, "prompt_eval_duration"),
+        "eval_count": _chunk_field(chunk, "eval_count"),
+        "eval_duration": _chunk_field(chunk, "eval_duration"),
+    }
+
+
 def _as_string_list(value: Any) -> list[str]:
     output: list[str] = []
     if isinstance(value, list):
@@ -450,6 +478,12 @@ def _coerce_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
     return {}
+
+
+def _coerce_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return list(value)
+    return []
 
 
 def _coerce_message_list(value: Any) -> list[Message]:
@@ -2847,7 +2881,20 @@ class ConversationOrchestrator:
                         total_timeout_seconds=analysisTotalTimeout,
                     )
                     break
-                chunkContent = str(getattr(getattr(chunk, "message", None), "content", "") or "")
+                except Exception as error:  # noqa: BLE001
+                    logger.exception(
+                        "[stream.analysis] stream iteration failed; "
+                        f"using conservative parse fallback (chunks={analysisChunkCount}, chars={analysisCharCount})"
+                    )
+                    await self._emit_stage(
+                        "analysis.error",
+                        "Analysis stream failed; using conservative parse fallback.",
+                        error=str(error),
+                        chunks=analysisChunkCount,
+                        chars=analysisCharCount,
+                    )
+                    break
+                chunkContent = _chunk_message_content(chunk)
                 # Call the streaming response method. This is intended to be over written by the UI for cutom handling
                 self.streamingResponse(streamingChunk=chunkContent)
                 analysisResponseMessage = analysisResponseMessage + chunkContent
@@ -2878,19 +2925,13 @@ class ConversationOrchestrator:
                         chars=analysisCharCount,
                     )
                     analysisLastProgressEmit = now
-                if chunk.done:
+                if _chunk_done(chunk):
                     analysisDoneSeen = True
-                    self._analysisStats = {
-                        "total_duration": chunk.total_duration,
-                        "load_duration": chunk.load_duration,
-                        "prompt_eval_count": chunk.prompt_eval_count,
-                        "prompt_eval_duration": chunk.prompt_eval_duration,
-                        "eval_count": chunk.eval_count,
-                        "eval_duration": chunk.eval_duration,
-                    }
+                    self._analysisStats = _chunk_stream_stats(chunk)
+                    evalCount = _safe_int(_chunk_field(chunk, "eval_count"), 0)
                     logger.info(
                         "[stream.analysis] "
-                        f"done chunks={analysisChunkCount} chars={analysisCharCount} eval_count={chunk.eval_count}"
+                        f"done chunks={analysisChunkCount} chars={analysisCharCount} eval_count={evalCount}"
                     )
             if not analysisDoneSeen:
                 logger.warning(
@@ -3333,7 +3374,20 @@ class ConversationOrchestrator:
                     total_timeout_seconds=responseTotalTimeout,
                 )
                 break
-            chunkContent = str(getattr(getattr(chunk, "message", None), "content", "") or "")
+            except Exception as error:  # noqa: BLE001
+                logger.exception(
+                    "[stream.response] stream iteration failed; "
+                    f"finalizing with available content (chunks={responseChunkCount}, chars={responseCharCount})"
+                )
+                await self._emit_stage(
+                    "response.error",
+                    "Response stream failed; finalizing with available content.",
+                    error=str(error),
+                    chunks=responseChunkCount,
+                    chars=responseCharCount,
+                )
+                break
+            chunkContent = _chunk_message_content(chunk)
             self.streamingResponse(streamingChunk=chunkContent)
             responseMessage = responseMessage + chunkContent
             responseChunkCount += 1
@@ -3363,19 +3417,13 @@ class ConversationOrchestrator:
                     chars=responseCharCount,
                 )
                 responseLastProgressEmit = now
-            if chunk.done:
+            if _chunk_done(chunk):
                 responseDoneSeen = True
-                self._devStats = {
-                    "total_duration": chunk.total_duration,
-                    "load_duration": chunk.load_duration,
-                    "prompt_eval_count": chunk.prompt_eval_count,
-                    "prompt_eval_duration": chunk.prompt_eval_duration,
-                    "eval_count": chunk.eval_count,
-                    "eval_duration": chunk.eval_duration,
-                }
+                self._devStats = _chunk_stream_stats(chunk)
+                evalCount = _safe_int(_chunk_field(chunk, "eval_count"), 0)
                 logger.info(
                     "[stream.response] "
-                    f"done chunks={responseChunkCount} chars={responseCharCount} eval_count={chunk.eval_count}"
+                    f"done chunks={responseChunkCount} chars={responseCharCount} eval_count={evalCount}"
                 )
         if not responseDoneSeen:
             logger.warning(
@@ -3554,6 +3602,7 @@ class ConversationOrchestrator:
                         json=personalityRollupState,
                     )
             except Exception as error:  # noqa: BLE001
+                logger.exception("Personality adaptation pipeline failed.")
                 await self._emit_stage(
                     "persona.error",
                     "Personality adaptation failed; continuing without profile mutation.",
@@ -4582,8 +4631,10 @@ class ToolCallingAgent():
     def _candidate_model_names_for_tool_retry(self, routing: dict[str, Any]) -> list[str]:
         attempted = set(_as_string_list(routing.get("attempted_models")))
         available = _as_string_list(routing.get("available_models"))
+        available_set = set(available)
         candidates: list[str] = []
         enforce_capability = _runtime_bool("tool_runtime.enforce_native_tool_capability", True)
+        prefer_available = _runtime_bool("tool_runtime.prefer_available_model_inventory", True)
 
         def add(name: Any) -> None:
             model_name = _as_text(name)
@@ -4598,15 +4649,17 @@ class ToolCallingAgent():
                 return
             if enforce_capability and self._cached_tool_capability(model_name) is False:
                 return
+            if prefer_available and available_set and model_name not in available_set:
+                return
             candidates.append(model_name)
 
-        # Prioritize explicit runtime defaults first, then policy chain, then discovered inventory.
+        # Prefer discovered inventory (currently installed), then runtime defaults and policy chain.
+        for model_name in available:
+            add(model_name)
         add(_runtime_value("inference.default_tool_model", ""))
         add(_runtime_value("inference.default_chat_model", ""))
         add(_runtime_value("inference.default_multimodal_model", ""))
         for model_name in self._allowed_models:
-            add(model_name)
-        for model_name in available:
             add(model_name)
 
         limit = _runtime_int("tool_runtime.auto_model_retry_candidate_limit", 6)
@@ -4752,12 +4805,16 @@ class ToolCallingAgent():
             "does not support tools" in normalized
             or ("tool" in normalized and "status code: 400" in normalized)
             or "unsupported tool" in normalized
+            or "status code: 404" in normalized
+            or "model '" in normalized and "not found" in normalized
         )
 
     def _candidate_model_names_for_pseudo_tooling(self, routing: dict[str, Any]) -> list[str]:
         available = _as_string_list(routing.get("available_models"))
+        available_set = set(available)
         attempted = _as_string_list(routing.get("attempted_models"))
         candidates: list[str] = []
+        prefer_available = _runtime_bool("tool_runtime.prefer_available_model_inventory", True)
 
         def add(name: Any) -> None:
             model_name = _as_text(name)
@@ -4768,18 +4825,20 @@ class ToolCallingAgent():
                 return
             if model_name in candidates:
                 return
+            if prefer_available and available_set and model_name not in available_set:
+                return
             candidates.append(model_name)
 
         add(routing.get("selected_model"))
         add(routing.get("requested_model"))
         for model_name in attempted:
             add(model_name)
+        for model_name in available:
+            add(model_name)
         add(_runtime_value("inference.default_chat_model", ""))
         add(_runtime_value("inference.default_tool_model", ""))
         add(_runtime_value("inference.default_multimodal_model", ""))
         for model_name in self._allowed_models:
-            add(model_name)
-        for model_name in available:
             add(model_name)
 
         limit = _runtime_int("tool_runtime.pseudo_tool_candidate_limit", 6)
@@ -6402,7 +6461,7 @@ def _preferred_runtime_model_for_policy(policyName: str) -> str:
         "generate": "inference.default_generate_model",
         "multimodal": "inference.default_multimodal_model",
     }.get(inferenceKey, "inference.default_chat_model")
-    return str(_runtime_value(runtimeKey, _runtime_value("inference.default_chat_model", "llama3.2:latest")))
+    return _as_text(_runtime_value(runtimeKey, _runtime_value("inference.default_chat_model", "")))
 
 
 def resolveAllowedModels(policyName: str, policy: dict) -> list[str]:
@@ -6456,7 +6515,46 @@ def resolveAllowedModels(policyName: str, policy: dict) -> list[str]:
         toolFallback = _normalize_model_name(_runtime_value("inference.default_tool_model", ""))
         if toolFallback:
             return [toolFallback]
-    return [str(_runtime_value("inference.default_chat_model", "llama3.2:latest"))]
+    chatFallback = _normalize_model_name(_runtime_value("inference.default_chat_model", ""))
+    if chatFallback:
+        return [chatFallback]
+    preferredFallback = _preferred_runtime_model_for_policy(policyName)
+    if preferredFallback:
+        return [preferredFallback]
+    return ["llama3.2:latest"]
+
+
+def _prune_unavailable_policy_models(
+    *,
+    policy_name: str,
+    policy: dict[str, Any],
+    available_models: list[str] | None,
+) -> dict[str, Any]:
+    if not _runtime_bool("orchestrator.prune_unavailable_policy_models", True):
+        return policy
+    if not isinstance(policy, dict):
+        return {}
+    available = _dedupe_models(available_models or [])
+    if not available:
+        return policy
+    allowed = _as_string_list(policy.get("allowed_models"))
+    if not allowed:
+        return policy
+
+    filtered = [model_name for model_name in allowed if model_name in available]
+    if not filtered:
+        return policy
+    if filtered == allowed:
+        return policy
+
+    patched = copy.deepcopy(policy)
+    patched["allowed_models"] = filtered
+    logger.info(
+        "Pruned unavailable policy models [%s]: removed=%s",
+        policy_name,
+        [name for name in allowed if name not in filtered],
+    )
+    return patched
 
 
 def loadAgentPolicy(policyName: str, endpointOverride: str | None = None) -> dict:
@@ -6486,6 +6584,12 @@ def loadAgentPolicy(policyName: str, endpointOverride: str | None = None) -> dic
         resolved = report.normalized_policy
     else:
         resolved = manager.default_policy(policyName)
+
+    resolved = _prune_unavailable_policy_models(
+        policy_name=policyName,
+        policy=resolved,
+        available_models=report.available_models,
+    )
 
     if cacheEnabled and cacheTtlSeconds > 0:
         _CONTROL_PLANE_POLICY_CACHE[cacheKey] = {
