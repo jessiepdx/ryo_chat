@@ -69,7 +69,6 @@ from hypermindlabs.utils import (
 from hypermindlabs.agents import (
     ConversationOrchestrator,
     ConversationalAgent,
-    ImageAgent,
     TweetAgent,
     loadAgentSystemPrompt,
 )
@@ -3340,38 +3339,48 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"The following error occurred while sending a telegram message:\n{err}")
 
 
-# TODO Still need to handle chat history and usage storage for images
 async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Image received.")
     chat = update.effective_chat
     message = update.effective_message
     user = update.effective_user
     topicID = message.message_thread_id if message.is_topic_message else None
+    bestPhoto = message.photo[-1] if message and message.photo else None
+    if bestPhoto is None:
+        return
+    captionText = str(message.caption or "").strip()
+    imagePrompt = (
+        captionText
+        if captionText
+        else "Please describe this image and answer in context of the current chat."
+    )
 
     # Need user account regardless of chat type
     member = members.getMemberByTelegramID(user.id)
     if member is None:
         logger.warning(f"Unregistered user {user.name} (user_id: {user.id}) sent an image in a {chat.type} chat.")
         try:
-            await message.delete()
-            # Ban user if they sent image within 60 seconds of joining the group chat
-            userJoined = context.chat_data.get(user.id)
-            if userJoined is not None:
-                # compare the timestamps
-                if userJoined > (datetime.now() - _new_member_grace_delta()):
+            if chat.type == "private":
+                if _database_unavailable():
+                    await message.reply_text(_database_unavailable_message())
+                else:
+                    await message.reply_text("Use the /start command to begin chatting with the chatbot.")
+            else:
+                await message.delete()
+                # Ban user if they sent image within 60 seconds of joining the group chat
+                userJoined = context.chat_data.get(user.id)
+                if userJoined is not None and userJoined > (datetime.now() - _new_member_grace_delta()):
                     logger.info(f"Banning {user.name} (user_id:  {user.id}) for spam.")
                     await chat.ban_member(user.id)
                     return
-
-            await context.bot.send_message(
-                chat_id=chat.id,
-                message_thread_id=topicID,
-                text=f"Start a private chat with the @{config.botName} to send images in this chat."
-            )
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    message_thread_id=topicID,
+                    text=f"Start a private chat with the @{config.botName} to send images in this chat."
+                )
         except Exception as err:
             logger.error(f"Exception while handling potential spam image:\n{err}")
         finally:
-            # Exit the function
             return
     
     memberID = member.get("member_id")
@@ -3384,11 +3393,17 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowedRoles = ["tester", "marketing", "admin", "owner"]
     
     # Get account information
+    communityID = None
+    chatHostID = memberID
+    chatType = "member"
+    threadID = None
+
     if chat.type == "private":
         # Set the rolesAvailable
-        rolesAvailable = member["roles"]
+        rolesAvailable = list(member.get("roles") or [])
         # Get rate limits for private chat
         rateLimits = communityScore.getRateLimits(memberID, chat.type)
+        threadID = None
 
     elif chat.type == "group" or chat.type == "supergroup":
         community = communities.getCommunityByTelegramID(chat.id)
@@ -3405,20 +3420,23 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Combine the user and group roles into rolesAvailable
         rolesAvailable = set(member["roles"] + community["roles"])
         # Get rate limits for group chat
-        rateLimits = communityScore.getRateLimits(memberID, "community") 
+        rateLimits = communityScore.getRateLimits(memberID, "community")
+        communityID = community.get("community_id")
+        chatHostID = communityID
+        chatType = "community"
+        threadID = topicID
     else:
         # Only chat types allowed are private, group, and supergroup
         return
     
     if (not any(role in rolesAvailable for role in allowedRoles)):
-        # User does not have permission for non rate limited chat
-        # Check if user has exceeded hourly rate
-        memberUsage = usage.getUsageForMember(memberID)
-        memberUsage = memberUsage if isinstance(memberUsage, list) else list()
-        if len(memberUsage) >= rateLimits["image"]:
+        memberCommunityScore = member.get("community_score", 0) or 0
+        if memberCommunityScore < minimumCommunityScore:
             try:
-                if member["community_score"] < minimumCommunityScore:
-                    logger.info(f"User {user.name} (user_id: {user.id}) does not meet the minimum community score to send images in a {chat.type} chat.")
+                logger.info(
+                    f"User {user.name} (user_id: {user.id}) does not meet the minimum community score to send images in a {chat.type} chat."
+                )
+                if chat.type != "private":
                     await message.delete()
                     await context.bot.send_message(
                         chat_id=chat.id,
@@ -3426,56 +3444,140 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text=f"You need a minimum community score of {minimumCommunityScore} to send images in this chat."
                     )
                 else:
-                    logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly message rate in {community['chat_title']} group chat.")
-                    await message.reply_text(text=f"You have reached your hourly rate limit.")
+                    await message.reply_text(
+                        text=f"You need a minimum community score of {minimumCommunityScore} to use private image features."
+                    )
             except Exception as err:
                 logger.error(f"Exception while handling image rate limits in a group chat:\n{err}")
             finally:
-                # User has reach rate limit, exit function
+                return
+
+        # User does not have permission for non rate limited chat
+        # Check if user has exceeded hourly rate
+        memberUsage = usage.getUsageForMember(memberID)
+        memberUsage = memberUsage if isinstance(memberUsage, list) else list()
+        imageLimit = int(rateLimits.get("image", 0) or 0)
+        if imageLimit > 0 and len(memberUsage) >= imageLimit:
+            try:
+                logger.info(f"User {user.name} (user_id: {user.id}) has reached their hourly image rate limit.")
+                await message.reply_text(text="You have reached your hourly image rate limit.")
+            except Exception as err:
+                logger.error(f"Exception while handling image rate limits in a group chat:\n{err}")
+            finally:
                 return
 
     # Convert images to base64
-    photoFile = await message.effective_attachment[-1].get_file()
+    photoFile = await bestPhoto.get_file()
     photoBytes = await photoFile.download_as_bytearray()
     b64_photo = base64.b64encode(photoBytes)
     b64_string = b64_photo.decode()
     imageList = [b64_string]
-    imagePrompt = "Describe this image." if not message.caption else message.caption
+    imageContext = {
+        "present": True,
+        "image_count": len(imageList),
+        "caption_present": bool(captionText),
+        "caption": captionText,
+        "prompt_text": imagePrompt,
+        "telegram_file_id": getattr(bestPhoto, "file_id", None),
+        "telegram_file_size": getattr(bestPhoto, "file_size", None),
+        "width": getattr(bestPhoto, "width", None),
+        "height": getattr(bestPhoto, "height", None),
+    }
 
     messageData = {
-        "chat_id": chat.id,
-        "topic_id" : topicID,
+        "community_id": communityID,
+        "chat_host_id": chatHostID,
+        "chat_type": chatType,
+        "member_id": memberID,
+        "platform": "telegram",
+        "topic_id": topicID,
         "message_id": message.message_id,
-        "message_images": imageList,
-        "message_text": imagePrompt
+        "message_text": imagePrompt,
+        "image_context": imageContext,
+        **_message_temporal_context(message),
     }
-    
-    # Create the conversational agent instance
-    imageAgent = ImageAgent(messageData, memberID)
-    
+
+    stageStatus = TelegramStageStatus(
+        context,
+        chat_id=chat.id,
+        thread_id=threadID,
+        reply_message=message if chat.type == "private" else None,
+        enabled=_runtime_bool("telegram.show_stage_progress", True),
+        show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
+        detail_level=_runtime_str("telegram.stage_detail_level", "minimal"),
+        update_min_interval_seconds=_runtime_float("telegram.stage_update_min_interval_seconds", 1.0),
+    )
+    await stageStatus.start()
+    stageEvents: list[dict[str, Any]] = []
+
+    async def _stage_callback(event: dict[str, Any]) -> None:
+        _append_stage_event(stageEvents, event)
+        await stageStatus.emit(event)
+
+    conversation = ConversationOrchestrator(
+        imagePrompt,
+        memberID,
+        messageData,
+        message.message_id,
+        options={
+            "stage_callback": _stage_callback,
+            "ingress_images": imageList,
+            "image_context": imageContext,
+        },
+    )
+
     # Shows the bot as "typing"
     try:
         await context.bot.send_chat_action(
             chat_id=chat.id, 
             action=constants.ChatAction.TYPING,
-            message_thread_id=topicID
+            message_thread_id=threadID
         )
     except Exception as err:
         logger.error(f"Exception while sending a chat action for typing:\n{err}")
         # Non critical to the remaining functionality, continue
-    
-    response = await imageAgent.generateResponse()
 
-    # Send the conversational agent response
     try:
-        responseMessage = await context.bot.send_message(
-            chat_id=chat.id,
-            message_thread_id=topicID,
-            text=f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
+        response = await conversation.runAgents()
+    except Exception as err:  # noqa: BLE001
+        logger.error(f"Conversation orchestration failed for image ingress:\n{err}")
+        await stageStatus.fail("I hit an internal error while processing that image request.")
+        return
+
+    try:
+        finalText = (
+            str(response)
+            if chat.type == "private"
+            else f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
+        )
+        responseMessage = await stageStatus.finalize(finalText)
+        await _attach_run_inspector_controls(
+            response_message=responseMessage,
+            final_text=finalText,
+            run_summary=conversation.run_summary,
+            stage_events=stageEvents,
         )
     except Exception as err:
         logger.error(f"Exception while sending a telegram message:\n{err}")
-    # TODO Handle adding prompt and response into the chat history collection.
+        return
+
+    if captionText and len(captionText.split(" ")) > _message_word_threshold():
+        communityScore.scoreMessage(conversation.promptHistoryID)
+
+    conversation.storeResponse(responseMessage.message_id)
+    usage.addUsage(conversation.promptHistoryID, conversation.responseHistoryID, conversation.stats)
+
+    userDefaults = context.user_data["defaults"] = {} if "defaults" not in context.user_data else context.user_data["defaults"]
+    if userDefaults.get("send_stats"):
+        try:
+            await sendStats(
+                stats=conversation.stats,
+                chatID=chat.id,
+                context=context,
+                threadID=threadID,
+            )
+        except Exception as err:
+            logger.error(f"The following error occurred while sending a telegram message:\n{err}")
 
 
 async def otherGroupChat(update: Update, context: ContextTypes.DEFAULT_TYPE):

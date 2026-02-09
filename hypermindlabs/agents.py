@@ -548,6 +548,13 @@ def _known_context_stage_preview(tool_results: dict[str, Any] | None) -> dict[st
         "telegram_username": payload.get("telegram_username"),
         "chat_type": payload.get("chat_type"),
         "timestamp_utc": payload.get("timestamp_utc"),
+        "image_context": {
+            "present": _as_bool(_coerce_dict(payload.get("image_context")).get("present"), False),
+            "image_count": _safe_int(_coerce_dict(payload.get("image_context")).get("image_count"), 0),
+            "caption_excerpt": _truncate_for_prompt(_coerce_dict(payload.get("image_context")).get("caption"), 120),
+            "width": _safe_int(_coerce_dict(payload.get("image_context")).get("width"), 0),
+            "height": _safe_int(_coerce_dict(payload.get("image_context")).get("height"), 0),
+        },
         "temporal_context": {
             "clock": _coerce_dict(temporal.get("clock")),
             "inbound": _coerce_dict(temporal.get("inbound")),
@@ -1872,6 +1879,15 @@ class ConversationOrchestrator:
         self._options = options if isinstance(options, dict) else {}
         stageCallback = self._options.get("stage_callback")
         self._stage_callback = stageCallback if callable(stageCallback) else None
+        self._ingressImages = [item for item in _as_string_list(self._options.get("ingress_images")) if item]
+        contextImage = _coerce_dict(self._context.get("image_context"))
+        optionImage = _coerce_dict(self._options.get("image_context"))
+        mergedImageContext = dict(contextImage)
+        mergedImageContext.update(optionImage)
+        if self._ingressImages:
+            mergedImageContext.setdefault("present", True)
+            mergedImageContext.setdefault("image_count", len(self._ingressImages))
+        self._imageContext = mergedImageContext
         self._transientSession = _as_bool(
             self._options.get("transient_session"),
             fallback=_as_bool(self._context.get("guest_mode"), False),
@@ -2143,6 +2159,7 @@ class ConversationOrchestrator:
                 "topic_transition": topicTransition,
                 "memory_circuit": memoryCircuit,
                 "workspace_context": workspaceContext,
+                "image_context": _coerce_dict(self._imageContext),
             }
         }
         knownContextPreview = _known_context_stage_preview(knownContext.get("tool_results"))
@@ -2844,6 +2861,7 @@ class ConversationOrchestrator:
         self._messages.append(assistantMessage)
         self._runSummary = {
             "known_context": _coerce_dict(knownContext.get("tool_results")),
+            "image_context": _coerce_dict(self._imageContext),
             "topic_transition": _coerce_dict(topicTransition),
             "memory_circuit": _coerce_dict(memoryCircuit),
             "memory_recall": memorySelectionPreview,
@@ -5020,10 +5038,33 @@ class ChatConversationAgent():
         self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
         self._allowed_models = resolveAllowedModels(agentName, policy)
         self._model = self._allowed_models[0]
+        optionMap = options if isinstance(options, dict) else {}
+        self._ingressImages = [item for item in _as_string_list(optionMap.get("ingress_images")) if item]
+        self._imageContext = _coerce_dict(optionMap.get("image_context"))
+        self._useMultimodal = bool(self._ingressImages)
+        if self._useMultimodal:
+            multimodalCandidates: list[str] = []
+            configuredMultimodal = _coerce_dict(getattr(config._instance, "inference", {}).get("multimodal")).get("model")
+
+            def _add_candidate(model_name: Any) -> None:
+                cleaned = _normalize_model_name(model_name)
+                if not cleaned:
+                    return
+                if cleaned in multimodalCandidates:
+                    return
+                multimodalCandidates.append(cleaned)
+
+            _add_candidate(_runtime_value("inference.default_multimodal_model", ""))
+            _add_candidate(configuredMultimodal)
+            for model_name in self._allowed_models:
+                _add_candidate(model_name)
+            if multimodalCandidates:
+                self._allowed_models = multimodalCandidates
+                self._model = multimodalCandidates[0]
 
         # Check for options passed and if policy allows for those options
-        if options:
-            modelRequested = options.get("model_requested")
+        if optionMap:
+            modelRequested = optionMap.get("model_requested")
             if modelRequested in self._allowed_models:
                 self._model = modelRequested
 
@@ -5041,17 +5082,70 @@ class ChatConversationAgent():
         if self._allowCustomSystemPrompt:
             self._messages += messages
         else:
-            histMessage: Message
-            self._messages += [histMessage for histMessage in messages if histMessage.role != "system"]
+            filtered_messages: list[Any] = []
+            for histMessage in messages:
+                if isinstance(histMessage, dict):
+                    roleName = _as_text(histMessage.get("role")).lower()
+                else:
+                    roleName = _as_text(getattr(histMessage, "role", "")).lower()
+                if roleName == "system":
+                    continue
+                filtered_messages.append(histMessage)
+            self._messages += filtered_messages
+
+    def _messages_payload(self) -> list[dict[str, Any]]:
+        payload: list[dict[str, Any]] = []
+        for message in self._messages:
+            if isinstance(message, dict):
+                role = _as_text(message.get("role"))
+                content = _as_text(message.get("content"))
+                if not role:
+                    continue
+                entry: dict[str, Any] = {"role": role, "content": content}
+                if "images" in message and isinstance(message.get("images"), list):
+                    entry["images"] = [item for item in message.get("images", []) if _as_text(item)]
+                payload.append(entry)
+                continue
+            role = _as_text(getattr(message, "role", ""))
+            if not role:
+                continue
+            payload.append(
+                {
+                    "role": role,
+                    "content": _as_text(getattr(message, "content", "")),
+                }
+            )
+
+        if self._useMultimodal:
+            attached = False
+            for index in range(len(payload) - 1, -1, -1):
+                if _as_text(payload[index].get("role")).lower() != "user":
+                    continue
+                enriched = dict(payload[index])
+                enriched["images"] = list(self._ingressImages)
+                payload[index] = enriched
+                attached = True
+                break
+            if not attached:
+                fallbackContent = _as_text(self._imageContext.get("caption"), "Please describe this image.")
+                payload.append(
+                    {
+                        "role": "user",
+                        "content": fallbackContent,
+                        "images": list(self._ingressImages),
+                    }
+                )
+        return payload
         
     async def generateResponse(self):
         logger.info(f"Generate a response for the chat conversation agent.")
+        capability = "multimodal" if self._useMultimodal else "chat"
         try:
             self._response, self._routing = await self._modelRouter.chat_with_fallback(
-                capability="chat",
+                capability=capability,
                 requested_model=self._model,
                 allowed_models=self._allowed_models,
-                messages=self._messages,
+                messages=self._messages_payload(),
                 stream=True,
             )
         except Exception as error:  # noqa: BLE001
