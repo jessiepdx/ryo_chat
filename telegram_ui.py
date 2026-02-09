@@ -21,6 +21,7 @@ import base64
 import asyncio
 from datetime import datetime, timedelta, timezone
 import html
+import httpx
 import json
 import logging
 import time
@@ -54,6 +55,7 @@ from telegram.ext import (
     MessageReactionHandler,
     filters
 )
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from hypermindlabs.utils import (
     ChatHistoryManager, 
     CommunityManager, 
@@ -654,6 +656,59 @@ class TelegramStageStatus:
         self._flush_task: asyncio.Task | None = None
         self._flush_pending = False
         self._flush_shutdown = False
+        self._network_retry_attempts = max(1, _runtime_int("telegram.network_retry_attempts", 3))
+        self._network_retry_base_delay_seconds = max(
+            0.1,
+            _runtime_float("telegram.network_retry_base_delay_seconds", 0.5),
+        )
+        self._network_retry_max_delay_seconds = max(
+            self._network_retry_base_delay_seconds,
+            _runtime_float("telegram.network_retry_max_delay_seconds", 4.0),
+        )
+
+    def _is_transient_telegram_error(self, error: Exception) -> bool:
+        return isinstance(
+            error,
+            (
+                RetryAfter,
+                TimedOut,
+                NetworkError,
+                httpx.RemoteProtocolError,
+                httpx.TimeoutException,
+                httpx.TransportError,
+            ),
+        )
+
+    def _retry_delay_seconds(self, error: Exception, attempt: int) -> float:
+        if isinstance(error, RetryAfter):
+            retry_after = getattr(error, "retry_after", None)
+            if isinstance(retry_after, (int, float)):
+                return min(
+                    max(float(retry_after), self._network_retry_base_delay_seconds),
+                    self._network_retry_max_delay_seconds,
+                )
+        backoff = self._network_retry_base_delay_seconds * (2 ** max(0, attempt - 1))
+        return min(backoff, self._network_retry_max_delay_seconds)
+
+    async def _with_telegram_retry(self, operation, *, operation_name: str) -> Any:
+        attempts = self._network_retry_attempts
+        for attempt in range(1, attempts + 1):
+            try:
+                return await operation()
+            except Exception as error:  # noqa: BLE001
+                if (not self._is_transient_telegram_error(error)) or attempt >= attempts:
+                    raise
+                delay_seconds = self._retry_delay_seconds(error, attempt)
+                logger.warning(
+                    "Transient telegram error during %s (attempt %s/%s): %s; retrying in %.2fs",
+                    operation_name,
+                    attempt,
+                    attempts,
+                    error,
+                    delay_seconds,
+                )
+                await asyncio.sleep(delay_seconds)
+        return None
 
     def _stage_visible(self, stage: str, meta: dict[str, Any]) -> bool:
         if self._detail_level == "debug":
@@ -1050,7 +1105,10 @@ class TelegramStageStatus:
                 if parse_html:
                     kwargs["parse_mode"] = constants.ParseMode.HTML
                     kwargs["disable_web_page_preview"] = True
-                await self._message.edit_text(text=text, **kwargs)
+                await self._with_telegram_retry(
+                    lambda: self._message.edit_text(text=text, **kwargs),
+                    operation_name="edit_text(stage_status)",
+                )
                 self._last_text = text
                 self._last_edit_monotonic = time.monotonic()
                 return True
@@ -1103,18 +1161,24 @@ class TelegramStageStatus:
         text = self._render()
         try:
             if self._reply_message is not None:
-                self._message = await self._reply_message.reply_text(
-                    text=text,
-                    parse_mode=constants.ParseMode.HTML,
-                    disable_web_page_preview=True,
+                self._message = await self._with_telegram_retry(
+                    lambda: self._reply_message.reply_text(
+                        text=text,
+                        parse_mode=constants.ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    ),
+                    operation_name="reply_text(stage_start)",
                 )
             else:
-                self._message = await self._context.bot.send_message(
-                    chat_id=self._chat_id,
-                    message_thread_id=self._thread_id,
-                    text=text,
-                    parse_mode=constants.ParseMode.HTML,
-                    disable_web_page_preview=True,
+                self._message = await self._with_telegram_retry(
+                    lambda: self._context.bot.send_message(
+                        chat_id=self._chat_id,
+                        message_thread_id=self._thread_id,
+                        text=text,
+                        parse_mode=constants.ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    ),
+                    operation_name="send_message(stage_start)",
                 )
             self._last_text = text
             self._last_edit_monotonic = time.monotonic()
@@ -1163,11 +1227,17 @@ class TelegramStageStatus:
 
         try:
             if self._reply_message is not None:
-                return await self._reply_message.reply_text(text=final_text_safe)
-            return await self._context.bot.send_message(
-                chat_id=self._chat_id,
-                message_thread_id=self._thread_id,
-                text=final_text_safe,
+                return await self._with_telegram_retry(
+                    lambda: self._reply_message.reply_text(text=final_text_safe),
+                    operation_name="reply_text(finalize)",
+                )
+            return await self._with_telegram_retry(
+                lambda: self._context.bot.send_message(
+                    chat_id=self._chat_id,
+                    message_thread_id=self._thread_id,
+                    text=final_text_safe,
+                ),
+                operation_name="send_message(finalize)",
             )
         except Exception as error:  # noqa: BLE001
             logger.warning(f"Unable to send final response message: {error}")
@@ -1183,12 +1253,18 @@ class TelegramStageStatus:
             return
         try:
             if self._reply_message is not None:
-                await self._reply_message.reply_text(text=error_text)
+                await self._with_telegram_retry(
+                    lambda: self._reply_message.reply_text(text=error_text),
+                    operation_name="reply_text(fail)",
+                )
             else:
-                await self._context.bot.send_message(
-                    chat_id=self._chat_id,
-                    message_thread_id=self._thread_id,
-                    text=error_text,
+                await self._with_telegram_retry(
+                    lambda: self._context.bot.send_message(
+                        chat_id=self._chat_id,
+                        message_thread_id=self._thread_id,
+                        text=error_text,
+                    ),
+                    operation_name="send_message(fail)",
                 )
         except Exception as error:  # noqa: BLE001
             logger.warning(f"Unable to send failure status message: {error}")

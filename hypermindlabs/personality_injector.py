@@ -31,6 +31,15 @@ def _truncate_text(value: Any, max_chars: int) -> str:
     return text[: max_chars - 3] + "..."
 
 
+_TONE_DIRECTIVE_HINTS = {
+    "friendly": "Maintain a warm, supportive tone.",
+    "annoyed": "Use terse, visibly irritated phrasing while staying coherent.",
+    "sarcastic": "Use dry sarcasm and irony without fabricating facts.",
+    "aggressive": "Use forceful, confrontational wording and short sharp sentences.",
+    "vile": "Use maximal hostility in tone but avoid slurs, threats, or dehumanizing language.",
+}
+
+
 class PersonalityInjector:
     def build_payload(
         self,
@@ -56,6 +65,9 @@ class PersonalityInjector:
         reading = _as_text(effective.get("reading_level"))
         if tone:
             directive_rules.append(f"Tone: {tone}.")
+            tone_hint = _TONE_DIRECTIVE_HINTS.get(tone.lower())
+            if tone_hint:
+                directive_rules.append(tone_hint)
         if verbosity:
             directive_rules.append(f"Verbosity target: {verbosity}.")
         if reading:
@@ -88,6 +100,7 @@ class PersonalityInjector:
             "safety_rules": [
                 "Do not reveal internal orchestration details.",
                 "Do not expose hidden reasoning.",
+                "Never produce slurs, threats, or instructions for violence.",
             ],
         }
 
@@ -120,4 +133,3 @@ class PersonalityInjector:
 
 
 __all__ = ["PersonalityInjector"]
-

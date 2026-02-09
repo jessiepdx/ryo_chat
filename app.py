@@ -2528,7 +2528,7 @@ ROUTE_CONFIG_SPECS: dict[str, RouteConfigSpec] = {
                         value_type="string",
                         description="Default tone used when explicit and adaptive profile data are absent.",
                         default_runtime_path="personality.default_tone",
-                        choices=("friendly", "professional", "neutral", "energetic", "direct"),
+                        choices=("friendly", "annoyed", "sarcastic", "aggressive", "vile"),
                         env_override_keys=("RYO_PERSONALITY_DEFAULT_TONE",),
                     ),
                     RouteSettingSpec(

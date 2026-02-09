@@ -48,6 +48,48 @@ class TestPersonalityEngine(unittest.TestCase):
         self.assertEqual(merged["response_style"]["tone"], "professional")
         self.assertEqual(merged["response_style"]["length"], "detailed")
 
+    def test_tone_adaptation_uses_requested_ladder(self):
+        engine = PersonalityEngine()
+        config = PersonalityRuntimeConfig(
+            adaptation_min_turns=1,
+            adaptation_window_turns=1,
+            adaptation_max_step_per_window=4,
+            default_tone="friendly",
+        )
+        profile = engine.resolve_profile(
+            member_id=5,
+            stored_profile=None,
+            runtime_config=config,
+        )
+        result = engine.adapt_after_turn(
+            profile=profile,
+            user_message="you are a fucking idiot and this is bullshit",
+            assistant_message="Acknowledged.",
+            analysis_payload={"response_style": {"length": "concise"}},
+            runtime_config=config,
+        )
+        self.assertIn(
+            result["profile"]["effective"]["tone"],
+            {"annoyed", "sarcastic", "aggressive", "vile"},
+        )
+        self.assertNotEqual(result["profile"]["effective"]["tone"], "friendly")
+        self.assertIn("tone", result["changed_fields"])
+
+    def test_legacy_tone_aliases_map_to_ladder(self):
+        engine = PersonalityEngine()
+        config = PersonalityRuntimeConfig()
+        profile = engine.resolve_profile(
+            member_id=7,
+            stored_profile={
+                "explicit_directive_json": {"tone": "professional"},
+                "adaptive_state_json": {},
+                "effective_profile_json": {},
+                "locked_fields_json": [],
+            },
+            runtime_config=config,
+        )
+        self.assertEqual(profile["effective"]["tone"], "friendly")
+
 
 class TestPersonalityInjectorAndRollup(unittest.TestCase):
     def test_injector_builds_payload(self):
@@ -99,4 +141,3 @@ class TestPersonalityInjectorAndRollup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

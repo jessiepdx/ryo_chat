@@ -15,10 +15,54 @@ from typing import Any
 
 _VERBOSITY_LEVELS = ("brief", "standard", "detailed")
 _READING_LEVELS = ("simple", "moderate", "advanced")
-_TONE_LEVELS = ("friendly", "professional", "neutral", "energetic", "direct")
+_TONE_LEVELS = ("friendly", "annoyed", "sarcastic", "aggressive", "vile")
 _FORMAT_LEVELS = ("plain", "markdown_light")
 _EMOJI_LEVELS = ("off", "minimal", "normal")
 _HUMOR_LEVELS = ("low", "medium", "high")
+_TONE_ALIASES = {
+    "friendly": "friendly",
+    "annoyed": "annoyed",
+    "sarcastic": "sarcastic",
+    "aggressive": "aggressive",
+    "vile": "vile",
+    # Legacy/alternate tone labels mapped into the new ladder.
+    "professional": "friendly",
+    "neutral": "friendly",
+    "energetic": "friendly",
+    "direct": "annoyed",
+    "assertive": "annoyed",
+    "harsh": "aggressive",
+    "angry": "aggressive",
+    "toxic": "vile",
+}
+_PROFANITY_TOKENS = {
+    "fuck",
+    "fucking",
+    "shit",
+    "bitch",
+    "asshole",
+    "damn",
+    "bullshit",
+    "cunt",
+    "bastard",
+}
+_INSULT_TOKENS = {
+    "idiot",
+    "stupid",
+    "moron",
+    "dumb",
+    "clown",
+    "trash",
+    "garbage",
+    "loser",
+}
+_SARCASM_MARKERS = (
+    "yeah right",
+    "sure buddy",
+    "as if",
+    "/s",
+    "great job genius",
+)
 
 
 def _as_text(value: Any, fallback: str = "") -> str:
@@ -70,6 +114,13 @@ def _normalize_enum(value: Any, allowed: tuple[str, ...], fallback: str) -> str:
     return normalized if normalized in allowed else fallback
 
 
+def _normalize_tone(value: Any, fallback: str = "friendly") -> str:
+    fallback_normalized = _TONE_ALIASES.get(_as_text(fallback, "friendly").lower(), "friendly")
+    candidate = _as_text(value, fallback_normalized).lower()
+    mapped = _TONE_ALIASES.get(candidate, candidate)
+    return mapped if mapped in _TONE_LEVELS else fallback_normalized
+
+
 def _tokenize(text: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9']+", _as_text(text))
 
@@ -95,6 +146,19 @@ def _step_towards(levels: tuple[str, ...], current: str, target: str, max_step: 
     if target_idx > current_idx:
         return levels[min(target_idx, current_idx + step)]
     return levels[max(target_idx, current_idx - step)]
+
+
+def _tone_from_hostility_score(score: float) -> str:
+    value = _clamp(float(score), 0.0, 1.0)
+    if value >= 0.86:
+        return "vile"
+    if value >= 0.66:
+        return "aggressive"
+    if value >= 0.46:
+        return "sarcastic"
+    if value >= 0.24:
+        return "annoyed"
+    return "friendly"
 
 
 @dataclass
@@ -139,7 +203,7 @@ class PersonalityRuntimeConfig:
             adaptation_window_turns=max(1, _as_int(payload.get("adaptation_window_turns"), 4)),
             verbosity_short_token_threshold=max(3, _as_int(payload.get("verbosity_short_token_threshold"), 10)),
             verbosity_long_token_threshold=max(8, _as_int(payload.get("verbosity_long_token_threshold"), 36)),
-            default_tone=_normalize_enum(payload.get("default_tone"), _TONE_LEVELS, "friendly"),
+            default_tone=_normalize_tone(payload.get("default_tone"), "friendly"),
             default_verbosity=_normalize_enum(payload.get("default_verbosity"), _VERBOSITY_LEVELS, "brief"),
             default_reading_level=_normalize_enum(payload.get("default_reading_level"), _READING_LEVELS, "moderate"),
             default_format=_normalize_enum(payload.get("default_format"), _FORMAT_LEVELS, "plain"),
@@ -214,22 +278,27 @@ class PersonalityEngine:
         profile["locked_fields"] = locked_fields
         explicit["locked_fields"] = list(locked_fields)
 
+        def _pick_style(field: str, default_value: str, normalizer) -> str:
+            explicit_value = explicit.get(field)
+            adaptive_value = adaptive.get(field)
+            if field in locked_fields:
+                return normalizer(explicit_value, default_value)
+            if adaptive_value is not None and _as_text(adaptive_value):
+                return normalizer(adaptive_value, default_value)
+            return normalizer(explicit_value, default_value)
+
         effective: dict[str, Any] = {
-            "tone": _normalize_enum(
-                explicit.get("tone") or adaptive.get("tone"),
-                _TONE_LEVELS,
-                config.default_tone,
-            ),
-            "verbosity": _normalize_enum(
-                explicit.get("verbosity") or adaptive.get("verbosity"),
-                _VERBOSITY_LEVELS,
+            "tone": _pick_style("tone", config.default_tone, _normalize_tone),
+            "verbosity": _pick_style(
+                "verbosity",
                 config.default_verbosity,
+                lambda value, fallback: _normalize_enum(value, _VERBOSITY_LEVELS, fallback),
             ),
             "format": _normalize_enum(explicit.get("format"), _FORMAT_LEVELS, config.default_format),
-            "reading_level": _normalize_enum(
-                explicit.get("reading_level") or adaptive.get("reading_level"),
-                _READING_LEVELS,
+            "reading_level": _pick_style(
+                "reading_level",
                 config.default_reading_level,
+                lambda value, fallback: _normalize_enum(value, _READING_LEVELS, fallback),
             ),
             "humor": _normalize_enum(explicit.get("humor"), _HUMOR_LEVELS, config.default_humor),
             "emoji": _normalize_enum(explicit.get("emoji"), _EMOJI_LEVELS, config.default_emoji),
@@ -313,11 +382,27 @@ class PersonalityEngine:
         avg_token_len = (sum(len(token) for token in tokens) / max(1, token_count)) if token_count else 0.0
         punctuation_count = len(re.findall(r"[!?.,;:]", text))
         punctuation_density = punctuation_count / max(1, char_count)
+        letters = re.findall(r"[A-Za-z]", text)
+        uppercase_letters = [char for char in letters if char.isupper()]
+        uppercase_ratio = len(uppercase_letters) / max(1, len(letters))
+        lowered_text = text.lower()
+        lowered_tokens = [token.lower() for token in tokens]
+        profanity_hits = sum(1 for token in lowered_tokens if token in _PROFANITY_TOKENS)
+        insult_hits = sum(1 for token in lowered_tokens if token in _INSULT_TOKENS)
+        sarcasm_hits = sum(1 for marker in _SARCASM_MARKERS if marker in lowered_text)
 
         short_threshold = max(2, runtime_config.verbosity_short_token_threshold)
         long_threshold = max(short_threshold + 1, runtime_config.verbosity_long_token_threshold)
         verbosity_score = _clamp((token_count - short_threshold) / max(1, long_threshold - short_threshold), 0.0, 1.0)
         reading_score = _clamp(((avg_token_len - 3.0) / 5.0) + (punctuation_density * 1.8), 0.0, 1.0)
+        hostility_score = 0.0
+        hostility_score += min(0.7, (profanity_hits * 0.2) + (insult_hits * 0.25))
+        hostility_score += min(0.2, text.count("!") * 0.04)
+        hostility_score += max(0.0, (uppercase_ratio - 0.45) * 1.1)
+        if sarcasm_hits > 0:
+            hostility_score = max(hostility_score, 0.48)
+        hostility_score = _clamp(hostility_score, 0.0, 1.0)
+        tone_target = _tone_from_hostility_score(hostility_score)
 
         analysis = _coerce_dict(analysis_payload)
         response_style = _coerce_dict(analysis.get("response_style"))
@@ -339,6 +424,8 @@ class PersonalityEngine:
             "punctuation_density": round(punctuation_density, 4),
             "verbosity_score_target": round(verbosity_score, 4),
             "reading_score_target": round(reading_score, 4),
+            "hostility_score_target": round(hostility_score, 4),
+            "tone_target": tone_target,
             "complexity_hint": complexity_hint,
             "length_hint": length_hint or "unknown",
         }
@@ -410,13 +497,28 @@ class PersonalityEngine:
 
         candidate_verbosity = self._score_to_verbosity(verbosity_score)
         candidate_reading = self._score_to_reading_level(reading_score)
+        candidate_tone = _normalize_tone(signals.get("tone_target"), runtime_config.default_tone)
         current_verbosity = _normalize_enum(adaptive.get("verbosity"), _VERBOSITY_LEVELS, runtime_config.default_verbosity)
         current_reading = _normalize_enum(adaptive.get("reading_level"), _READING_LEVELS, runtime_config.default_reading_level)
+        current_tone = _normalize_tone(
+            adaptive.get("tone"),
+            _normalize_tone(explicit.get("tone"), runtime_config.default_tone),
+        )
         last_adapt_turn = _as_int(adaptive.get("last_adapt_turn"), 0)
         can_shift = (turns_observed - last_adapt_turn) >= window_turns
 
         changed_fields: list[str] = []
         if runtime_config.adaptive_enabled and turns_observed >= runtime_config.adaptation_min_turns and can_shift:
+            if "tone" not in locked_fields:
+                next_tone = _step_towards(
+                    _TONE_LEVELS,
+                    current_tone,
+                    candidate_tone,
+                    runtime_config.adaptation_max_step_per_window,
+                )
+                if next_tone != current_tone:
+                    adaptive["tone"] = next_tone
+                    changed_fields.append("tone")
             if "verbosity" not in locked_fields:
                 next_verbosity = _step_towards(
                     _VERBOSITY_LEVELS,
@@ -440,7 +542,7 @@ class PersonalityEngine:
             if changed_fields:
                 adaptive["last_adapt_turn"] = turns_observed
 
-        adaptive.setdefault("tone", _normalize_enum(explicit.get("tone"), _TONE_LEVELS, runtime_config.default_tone))
+        adaptive["tone"] = _normalize_tone(adaptive.get("tone"), _normalize_tone(explicit.get("tone"), runtime_config.default_tone))
         confidence = _clamp(float(turns_observed) / float(max(1, runtime_config.adaptation_min_turns * 2)), 0.0, 1.0)
         adaptive["confidence"] = round(confidence, 3)
         adaptive["last_reason"] = "adaptive_signal_update"
@@ -512,8 +614,10 @@ class PersonalityEngine:
         if not incoming:
             return payload
 
+        if "tone" in incoming:
+            explicit["tone"] = _normalize_tone(incoming.get("tone"), runtime_config.default_tone)
+
         for field, allowed, fallback in (
-            ("tone", _TONE_LEVELS, runtime_config.default_tone),
             ("verbosity", _VERBOSITY_LEVELS, runtime_config.default_verbosity),
             ("format", _FORMAT_LEVELS, runtime_config.default_format),
             ("reading_level", _READING_LEVELS, runtime_config.default_reading_level),

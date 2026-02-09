@@ -6467,6 +6467,21 @@ _POLICY_TO_INFERENCE_KEY = {
 
 
 def _runtime_model_for_capability(capability: str) -> str:
+    inferenceConfig = config._instance.inference if hasattr(config, "_instance") else {}
+    configKey = {
+        "tool": "default_tool_model",
+        "chat": "default_chat_model",
+        "analysis": "default_chat_model",
+        "dev_test": "default_chat_model",
+        "embedding": "default_embedding_model",
+        "generate": "default_generate_model",
+        "multimodal": "default_multimodal_model",
+    }.get(capability, "default_chat_model")
+    if isinstance(inferenceConfig, dict):
+        configuredValue = _normalize_model_name(inferenceConfig.get(configKey))
+        if configuredValue:
+            return configuredValue
+
     runtimeKey = {
         "tool": "inference.default_tool_model",
         "chat": "inference.default_chat_model",
