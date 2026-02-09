@@ -1649,6 +1649,8 @@ class ConversationOrchestrator:
                 }
             )
             toolOptions["tool_runtime_context"] = toolRuntimeContext
+            toolOptions["analysis_payload"] = normalizedAnalysis
+            toolOptions["latest_user_message"] = self._message
             self._toolsAgent = ToolCallingAgent(toolStageMessages, options=toolOptions)
             toolResponses = await self._toolsAgent.generateResponse()
             toolSummary = _coerce_dict(getattr(self._toolsAgent, "execution_summary", {}))
@@ -2129,6 +2131,8 @@ class ToolCallingAgent():
             "run_id": str(runContext.get("run_id") or "").strip() or None,
             "member_id": runContext.get("member_id"),
         }
+        self._analysisPayload = _coerce_dict(optionMap.get("analysis_payload"))
+        self._latestUserMessage = _as_text(optionMap.get("latest_user_message"))
         self._toolRuntimeContext = _coerce_dict(optionMap.get("tool_runtime_context"))
         if options:
             modelRequested = options.get("model_requested")
@@ -2393,6 +2397,44 @@ class ToolCallingAgent():
         if limit <= 0:
             limit = 6
         return candidates[:limit]
+
+    def _analysis_tool_hints(self) -> list[str]:
+        hints: list[str] = []
+        for hint in _as_string_list(self._analysisPayload.get("tool_hints")):
+            if hint in self._toolSpecs and hint not in hints:
+                hints.append(hint)
+        return hints
+
+    def _analysis_requires_tools(self) -> bool:
+        needs_tools = _as_bool(self._analysisPayload.get("needs_tools"), False)
+        if not needs_tools:
+            return False
+        hints = self._analysis_tool_hints()
+        if not hints:
+            return True
+        return any(hint != "skipTools" for hint in hints)
+
+    def _hint_driven_tool_calls(self) -> list[dict[str, Any]]:
+        hints = self._analysis_tool_hints()
+        query_text = self._latestUserMessage or _as_text(self._toolRuntimeContext.get("latest_user_message"))
+        query_text = query_text.strip()
+        calls: list[dict[str, Any]] = []
+        if not hints and "braveSearch" in self._toolSpecs and query_text:
+            return [{"function": {"name": "braveSearch", "arguments": {"queryString": query_text}}}]
+        for hint in hints:
+            if hint == "skipTools":
+                continue
+            if hint not in self._toolSpecs:
+                continue
+            args: dict[str, Any] = {}
+            if hint in {"braveSearch", "chatHistorySearch", "knowledgeSearch"} and query_text:
+                args["queryString"] = query_text
+            calls.append({"function": {"name": hint, "arguments": args}})
+            if len(calls) >= 2:
+                break
+        if not calls and "skipTools" in hints and "skipTools" in self._toolSpecs:
+            calls.append({"function": {"name": "skipTools", "arguments": {}}})
+        return calls
 
     def _pseudo_tool_catalog(self) -> list[dict[str, Any]]:
         catalog: list[dict[str, Any]] = []
@@ -2775,10 +2817,57 @@ class ToolCallingAgent():
         toolResults = list()
         responseMessage = getattr(self._response, "message", None)
         rawToolCalls = list(getattr(responseMessage, "tool_calls", []) or [])
+        modelOutputText = _as_text(getattr(responseMessage, "content", ""))
+
+        if not rawToolCalls and not used_pseudo_tool_fallback and self._analysis_requires_tools():
+            logger.warning(
+                "Tool stage returned no tool_calls despite analysis.needs_tools=true; "
+                "attempting pseudo fallback."
+            )
+            pseudo_calls, pseudo_text, pseudo_routing = await self._pseudo_tool_fallback(
+                base_routing=self._routing,
+                trigger_error=RuntimeError("missing_tool_calls_with_analysis_needs_tools"),
+            )
+            if pseudo_calls is not None:
+                rawToolCalls = list(pseudo_calls)
+                if pseudo_text:
+                    modelOutputText = _as_text(pseudo_text)
+                if pseudo_routing:
+                    self._routing = pseudo_routing
+                used_pseudo_tool_fallback = True
+                self._executionSummary["model_fallback"] = {
+                    "trigger": "missing_tool_calls",
+                    "mode": "pseudo_structured_output",
+                    "selected_model": _coerce_dict(self._routing).get("selected_model"),
+                    "success": bool(rawToolCalls),
+                }
+
+        if not rawToolCalls and self._analysis_requires_tools():
+            hint_calls = self._hint_driven_tool_calls()
+            if hint_calls:
+                rawToolCalls = hint_calls
+                used_pseudo_tool_fallback = True
+                self._executionSummary["model_fallback"] = {
+                    "trigger": "missing_tool_calls",
+                    "mode": "analysis_hint_fallback",
+                    "selected_model": _coerce_dict(self._routing).get("selected_model"),
+                    "success": True,
+                }
+                await self._emit_tool_runtime_event(
+                    {
+                        "stage": "tools.fallback.hints",
+                        "status": "warning",
+                        "detail": "Synthesizing tool calls from analysis hints after empty native tool output.",
+                        "meta": {
+                            "hints": self._analysis_tool_hints(),
+                            "tool_calls": len(rawToolCalls),
+                        },
+                    }
+                )
+
         requestedTools: list[dict[str, Any]] = self._collect_requested_tools(rawToolCalls)
         if rawToolCalls:
             toolResults = await self._execute_tool_calls(rawToolCalls)
-        modelOutputText = _as_text(getattr(responseMessage, "content", ""))
         if modelOutputText and len(modelOutputText) > 280:
             modelOutputText = modelOutputText[:277].rstrip() + "..."
         toolErrors = [
