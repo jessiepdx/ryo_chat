@@ -33,6 +33,12 @@ def _tool_capability() -> dict[str, Any]:
         chat_history_search_fn=_noop_tool,
         knowledge_search_fn=_noop_tool,
         skip_tools_fn=_noop_tool,
+        known_users_list_fn=_noop_tool,
+        message_known_user_fn=_noop_tool,
+        process_workspace_upsert_fn=_noop_tool,
+        process_workspace_list_fn=_noop_tool,
+        process_workspace_step_update_fn=_noop_tool,
+        outbox_list_fn=_noop_tool,
         knowledge_domains=[],
     )
 

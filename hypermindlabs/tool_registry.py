@@ -45,6 +45,15 @@ def _coerce_query(value: Any) -> str:
     return cleaned
 
 
+def _coerce_non_empty_text(value: Any, field_name: str = "value") -> str:
+    if value is None:
+        raise ValueError(f"{field_name} is required.")
+    cleaned = str(value).strip()
+    if cleaned == "":
+        raise ValueError(f"{field_name} cannot be empty.")
+    return cleaned
+
+
 def _coerce_positive_int(value: Any) -> int:
     if isinstance(value, bool):
         raise ValueError("boolean values are not valid integers.")
@@ -377,6 +386,12 @@ def build_tool_specs(
     chat_history_search_fn: Callable[..., Any],
     knowledge_search_fn: Callable[..., Any],
     skip_tools_fn: Callable[..., Any],
+    known_users_list_fn: Callable[..., Any] | None = None,
+    message_known_user_fn: Callable[..., Any] | None = None,
+    process_workspace_upsert_fn: Callable[..., Any] | None = None,
+    process_workspace_list_fn: Callable[..., Any] | None = None,
+    process_workspace_step_update_fn: Callable[..., Any] | None = None,
+    outbox_list_fn: Callable[..., Any] | None = None,
     knowledge_domains: list[str] | None = None,
     custom_tool_entries: list[dict[str, Any]] | None = None,
 ) -> dict[str, ToolSpec]:
@@ -427,6 +442,175 @@ def build_tool_specs(
             "filesystem": {"mode": "none"},
         }
     )
+    local_mutating_sandbox = resolve_tool_sandbox_policy(
+        {
+            "side_effect_class": "mutating",
+            "require_approval": True,
+            "network": {"enabled": False, "allowlist_domains": []},
+            "filesystem": {"mode": "none"},
+        }
+    )
+    telegram_send_sandbox = resolve_tool_sandbox_policy(
+        {
+            "tool_name": "messageKnownUser",
+            "side_effect_class": "mutating",
+            "require_approval": True,
+            "network": {
+                "enabled": True,
+                "allowlist_domains": ["api.telegram.org"],
+            },
+            "filesystem": {"mode": "none"},
+        }
+    )
+
+    known_users_query_arg = ToolArgSpec(
+        name="queryString",
+        json_type="string",
+        description="Optional username/name filter.",
+        required=False,
+        default="",
+    )
+    known_users_count_arg = ToolArgSpec(
+        name="count",
+        json_type="integer",
+        description="Maximum number of known users to return.",
+        required=False,
+        default=20,
+        coercer=_coerce_positive_int,
+    )
+    target_username_arg = ToolArgSpec(
+        name="targetUsername",
+        json_type="string",
+        description="Recipient username to resolve (without @ is fine).",
+        required=False,
+        default="",
+    )
+    target_member_id_arg = ToolArgSpec(
+        name="targetMemberID",
+        json_type="integer",
+        description="Recipient member ID if known.",
+        required=False,
+        default=None,
+        coercer=_coerce_positive_int,
+    )
+    process_id_arg = ToolArgSpec(
+        name="processID",
+        json_type="integer",
+        description="Existing process ID to update/read.",
+        required=False,
+        default=None,
+        coercer=_coerce_positive_int,
+    )
+    message_text_arg = ToolArgSpec(
+        name="messageText",
+        json_type="string",
+        description="Message content to deliver.",
+        required=True,
+        coercer=lambda value: _coerce_non_empty_text(value, "messageText"),
+    )
+    send_now_arg = ToolArgSpec(
+        name="sendNow",
+        json_type="boolean",
+        description="When true, attempt immediate delivery instead of queue-only.",
+        required=False,
+        default=True,
+        coercer=_coerce_bool,
+    )
+    process_label_arg = ToolArgSpec(
+        name="processLabel",
+        json_type="string",
+        description="Human-readable process label.",
+        required=True,
+        coercer=lambda value: _coerce_non_empty_text(value, "processLabel"),
+    )
+    process_description_arg = ToolArgSpec(
+        name="processDescription",
+        json_type="string",
+        description="Optional process objective/description.",
+        required=False,
+        default="",
+    )
+    process_spec_arg = ToolArgSpec(
+        name="processSpec",
+        json_type="object",
+        description="Structured process JSON, usually including a `steps` array.",
+        required=False,
+        default={},
+    )
+    process_status_arg = ToolArgSpec(
+        name="processStatus",
+        json_type="string",
+        description="Process status filter or desired state.",
+        required=False,
+        default="active",
+    )
+    replace_steps_arg = ToolArgSpec(
+        name="replaceSteps",
+        json_type="boolean",
+        description="Replace all existing process steps with supplied steps.",
+        required=False,
+        default=True,
+        coercer=_coerce_bool,
+    )
+    include_steps_arg = ToolArgSpec(
+        name="includeSteps",
+        json_type="boolean",
+        description="Include full step payloads in process listing output.",
+        required=False,
+        default=False,
+        coercer=_coerce_bool,
+    )
+    step_id_arg = ToolArgSpec(
+        name="stepID",
+        json_type="integer",
+        description="Specific step ID to update.",
+        required=False,
+        default=None,
+        coercer=_coerce_positive_int,
+    )
+    step_order_arg = ToolArgSpec(
+        name="stepOrder",
+        json_type="integer",
+        description="Step order index to update.",
+        required=False,
+        default=None,
+        coercer=_coerce_positive_int,
+    )
+    step_label_arg = ToolArgSpec(
+        name="stepLabel",
+        json_type="string",
+        description="Step label to update/create when no ID/order is provided.",
+        required=False,
+        default="",
+    )
+    step_status_arg = ToolArgSpec(
+        name="stepStatus",
+        json_type="string",
+        description="New step status (pending/in_progress/blocked/completed/skipped/cancelled).",
+        required=False,
+        default="completed",
+    )
+    step_details_arg = ToolArgSpec(
+        name="stepDetails",
+        json_type="string",
+        description="Optional notes/details for the step update.",
+        required=False,
+        default="",
+    )
+    step_payload_arg = ToolArgSpec(
+        name="stepPayload",
+        json_type="object",
+        description="Optional structured metadata for this step update.",
+        required=False,
+        default={},
+    )
+    outbox_status_arg = ToolArgSpec(
+        name="deliveryStatus",
+        json_type="string",
+        description="Optional outbox delivery status filter.",
+        required=False,
+        default="",
+    )
 
     specs = {
         "braveSearch": ToolSpec(
@@ -474,12 +658,96 @@ def build_tool_specs(
             sandbox_policy=merge_sandbox_policies(local_read_sandbox, {"tool_name": "skipTools"}),
         ),
     }
+
+    if callable(known_users_list_fn):
+        specs["knownUsersList"] = ToolSpec(
+            name="knownUsersList",
+            description="List known users in the workspace directory for inter-user communication.",
+            function=known_users_list_fn,
+            args=(known_users_query_arg, known_users_count_arg),
+            default_timeout_seconds=4.0,
+            default_max_retries=0,
+            side_effect_class="read_only",
+            sandbox_policy=merge_sandbox_policies(local_read_sandbox, {"tool_name": "knownUsersList"}),
+        )
+
+    if callable(message_known_user_fn):
+        specs["messageKnownUser"] = ToolSpec(
+            name="messageKnownUser",
+            description="Queue or send a direct message to a known workspace user.",
+            function=message_known_user_fn,
+            args=(target_username_arg, target_member_id_arg, message_text_arg, process_id_arg, send_now_arg),
+            default_timeout_seconds=12.0,
+            default_max_retries=0,
+            side_effect_class="mutating",
+            sandbox_policy=telegram_send_sandbox,
+        )
+
+    if callable(process_workspace_upsert_fn):
+        specs["upsertProcessWorkspace"] = ToolSpec(
+            name="upsertProcessWorkspace",
+            description="Create/update a persistent multi-step process workspace with progress tracking.",
+            function=process_workspace_upsert_fn,
+            args=(process_label_arg, process_description_arg, process_spec_arg, process_id_arg, process_status_arg, replace_steps_arg),
+            default_timeout_seconds=8.0,
+            default_max_retries=0,
+            side_effect_class="mutating",
+            sandbox_policy=merge_sandbox_policies(local_mutating_sandbox, {"tool_name": "upsertProcessWorkspace"}),
+        )
+
+    if callable(process_workspace_list_fn):
+        specs["listProcessWorkspace"] = ToolSpec(
+            name="listProcessWorkspace",
+            description="List process workspace records and completion state for ongoing multi-turn workflows.",
+            function=process_workspace_list_fn,
+            args=(process_status_arg, known_users_count_arg, include_steps_arg, process_id_arg),
+            default_timeout_seconds=6.0,
+            default_max_retries=0,
+            side_effect_class="read_only",
+            sandbox_policy=merge_sandbox_policies(local_read_sandbox, {"tool_name": "listProcessWorkspace"}),
+        )
+
+    if callable(process_workspace_step_update_fn):
+        specs["updateProcessWorkspaceStep"] = ToolSpec(
+            name="updateProcessWorkspaceStep",
+            description="Update one process step and automatically refresh overall process completion metrics.",
+            function=process_workspace_step_update_fn,
+            args=(process_id_arg, step_id_arg, step_order_arg, step_label_arg, step_status_arg, step_details_arg, step_payload_arg),
+            default_timeout_seconds=8.0,
+            default_max_retries=0,
+            side_effect_class="mutating",
+            sandbox_policy=merge_sandbox_policies(local_mutating_sandbox, {"tool_name": "updateProcessWorkspaceStep"}),
+        )
+
+    if callable(outbox_list_fn):
+        specs["listOutboxMessages"] = ToolSpec(
+            name="listOutboxMessages",
+            description="List queued/sent outbox messages for the current member session.",
+            function=outbox_list_fn,
+            args=(known_users_count_arg, outbox_status_arg),
+            default_timeout_seconds=4.0,
+            default_max_retries=0,
+            side_effect_class="read_only",
+            sandbox_policy=merge_sandbox_policies(local_read_sandbox, {"tool_name": "listOutboxMessages"}),
+        )
+
     specs.update(custom_tool_specs(custom_tool_entries))
     return specs
 
 
 def ordered_tool_names(specs: dict[str, ToolSpec]) -> list[str]:
-    builtins = ("braveSearch", "chatHistorySearch", "knowledgeSearch", "skipTools")
+    builtins = (
+        "braveSearch",
+        "chatHistorySearch",
+        "knowledgeSearch",
+        "skipTools",
+        "knownUsersList",
+        "messageKnownUser",
+        "upsertProcessWorkspace",
+        "listProcessWorkspace",
+        "updateProcessWorkspaceStep",
+        "listOutboxMessages",
+    )
     output = [name for name in builtins if name in specs]
     custom_names = sorted([name for name in specs.keys() if name not in builtins])
     output.extend(custom_names)
@@ -764,6 +1032,12 @@ class ToolRegistryStore:
         chat_history_search_fn: Callable[..., Any],
         knowledge_search_fn: Callable[..., Any],
         skip_tools_fn: Callable[..., Any],
+        known_users_list_fn: Callable[..., Any] | None = None,
+        message_known_user_fn: Callable[..., Any] | None = None,
+        process_workspace_upsert_fn: Callable[..., Any] | None = None,
+        process_workspace_list_fn: Callable[..., Any] | None = None,
+        process_workspace_step_update_fn: Callable[..., Any] | None = None,
+        outbox_list_fn: Callable[..., Any] | None = None,
         knowledge_domains: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         custom_tools = self.list_custom_tools(include_disabled=True)
@@ -772,6 +1046,12 @@ class ToolRegistryStore:
             chat_history_search_fn=chat_history_search_fn,
             knowledge_search_fn=knowledge_search_fn,
             skip_tools_fn=skip_tools_fn,
+            known_users_list_fn=known_users_list_fn,
+            message_known_user_fn=message_known_user_fn,
+            process_workspace_upsert_fn=process_workspace_upsert_fn,
+            process_workspace_list_fn=process_workspace_list_fn,
+            process_workspace_step_update_fn=process_workspace_step_update_fn,
+            outbox_list_fn=outbox_list_fn,
             knowledge_domains=knowledge_domains,
             custom_tool_entries=custom_tools,
         )

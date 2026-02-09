@@ -51,6 +51,7 @@ from hypermindlabs.tool_sandbox import (
 from hypermindlabs.tool_runtime import ToolRuntime
 from hypermindlabs.utils import (
     ChatHistoryManager, 
+    CollaborationWorkspaceManager,
     ConfigManager, 
     ConsoleColors, 
     KnowledgeManager, 
@@ -75,6 +76,7 @@ config = ConfigManager()
 knowledge = KnowledgeManager()
 members = MemberManager()
 usage = UsageManager()
+collaboration = CollaborationWorkspaceManager()
 
 # Enable logging
 logging.basicConfig(
@@ -190,7 +192,18 @@ def _routing_from_error(error: Exception) -> dict[str, Any]:
     return {"errors": [str(error)], "status": "failed_all_candidates"}
 
 
-_ALLOWED_TOOL_HINTS = {"braveSearch", "chatHistorySearch", "knowledgeSearch", "skipTools"}
+_ALLOWED_TOOL_HINTS = {
+    "braveSearch",
+    "chatHistorySearch",
+    "knowledgeSearch",
+    "skipTools",
+    "knownUsersList",
+    "messageKnownUser",
+    "upsertProcessWorkspace",
+    "listProcessWorkspace",
+    "updateProcessWorkspaceStep",
+    "listOutboxMessages",
+}
 _DIAGNOSTIC_REQUEST_PATTERNS = (
     r"\bdebug\b",
     r"\btrace\b",
@@ -447,7 +460,16 @@ def _ollama_stream_stats_summary(stats: dict[str, Any] | None) -> dict[str, Any]
 def _stage_meta_log_summary(meta: dict[str, Any] | None) -> dict[str, Any]:
     payload = _coerce_dict(meta)
     summary: dict[str, Any] = {}
-    for key in ("model", "selected_model", "tool_calls", "requested_tool_calls", "executed_tool_calls"):
+    for key in (
+        "model",
+        "selected_model",
+        "tool_calls",
+        "requested_tool_calls",
+        "executed_tool_calls",
+        "action",
+        "active_process_count",
+        "pending_outbox_count",
+    ):
         if key in payload:
             summary[key] = payload.get(key)
     for key in ("prompt_tokens", "completion_tokens", "total_tokens_per_second"):
@@ -513,6 +535,7 @@ def _known_context_stage_preview(tool_results: dict[str, Any] | None) -> dict[st
             "small_talk_turn": _coerce_dict(payload.get("memory_circuit")).get("small_talk_turn"),
             "routing_note": _coerce_dict(payload.get("memory_circuit")).get("routing_note"),
         },
+        "workspace_context": _workspace_context_stage_preview(payload.get("workspace_context")),
     }
     return preview
 
@@ -545,6 +568,167 @@ def _memory_selection_stage_preview(memory_selection: dict[str, Any] | None) -> 
         "candidates_considered": selection.get("candidates_considered"),
         "selected_count": selection.get("selected_count", len(selected_preview)),
         "selected": selected_preview,
+    }
+
+
+def _workspace_context_stage_preview(workspace_context: dict[str, Any] | None) -> dict[str, Any]:
+    payload = _coerce_dict(workspace_context)
+    active_raw = payload.get("active_processes")
+    active = active_raw if isinstance(active_raw, list) else []
+    outbox_raw = payload.get("recent_outbox")
+    outbox = outbox_raw if isinstance(outbox_raw, list) else []
+
+    active_preview: list[dict[str, Any]] = []
+    for process in active[:6]:
+        record = _coerce_dict(process)
+        active_preview.append(
+            {
+                "process_id": record.get("process_id"),
+                "process_label": _truncate_for_prompt(record.get("process_label"), 80),
+                "process_status": _as_text(record.get("process_status"), "active"),
+                "completion_percent": record.get("completion_percent"),
+                "steps_completed": record.get("steps_completed"),
+                "steps_total": record.get("steps_total"),
+                "next_step_label": _truncate_for_prompt(record.get("next_step_label"), 100),
+                "next_step_status": _as_text(record.get("next_step_status")),
+                "updated_at": record.get("updated_at"),
+            }
+        )
+
+    outbox_preview: list[dict[str, Any]] = []
+    for message in outbox[:6]:
+        record = _coerce_dict(message)
+        outbox_preview.append(
+            {
+                "outbox_id": record.get("outbox_id"),
+                "target_username": _as_text(record.get("target_username")),
+                "delivery_status": _as_text(record.get("delivery_status"), "queued"),
+                "process_id": record.get("process_id"),
+                "message_excerpt": _truncate_for_prompt(record.get("message_excerpt"), 100),
+                "created_at": record.get("created_at"),
+            }
+        )
+
+    return {
+        "schema": _as_text(payload.get("schema"), "ryo.workspace_context.v1"),
+        "enabled": _as_bool(payload.get("enabled"), True),
+        "active_process_count": _safe_int(payload.get("active_process_count"), len(active_preview)),
+        "pending_outbox_count": _safe_int(payload.get("pending_outbox_count"), 0),
+        "resume_recommended": _as_bool(payload.get("resume_recommended"), bool(active_preview)),
+        "active_processes": active_preview,
+        "recent_outbox": outbox_preview,
+    }
+
+
+def _workspace_context_for_member(member_id: Any) -> dict[str, Any]:
+    if not _runtime_bool("orchestrator.workspace_context_enabled", True):
+        return {
+            "schema": "ryo.workspace_context.v1",
+            "enabled": False,
+            "reason": "runtime.workspace_context_disabled",
+            "active_process_count": 0,
+            "pending_outbox_count": 0,
+            "resume_recommended": False,
+            "active_processes": [],
+            "recent_outbox": [],
+        }
+
+    member_id_int = _safe_int(member_id, 0)
+    if member_id_int <= 0:
+        return {
+            "schema": "ryo.workspace_context.v1",
+            "enabled": False,
+            "reason": "missing_member_id",
+            "active_process_count": 0,
+            "pending_outbox_count": 0,
+            "resume_recommended": False,
+            "active_processes": [],
+            "recent_outbox": [],
+        }
+
+    process_limit = max(1, min(12, _runtime_int("orchestrator.workspace_process_limit", 6)))
+    outbox_limit = max(1, min(20, _runtime_int("orchestrator.workspace_outbox_limit", 8)))
+    active_processes: list[dict[str, Any]] = []
+    recent_outbox: list[dict[str, Any]] = []
+    pending_outbox_count = 0
+
+    try:
+        process_rows = collaboration.listProcesses(
+            ownerMemberID=member_id_int,
+            processStatus="all",
+            count=process_limit,
+            include_steps=True,
+        )
+        for process_row in process_rows:
+            process = _coerce_dict(process_row)
+            process_status = _as_text(process.get("process_status"), "active")
+            if process_status in {"completed", "cancelled"}:
+                continue
+            next_step_label = ""
+            next_step_status = ""
+            steps = process.get("steps")
+            if isinstance(steps, list):
+                for step in steps:
+                    step_data = _coerce_dict(step)
+                    status = _as_text(step_data.get("step_status"), "pending")
+                    if status in {"completed", "skipped", "cancelled"}:
+                        continue
+                    next_step_label = _as_text(step_data.get("step_label"))
+                    next_step_status = status
+                    break
+            active_processes.append(
+                {
+                    "process_id": process.get("process_id"),
+                    "process_label": _as_text(process.get("process_label")),
+                    "process_status": process_status,
+                    "completion_percent": process.get("completion_percent"),
+                    "steps_total": process.get("steps_total"),
+                    "steps_completed": process.get("steps_completed"),
+                    "next_step_label": next_step_label,
+                    "next_step_status": next_step_status,
+                    "updated_at": process.get("updated_at"),
+                }
+            )
+
+        outbox_rows = collaboration.listOutboxForMember(memberID=member_id_int, count=outbox_limit)
+        for outbox_row in outbox_rows:
+            outbox = _coerce_dict(outbox_row)
+            delivery_status = _as_text(outbox.get("delivery_status"), "queued")
+            if delivery_status in {"queued", "failed"}:
+                pending_outbox_count += 1
+            recent_outbox.append(
+                {
+                    "outbox_id": outbox.get("outbox_id"),
+                    "target_username": _as_text(outbox.get("target_username")),
+                    "target_member_id": outbox.get("target_member_id"),
+                    "delivery_status": delivery_status,
+                    "process_id": outbox.get("process_id"),
+                    "message_excerpt": _truncate_for_prompt(outbox.get("message_text"), 120),
+                    "created_at": outbox.get("created_at"),
+                }
+            )
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"Unable to build workspace context for member {member_id_int}: {error}")
+        return {
+            "schema": "ryo.workspace_context.v1",
+            "enabled": False,
+            "reason": "workspace_context_error",
+            "error": str(error),
+            "active_process_count": 0,
+            "pending_outbox_count": 0,
+            "resume_recommended": False,
+            "active_processes": [],
+            "recent_outbox": [],
+        }
+
+    return {
+        "schema": "ryo.workspace_context.v1",
+        "enabled": True,
+        "active_process_count": len(active_processes),
+        "pending_outbox_count": pending_outbox_count,
+        "resume_recommended": bool(active_processes),
+        "active_processes": active_processes,
+        "recent_outbox": recent_outbox,
     }
 
 
@@ -1070,8 +1254,16 @@ def _normalize_analysis_payload(
     context_data = known_context if isinstance(known_context, dict) else {}
     context_topic_transition = _coerce_dict(context_data.get("topic_transition"))
     context_memory_circuit = _coerce_dict(context_data.get("memory_circuit"))
+    context_workspace = _coerce_dict(context_data.get("workspace_context"))
+    context_active_processes_raw = context_workspace.get("active_processes")
+    context_active_processes = (
+        context_active_processes_raw
+        if isinstance(context_active_processes_raw, list)
+        else []
+    )
     payload_topic_transition = _coerce_dict(payload.get("topic_transition"))
     payload_memory_directive = _coerce_dict(payload.get("memory_directive"))
+    payload_process_directive = _coerce_dict(payload.get("process_directive"))
 
     transition_switched = _as_bool(
         payload_topic_transition.get("switched"),
@@ -1139,6 +1331,72 @@ def _normalize_analysis_payload(
     if transition_switched and not history_search_allowed:
         tool_hints = [hint for hint in tool_hints if hint != "chatHistorySearch"]
 
+    action_raw = _as_text(payload_process_directive.get("action"), "none").lower()
+    process_action_aliases = {
+        "none": "none",
+        "list_users": "list_users",
+        "users": "list_users",
+        "known_users": "list_users",
+        "send_message": "send_message",
+        "message_user": "send_message",
+        "direct_message": "send_message",
+        "start_process": "start_process",
+        "create_process": "start_process",
+        "new_process": "start_process",
+        "resume_process": "resume_process",
+        "continue_process": "resume_process",
+        "list_processes": "resume_process",
+        "update_process_step": "update_process_step",
+        "complete_step": "update_process_step",
+        "list_outbox": "list_outbox",
+        "outbox": "list_outbox",
+    }
+    process_action = process_action_aliases.get(action_raw, "none")
+    process_id = _safe_int(payload_process_directive.get("process_id"), 0)
+    if process_id <= 0:
+        process_id = 0
+    if process_id == 0 and process_action in {"resume_process", "update_process_step"} and context_active_processes:
+        first_active = _coerce_dict(context_active_processes[0])
+        process_id = _safe_int(first_active.get("process_id"), 0)
+    process_label = _as_text(payload_process_directive.get("process_label"))
+    if not process_label and process_action == "start_process":
+        process_label = f"{_as_text(payload.get('topic'), 'process')} workflow"
+    process_directive = {
+        "action": process_action,
+        "process_id": process_id if process_id > 0 else None,
+        "process_label": _truncate_for_prompt(process_label, 140),
+        "step_label": _truncate_for_prompt(payload_process_directive.get("step_label"), 140),
+        "step_status": _as_text(payload_process_directive.get("step_status"), "completed").lower(),
+        "step_details": _truncate_for_prompt(payload_process_directive.get("step_details"), 180),
+        "target_username": _as_text(payload_process_directive.get("target_username")).lstrip("@"),
+        "target_member_id": (
+            _safe_int(payload_process_directive.get("target_member_id"), 0)
+            if _safe_int(payload_process_directive.get("target_member_id"), 0) > 0
+            else None
+        ),
+        "message_text": _truncate_for_prompt(payload_process_directive.get("message_text"), 300),
+        "reason": _truncate_for_prompt(
+            payload_process_directive.get("reason"),
+            180,
+        ),
+    }
+    if process_directive["step_status"] not in {"pending", "in_progress", "blocked", "completed", "skipped", "cancelled"}:
+        process_directive["step_status"] = "completed"
+    process_action_hints = {
+        "list_users": ["knownUsersList"],
+        "send_message": ["knownUsersList", "messageKnownUser"],
+        "start_process": ["upsertProcessWorkspace"],
+        "resume_process": ["listProcessWorkspace"],
+        "update_process_step": ["listProcessWorkspace", "updateProcessWorkspaceStep"],
+        "list_outbox": ["listOutboxMessages"],
+    }
+    for hinted_tool in process_action_hints.get(process_action, []):
+        if hinted_tool in _ALLOWED_TOOL_HINTS and hinted_tool not in tool_hints:
+            tool_hints.append(hinted_tool)
+    max_hints = max(1, min(8, _runtime_int("orchestrator.analysis_tool_hints_max", 3)))
+    if len(tool_hints) > max_hints:
+        tool_hints = tool_hints[:max_hints]
+
     risk_flags = _as_string_list(payload.get("risk_flags")) or ["none"]
     topic = _as_text(payload.get("topic"), transition_to_topic or "general")
     if transition_switched and transition_to_topic:
@@ -1167,11 +1425,16 @@ def _normalize_analysis_payload(
         "analysis_reasoned_briefness" if brevity_mode == "brief_social" else "analysis_reasoned_standard",
     )
 
+    needs_tools = _as_bool(payload.get("needs_tools"), fallback=False)
+    if process_action != "none":
+        needs_tools = True
+
     return {
         "topic": topic,
         "intent": intent,
-        "needs_tools": _as_bool(payload.get("needs_tools"), fallback=False),
+        "needs_tools": needs_tools,
         "tool_hints": tool_hints,
+        "process_directive": process_directive,
         "risk_flags": risk_flags,
         "topic_transition": {
             "switched": transition_switched,
@@ -1272,6 +1535,84 @@ def _tool_results_repair_preview(tool_results: list[dict[str, Any]]) -> list[dic
     return preview
 
 
+def _process_tool_stage_summary(tool_results: list[dict[str, Any]] | None) -> dict[str, Any]:
+    results = tool_results if isinstance(tool_results, list) else []
+    process_tool_names = {
+        "knownUsersList",
+        "messageKnownUser",
+        "upsertProcessWorkspace",
+        "listProcessWorkspace",
+        "updateProcessWorkspaceStep",
+        "listOutboxMessages",
+    }
+
+    process_tools_executed: list[str] = []
+    process_ids: list[int] = []
+    outbox_statuses: list[str] = []
+    errors: list[dict[str, Any]] = []
+    active_process_count: int | None = None
+
+    for item in results:
+        result = _coerce_dict(item)
+        tool_name = _as_text(result.get("tool_name"))
+        if tool_name not in process_tool_names:
+            continue
+        process_tools_executed.append(tool_name)
+        status = _as_text(result.get("status"), "ok")
+        payload = _coerce_dict(result.get("tool_results"))
+        if status == "error":
+            errors.append(
+                {
+                    "tool_name": tool_name,
+                    "error": _coerce_dict(result.get("error")),
+                }
+            )
+            continue
+
+        if tool_name in {"upsertProcessWorkspace", "updateProcessWorkspaceStep"}:
+            process = _coerce_dict(payload.get("process"))
+            process_id = _safe_int(process.get("process_id"), 0)
+            if process_id > 0 and process_id not in process_ids:
+                process_ids.append(process_id)
+
+        if tool_name == "listProcessWorkspace":
+            active_process_count = _safe_int(payload.get("count"), 0)
+            processes = payload.get("processes")
+            if isinstance(processes, list):
+                for process in processes:
+                    process_id = _safe_int(_coerce_dict(process).get("process_id"), 0)
+                    if process_id > 0 and process_id not in process_ids:
+                        process_ids.append(process_id)
+
+        if tool_name == "messageKnownUser":
+            outbox = _coerce_dict(payload.get("outbox"))
+            delivery_status = _as_text(outbox.get("delivery_status"))
+            if delivery_status:
+                outbox_statuses.append(delivery_status)
+
+        if tool_name == "listOutboxMessages":
+            if active_process_count is None:
+                active_process_count = _safe_int(payload.get("count"), 0)
+
+    deduped_tools = []
+    for name in process_tools_executed:
+        if name not in deduped_tools:
+            deduped_tools.append(name)
+    deduped_outbox_statuses = []
+    for status in outbox_statuses:
+        if status not in deduped_outbox_statuses:
+            deduped_outbox_statuses.append(status)
+
+    return {
+        "has_updates": bool(deduped_tools),
+        "process_tools_executed": deduped_tools,
+        "process_ids": process_ids,
+        "active_process_count": active_process_count,
+        "outbox_statuses": deduped_outbox_statuses,
+        "errors": errors,
+    }
+
+
 
 ################
 # ORCHESTRATOR #
@@ -1287,6 +1628,7 @@ class ConversationOrchestrator:
         self._runSummary: dict[str, Any] = {}
 
         self._message = message
+        self._memberID = memberID
         self._messageID = messageID
         self._context = context if isinstance(context, dict) else {}
         self._options = options if isinstance(options, dict) else {}
@@ -1530,6 +1872,10 @@ class ConversationOrchestrator:
             history_messages=self._shortHistory,
             topic_transition=topicTransition,
         )
+        workspaceContext = _workspace_context_for_member(
+            self._memberID if not self._transientSession else None
+        )
+        workspaceContextPreview = _workspace_context_stage_preview(workspaceContext)
         if _as_bool(topicTransition.get("switched"), False):
             await self._emit_stage(
                 "context.topic_shift",
@@ -1537,6 +1883,14 @@ class ConversationOrchestrator:
                 from_topic=topicTransition.get("from_topic"),
                 to_topic=topicTransition.get("to_topic"),
                 reason=topicTransition.get("reason"),
+            )
+        if _as_bool(workspaceContext.get("enabled"), False):
+            await self._emit_stage(
+                "context.workspace",
+                "Loaded workspace state for process/message continuity.",
+                active_process_count=workspaceContextPreview.get("active_process_count", 0),
+                pending_outbox_count=workspaceContextPreview.get("pending_outbox_count", 0),
+                json=workspaceContextPreview,
             )
 
         knownContext = {
@@ -1550,6 +1904,7 @@ class ConversationOrchestrator:
                 "temporal_context": temporalContext,
                 "topic_transition": topicTransition,
                 "memory_circuit": memoryCircuit,
+                "workspace_context": workspaceContext,
             }
         }
         knownContextPreview = _known_context_stage_preview(knownContext.get("tool_results"))
@@ -1579,7 +1934,13 @@ class ConversationOrchestrator:
         normalizedAnalysis: dict[str, Any]
         smallTalkTurn = _as_bool(memoryCircuit.get("small_talk_turn"), False)
         historyRecallRequested = _as_bool(memoryCircuit.get("history_recall_requested"), False)
-        analysisBypassed = analysisBypassSmallTalk and smallTalkTurn and not historyRecallRequested
+        workspaceResumeRecommended = _as_bool(workspaceContext.get("resume_recommended"), False)
+        analysisBypassed = (
+            analysisBypassSmallTalk
+            and smallTalkTurn
+            and not historyRecallRequested
+            and not workspaceResumeRecommended
+        )
 
         if analysisBypassed:
             normalizedAnalysis = {
@@ -1587,6 +1948,16 @@ class ConversationOrchestrator:
                 "intent": "social_reply",
                 "needs_tools": False,
                 "tool_hints": [],
+                "process_directive": {
+                    "action": "none",
+                    "process_id": None,
+                    "process_label": "",
+                    "step_label": "",
+                    "step_status": "completed",
+                    "target_username": "",
+                    "message_text": "",
+                    "reason": "analysis_bypass_small_talk",
+                },
                 "risk_flags": ["none"],
                 "topic_transition": _coerce_dict(topicTransition),
                 "memory_directive": {
@@ -1731,6 +2102,16 @@ class ConversationOrchestrator:
                 "Normalized analysis payload produced.",
                 json=normalizedAnalysis,
             )
+            processDirective = _coerce_dict(normalizedAnalysis.get("process_directive"))
+            processAction = _as_text(processDirective.get("action"), "none")
+            if processAction != "none":
+                await self._emit_stage(
+                    "process.directive",
+                    "Process workflow directive selected from analysis.",
+                    action=processAction,
+                    process_id=processDirective.get("process_id"),
+                    json=processDirective,
+                )
 
         analysisMessagePayload = {
             "tool_name": "Message Analysis",
@@ -1785,6 +2166,7 @@ class ConversationOrchestrator:
 
         toolResponses: list[dict[str, Any]] = []
         toolSummary: dict[str, Any] = {}
+        processToolState: dict[str, Any] = {"has_updates": False}
         toolExecutionMode = "skipped_fast_path" if fastPathActive else "native_tools"
         knownContextResults = _coerce_dict(knownContext.get("tool_results"))
 
@@ -1811,8 +2193,10 @@ class ConversationOrchestrator:
                     "chat_type": self._chatType,
                     "platform": self._platform,
                     "topic_id": self._topicID,
+                    "member_id": self._memberID,
                     "topic_transition": _coerce_dict(knownContextResults.get("topic_transition")),
                     "memory_circuit": _coerce_dict(knownContextResults.get("memory_circuit")),
+                    "workspace_context": _coerce_dict(knownContextResults.get("workspace_context")),
                     "history_search_allowed": _as_bool(
                         _coerce_dict(knownContextResults.get("memory_circuit")).get("history_search_allowed"),
                         True,
@@ -1820,6 +2204,12 @@ class ConversationOrchestrator:
                 }
             )
             toolOptions["tool_runtime_context"] = toolRuntimeContext
+            toolRunContext = _coerce_dict(toolOptions.get("run_context"))
+            if self._memberID is not None:
+                toolRunContext["member_id"] = self._memberID
+            if self._transientSession:
+                toolRunContext["guest_mode"] = True
+            toolOptions["run_context"] = toolRunContext
             toolOptions["analysis_payload"] = _coerce_dict(analysisPayload)
             toolOptions["latest_user_message"] = self._message
             self._toolsAgent = ToolCallingAgent(_build_tool_stage_messages(), options=toolOptions)
@@ -1892,6 +2282,13 @@ class ConversationOrchestrator:
 
             for toolResponse in toolResponses:
                 self._messages.append(Message(role="tool", content=json.dumps(toolResponse, ensure_ascii=False)))
+            processToolState = _process_tool_stage_summary(toolResponses)
+            if _as_bool(processToolState.get("has_updates"), False):
+                await self._emit_stage(
+                    "process.state",
+                    "Process/message workspace updated during tool execution.",
+                    json=processToolState,
+                )
         
         # TODO Tools to thoughts "thinking" agent next, will produce thoughts based analysis and tool responses, outputs thoughts followed by a prompt
         
@@ -2070,6 +2467,7 @@ class ConversationOrchestrator:
             "analysis_stats": analysisStatsSummary,
             "tool_execution_mode": toolExecutionMode,
             "tool_summary": _coerce_dict(toolSummary),
+            "process_tool_state": _coerce_dict(processToolState),
             "tool_results": toolResponses if isinstance(toolResponses, list) else [],
             "response": {
                 "text": sanitizedResponseMessage,
@@ -2285,6 +2683,141 @@ def skipTools() -> dict:
     }
 
 
+def _runtime_member_id(runtime_context: dict | None) -> int | None:
+    context = _coerce_dict(runtime_context)
+    member_id = context.get("member_id")
+    try:
+        value = int(member_id)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def knownUsersList(queryString: str = "", count: int = 20, runtime_context: dict | None = None) -> dict:
+    """List members known in the database for inter-user communication workflows."""
+    known_users = collaboration.listKnownUsers(queryString=queryString, count=count)
+    return {
+        "query": _as_text(queryString),
+        "count": len(known_users),
+        "users": known_users,
+    }
+
+
+def messageKnownUser(
+    targetUsername: str = "",
+    targetMemberID: int = None,
+    messageText: str = "",
+    processID: int = None,
+    sendNow: bool = True,
+    runtime_context: dict | None = None,
+) -> dict:
+    """Queue or send a direct message to a known user in the workspace."""
+    sender_member_id = _runtime_member_id(runtime_context)
+    return collaboration.queueOrSendUserMessage(
+        senderMemberID=sender_member_id,
+        targetUsername=targetUsername,
+        targetMemberID=targetMemberID,
+        messageText=messageText,
+        deliveryChannel="telegram",
+        processID=processID,
+        sendNow=sendNow,
+    )
+
+
+def upsertProcessWorkspace(
+    processLabel: str,
+    processDescription: str = "",
+    processSpec: Any = None,
+    processID: int = None,
+    processStatus: str = "active",
+    replaceSteps: bool = True,
+    runtime_context: dict | None = None,
+) -> dict:
+    """Create or update a multi-step process workspace persisted across turns."""
+    owner_member_id = _runtime_member_id(runtime_context)
+    if owner_member_id is None:
+        return {"status": "error", "error": "owner_member_id_required"}
+    return collaboration.createOrUpdateProcess(
+        ownerMemberID=owner_member_id,
+        processLabel=processLabel,
+        processDescription=processDescription,
+        processSpec=processSpec,
+        processID=processID,
+        processStatus=processStatus,
+        replaceSteps=replaceSteps,
+    )
+
+
+def listProcessWorkspace(
+    processStatus: str = "active",
+    count: int = 12,
+    includeSteps: bool = False,
+    processID: int = None,
+    runtime_context: dict | None = None,
+) -> dict:
+    """List active/incomplete persisted processes for the calling member."""
+    owner_member_id = _runtime_member_id(runtime_context)
+    if owner_member_id is None:
+        return {"status": "error", "error": "owner_member_id_required"}
+
+    if processID is not None:
+        process = collaboration.getProcessByID(owner_member_id, processID, include_steps=includeSteps)
+        if process is None:
+            return {"status": "error", "error": "process_not_found", "process_id": processID}
+        return {"status": "ok", "count": 1, "processes": [process]}
+
+    processes = collaboration.listProcesses(
+        ownerMemberID=owner_member_id,
+        processStatus=processStatus,
+        count=count,
+        include_steps=includeSteps,
+    )
+    return {"status": "ok", "count": len(processes), "processes": processes}
+
+
+def updateProcessWorkspaceStep(
+    processID: int,
+    stepID: int = None,
+    stepOrder: int = None,
+    stepLabel: str = "",
+    stepStatus: str = "completed",
+    stepDetails: str = None,
+    stepPayload: dict | None = None,
+    runtime_context: dict | None = None,
+) -> dict:
+    """Update a process step state and refresh completion/progress counters."""
+    owner_member_id = _runtime_member_id(runtime_context)
+    if owner_member_id is None:
+        return {"status": "error", "error": "owner_member_id_required"}
+    return collaboration.updateProcessStep(
+        ownerMemberID=owner_member_id,
+        processID=processID,
+        stepID=stepID,
+        stepOrder=stepOrder,
+        stepLabel=stepLabel,
+        stepStatus=stepStatus,
+        stepDetails=stepDetails,
+        stepPayload=_coerce_dict(stepPayload),
+    )
+
+
+def listOutboxMessages(
+    count: int = 20,
+    deliveryStatus: str = "",
+    runtime_context: dict | None = None,
+) -> dict:
+    """List queued/sent member outbox messages for the calling member."""
+    owner_member_id = _runtime_member_id(runtime_context)
+    if owner_member_id is None:
+        return {"status": "error", "error": "owner_member_id_required"}
+    messages = collaboration.listOutboxForMember(
+        memberID=owner_member_id,
+        count=count,
+        deliveryStatus=deliveryStatus,
+    )
+    return {"status": "ok", "count": len(messages), "messages": messages}
+
+
 ################
 # BEGIN AGENTS #
 ################
@@ -2463,6 +2996,12 @@ class ToolCallingAgent():
             chat_history_search_fn=chatHistorySearch,
             knowledge_search_fn=knowledgeSearch,
             skip_tools_fn=skipTools,
+            known_users_list_fn=knownUsersList,
+            message_known_user_fn=messageKnownUser,
+            process_workspace_upsert_fn=upsertProcessWorkspace,
+            process_workspace_list_fn=listProcessWorkspace,
+            process_workspace_step_update_fn=updateProcessWorkspaceStep,
+            outbox_list_fn=listOutboxMessages,
             knowledge_domains=config.knowledgeDomains,
             custom_tool_entries=[],
         )
@@ -2490,6 +3029,12 @@ class ToolCallingAgent():
                 chat_history_search_fn=chatHistorySearch,
                 knowledge_search_fn=knowledgeSearch,
                 skip_tools_fn=skipTools,
+                known_users_list_fn=knownUsersList,
+                message_known_user_fn=messageKnownUser,
+                process_workspace_upsert_fn=upsertProcessWorkspace,
+                process_workspace_list_fn=listProcessWorkspace,
+                process_workspace_step_update_fn=updateProcessWorkspaceStep,
+                outbox_list_fn=listOutboxMessages,
                 knowledge_domains=config.knowledgeDomains,
                 custom_tool_entries=list(customToolIndex.values()),
             )
@@ -2753,9 +3298,69 @@ class ToolCallingAgent():
         for hint in _as_string_list(self._analysisPayload.get("tool_hints")):
             if hint in self._toolSpecs and hint not in hints:
                 hints.append(hint)
+
+        process_directive = self._analysis_process_directive()
+        for hint in self._process_action_hints(_as_text(process_directive.get("action"), "none")):
+            if hint in self._toolSpecs and hint not in hints:
+                hints.append(hint)
         return hints
 
+    @staticmethod
+    def _process_action_hints(action: str) -> list[str]:
+        mapping = {
+            "list_users": ["knownUsersList"],
+            "send_message": ["knownUsersList", "messageKnownUser"],
+            "start_process": ["upsertProcessWorkspace"],
+            "resume_process": ["listProcessWorkspace"],
+            "update_process_step": ["listProcessWorkspace", "updateProcessWorkspaceStep"],
+            "list_outbox": ["listOutboxMessages"],
+        }
+        return list(mapping.get(_as_text(action).lower(), []))
+
+    def _analysis_process_directive(self) -> dict[str, Any]:
+        directive = _coerce_dict(self._analysisPayload.get("process_directive"))
+        action_raw = _as_text(directive.get("action"), "none").lower()
+        allowed_actions = {
+            "none",
+            "list_users",
+            "send_message",
+            "start_process",
+            "resume_process",
+            "update_process_step",
+            "list_outbox",
+        }
+        action = action_raw if action_raw in allowed_actions else "none"
+        process_id = _safe_int(directive.get("process_id"), 0)
+        if process_id <= 0:
+            process_id = 0
+        target_member_id = _safe_int(directive.get("target_member_id"), 0)
+        if target_member_id <= 0:
+            target_member_id = 0
+        workspace_context = _coerce_dict(self._toolRuntimeContext.get("workspace_context"))
+        active_processes_raw = workspace_context.get("active_processes")
+        active_processes = active_processes_raw if isinstance(active_processes_raw, list) else []
+        if process_id <= 0 and action in {"resume_process", "update_process_step"} and active_processes:
+            process_id = _safe_int(_coerce_dict(active_processes[0]).get("process_id"), 0)
+        step_status = _as_text(directive.get("step_status"), "completed").lower()
+        if step_status not in {"pending", "in_progress", "blocked", "completed", "skipped", "cancelled"}:
+            step_status = "completed"
+        return {
+            "action": action,
+            "process_id": process_id if process_id > 0 else None,
+            "process_label": _as_text(directive.get("process_label")),
+            "process_description": _as_text(directive.get("process_description")),
+            "step_label": _as_text(directive.get("step_label")),
+            "step_status": step_status,
+            "step_details": _as_text(directive.get("step_details")),
+            "target_username": _as_text(directive.get("target_username")).lstrip("@"),
+            "target_member_id": target_member_id if target_member_id > 0 else None,
+            "message_text": _as_text(directive.get("message_text")),
+        }
+
     def _analysis_requires_tools(self) -> bool:
+        process_directive = self._analysis_process_directive()
+        if _as_text(process_directive.get("action"), "none") != "none":
+            return True
         needs_tools = _as_bool(self._analysisPayload.get("needs_tools"), False)
         if not needs_tools:
             return False
@@ -2768,7 +3373,120 @@ class ToolCallingAgent():
         hints = self._analysis_tool_hints()
         query_text = self._latestUserMessage or _as_text(self._toolRuntimeContext.get("latest_user_message"))
         query_text = query_text.strip()
+        process_directive = self._analysis_process_directive()
+        process_action = _as_text(process_directive.get("action"), "none")
         calls: list[dict[str, Any]] = []
+
+        def add_call(tool_name: str, arguments: dict[str, Any] | None = None) -> None:
+            if tool_name not in self._toolSpecs:
+                return
+            args = arguments if isinstance(arguments, dict) else {}
+            calls.append({"function": {"name": tool_name, "arguments": args}})
+
+        if process_action != "none":
+            process_id = process_directive.get("process_id")
+            process_label = _as_text(process_directive.get("process_label"))
+            process_description = _as_text(process_directive.get("process_description"))
+            step_label = _as_text(process_directive.get("step_label"))
+            step_status = _as_text(process_directive.get("step_status"), "completed")
+            step_details = _as_text(process_directive.get("step_details"))
+            target_username = _as_text(process_directive.get("target_username"))
+            target_member_id = process_directive.get("target_member_id")
+            message_text = _as_text(process_directive.get("message_text"), query_text)
+
+            if process_action == "list_users":
+                args: dict[str, Any] = {}
+                if target_username:
+                    args["queryString"] = target_username
+                elif query_text:
+                    args["queryString"] = query_text
+                args["count"] = max(1, _runtime_int("orchestrator.process_user_lookup_count", 8))
+                add_call("knownUsersList", args)
+
+            elif process_action == "send_message":
+                if target_username:
+                    add_call(
+                        "knownUsersList",
+                        {
+                            "queryString": target_username,
+                            "count": max(1, _runtime_int("orchestrator.process_user_lookup_count", 8)),
+                        },
+                    )
+                elif target_member_id:
+                    add_call(
+                        "knownUsersList",
+                        {
+                            "queryString": str(target_member_id),
+                            "count": max(1, _runtime_int("orchestrator.process_user_lookup_count", 8)),
+                        },
+                    )
+                if message_text and (target_username or target_member_id):
+                    args: dict[str, Any] = {
+                        "messageText": message_text,
+                        "sendNow": True,
+                    }
+                    if target_username:
+                        args["targetUsername"] = target_username
+                    if target_member_id:
+                        args["targetMemberID"] = target_member_id
+                    if process_id:
+                        args["processID"] = process_id
+                    add_call("messageKnownUser", args)
+
+            elif process_action == "start_process":
+                if not process_label:
+                    topic = _as_text(self._analysisPayload.get("topic"), "workflow")
+                    process_label = f"{topic} workflow"
+                add_call(
+                    "upsertProcessWorkspace",
+                    {
+                        "processLabel": process_label,
+                        "processDescription": process_description or _as_text(self._analysisPayload.get("intent")),
+                        "processStatus": "active",
+                        "replaceSteps": True,
+                    },
+                )
+
+            elif process_action == "resume_process":
+                args: dict[str, Any] = {
+                    "includeSteps": True,
+                    "count": max(1, _runtime_int("orchestrator.process_resume_count", 5)),
+                    "processStatus": "active",
+                }
+                if process_id:
+                    args["processID"] = process_id
+                add_call("listProcessWorkspace", args)
+
+            elif process_action == "update_process_step":
+                list_args: dict[str, Any] = {
+                    "includeSteps": True,
+                    "count": max(1, _runtime_int("orchestrator.process_resume_count", 5)),
+                    "processStatus": "active",
+                }
+                if process_id:
+                    list_args["processID"] = process_id
+                add_call("listProcessWorkspace", list_args)
+                if process_id:
+                    update_args: dict[str, Any] = {
+                        "processID": process_id,
+                        "stepStatus": step_status if step_status else "completed",
+                    }
+                    if step_label:
+                        update_args["stepLabel"] = step_label
+                    if step_details:
+                        update_args["stepDetails"] = step_details
+                    add_call("updateProcessWorkspaceStep", update_args)
+
+            elif process_action == "list_outbox":
+                add_call(
+                    "listOutboxMessages",
+                    {"count": max(1, _runtime_int("orchestrator.process_outbox_count", 10))},
+                )
+
+            if calls:
+                max_calls = max(1, _runtime_int("tool_runtime.process_hint_max_calls", 3))
+                return calls[:max_calls]
+
         if not hints and "braveSearch" in self._toolSpecs and query_text:
             return [{"function": {"name": "braveSearch", "arguments": {"queryString": query_text}}}]
         for hint in hints:
@@ -2779,6 +3497,20 @@ class ToolCallingAgent():
             args: dict[str, Any] = {}
             if hint in {"braveSearch", "chatHistorySearch", "knowledgeSearch"} and query_text:
                 args["queryString"] = query_text
+            elif hint == "knownUsersList":
+                if query_text:
+                    args["queryString"] = query_text
+                args["count"] = max(1, _runtime_int("orchestrator.process_user_lookup_count", 8))
+            elif hint == "listProcessWorkspace":
+                args["includeSteps"] = True
+                args["count"] = max(1, _runtime_int("orchestrator.process_resume_count", 5))
+                args["processStatus"] = "active"
+            elif hint == "listOutboxMessages":
+                args["count"] = max(1, _runtime_int("orchestrator.process_outbox_count", 10))
+            elif hint in {"messageKnownUser", "upsertProcessWorkspace", "updateProcessWorkspaceStep"}:
+                # These hints require additional structured arguments from process_directive.
+                # Avoid executing malformed calls in generic hint fallback mode.
+                continue
             calls.append({"function": {"name": hint, "arguments": args}})
             if len(calls) >= 2:
                 break

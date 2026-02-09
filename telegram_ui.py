@@ -281,14 +281,17 @@ def _guard_message_handler(handler):
 _ORCHESTRATION_STAGE_LABELS = {
     "orchestrator.start": "Accepted request",
     "orchestrator.fast_path": "Fast path",
+    "context.workspace": "Workspace context",
     "context.built": "Context built",
     "analysis.start": "Analyzing message",
     "analysis.progress": "Analyzing message",
     "analysis.complete": "Analysis complete",
     "analysis.payload": "Analysis payload",
+    "process.directive": "Process directive",
     "tools.start": "Evaluating tools",
     "tools.model_output": "Tool model output",
     "tools.complete": "Tools complete",
+    "process.state": "Process state",
     "response.start": "Generating response",
     "response.progress": "Generating response",
     "response.complete": "Response generated",
@@ -303,12 +306,15 @@ _TELEGRAM_FALLBACK_FINAL_REPLY = "I could not generate a complete reply this tur
 _MINIMAL_VISIBLE_STAGES = {
     "orchestrator.start",
     "orchestrator.fast_path",
+    "context.workspace",
     "analysis.start",
     "analysis.progress",
     "analysis.complete",
+    "process.directive",
     "tools.start",
     "tools.model_output",
     "tools.complete",
+    "process.state",
     "response.start",
     "response.progress",
     "response.complete",
@@ -736,6 +742,16 @@ class TelegramStageStatus:
         if isinstance(execution_mode, str) and execution_mode.strip():
             pieces.append(f"mode={execution_mode.strip()}")
 
+        process_action = str(meta.get("action") or "").strip()
+        if process_action:
+            pieces.append(f"action={process_action}")
+        active_process_count = meta.get("active_process_count")
+        if isinstance(active_process_count, int):
+            pieces.append(f"active_processes={active_process_count}")
+        pending_outbox_count = meta.get("pending_outbox_count")
+        if isinstance(pending_outbox_count, int):
+            pieces.append(f"pending_outbox={pending_outbox_count}")
+
         stats = self._extract_stats_payload(meta)
         total_tps = self._coerce_float(stats.get("total_tokens_per_second"))
         completion_tps = self._coerce_float(stats.get("completion_tokens_per_second"))
@@ -777,6 +793,18 @@ class TelegramStageStatus:
         if stage == "orchestrator.start":
             return "Accepted request and preparing context."
 
+        if stage == "context.workspace":
+            active = meta.get("active_process_count")
+            pending = meta.get("pending_outbox_count")
+            if isinstance(active, int) and isinstance(pending, int):
+                if active > 0 or pending > 0:
+                    return (
+                        f"Loaded workspace continuity context ({active} active process(es), "
+                        f"{pending} pending outbox item(s))."
+                    )
+                return "No active workspace processes; starting with a clean process context."
+            return "Loaded workspace continuity context."
+
         if stage == "analysis.start":
             return "Running message analysis and model routing."
 
@@ -795,6 +823,15 @@ class TelegramStageStatus:
         if stage == "tools.start":
             return "Determining whether tools are needed for this request."
 
+        if stage == "process.directive":
+            action = str(meta.get("action") or "").strip()
+            process_id = meta.get("process_id")
+            if action:
+                if process_id:
+                    return f"Selected process action '{action}' (process_id={process_id})."
+                return f"Selected process action '{action}'."
+            return "Selected a process workspace action from analysis."
+
         if stage == "tools.complete":
             model_error = self._extract_from_meta_json(meta, "summary", "model_error")
             if isinstance(model_error, dict):
@@ -809,6 +846,20 @@ class TelegramStageStatus:
                     return self._truncate_text(f"Executed {executed} tool call(s): {names}", 320)
                 return f"Executed {executed} tool call(s)."
             return "No tool calls were executed for this request."
+
+        if stage == "process.state":
+            process_tools = self._extract_from_meta_json(meta, "process_tools_executed")
+            process_ids = self._extract_from_meta_json(meta, "process_ids")
+            if isinstance(process_tools, list) and process_tools:
+                labels = ", ".join(str(name) for name in process_tools[:3])
+                if isinstance(process_ids, list) and process_ids:
+                    process_label = ", ".join(str(pid) for pid in process_ids[:3])
+                    return self._truncate_text(
+                        f"Workspace updated via {labels}; active process ids: {process_label}.",
+                        320,
+                    )
+                return self._truncate_text(f"Workspace updated via {labels}.", 320)
+            return "Workspace state synchronized from tool execution."
 
         if stage == "analysis.complete":
             selected_model = str(meta.get("selected_model") or "").strip()

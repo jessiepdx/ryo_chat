@@ -25,6 +25,7 @@ import os
 import psycopg
 import queue
 import re
+import requests
 import secrets
 import sys
 import string
@@ -120,6 +121,8 @@ STARTUP_CORE_MIGRATIONS: tuple[str, ...] = (
     "081_run_events.sql",
     "082_run_state_snapshots.sql",
     "083_run_artifacts.sql",
+    "084_agent_process_workspace.sql",
+    "085_member_outbox.sql",
 )
 STARTUP_VECTOR_MIGRATIONS: tuple[str, ...] = (
     "011_create_vector_extension.sql",
@@ -966,6 +969,1036 @@ class MemberManager:
     @property
     def rolesList(self):
         return self.__rolesList
+
+
+class CollaborationWorkspaceManager:
+    _instance = None
+    _ALLOWED_PROCESS_STATUS = {"active", "paused", "blocked", "completed", "cancelled"}
+    _ALLOWED_STEP_STATUS = {"pending", "in_progress", "blocked", "completed", "skipped", "cancelled"}
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(CollaborationWorkspaceManager, cls).__new__(cls)
+            connection = None
+            try:
+                connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+                cursor = connection.cursor()
+                logger.debug("PostgreSQL connection established for collaboration workspace.")
+                execute_migration(cursor, "084_agent_process_workspace.sql")
+                connection.commit()
+                execute_migration(cursor, "085_member_outbox.sql")
+                connection.commit()
+                cursor.close()
+            except psycopg.Error as error:
+                logger.error(f"Exception while preparing collaboration workspace tables:\n{error}")
+            finally:
+                if connection:
+                    connection.close()
+                    logger.debug("PostgreSQL connection is closed.")
+        return cls._instance
+
+    @staticmethod
+    def _as_int(value: Any, fallback: int | None = None) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    @staticmethod
+    def _as_text(value: Any, fallback: str = "") -> str:
+        text = str(value if value is not None else "").strip()
+        return text if text else fallback
+
+    @staticmethod
+    def _coerce_dict(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        return {}
+
+    @staticmethod
+    def _coerce_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return list(value)
+        return []
+
+    @staticmethod
+    def _timestamp_iso(value: Any) -> str | None:
+        if isinstance(value, datetime):
+            return value.replace(microsecond=0).isoformat()
+        return None
+
+    def _connect(self) -> psycopg.Connection:
+        return psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+
+    def _normalize_process_status(self, value: Any, default: str = "active") -> str:
+        status = self._as_text(value, default).lower()
+        if status not in self._ALLOWED_PROCESS_STATUS:
+            return default
+        return status
+
+    def _normalize_step_status(self, value: Any, default: str = "pending") -> str:
+        status = self._as_text(value, default).lower()
+        if status not in self._ALLOWED_STEP_STATUS:
+            return default
+        return status
+
+    def _normalize_steps(self, raw_steps: Any) -> list[dict[str, Any]]:
+        steps_input: list[Any]
+        if isinstance(raw_steps, str):
+            cleaned = raw_steps.strip()
+            if cleaned == "":
+                steps_input = []
+            else:
+                try:
+                    parsed = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    parsed = []
+                if isinstance(parsed, dict):
+                    steps_input = self._coerce_list(parsed.get("steps"))
+                elif isinstance(parsed, list):
+                    steps_input = parsed
+                else:
+                    steps_input = []
+        elif isinstance(raw_steps, dict):
+            steps_input = self._coerce_list(raw_steps.get("steps"))
+        else:
+            steps_input = self._coerce_list(raw_steps)
+
+        normalized: list[dict[str, Any]] = []
+        for item in steps_input[:400]:
+            if isinstance(item, str):
+                label = self._as_text(item)
+                details = ""
+                status = "pending"
+                required = True
+                payload = {}
+            elif isinstance(item, dict):
+                label = self._as_text(
+                    item.get("label")
+                    or item.get("title")
+                    or item.get("name")
+                    or item.get("step")
+                )
+                details = self._as_text(item.get("details") or item.get("description"))
+                status = self._normalize_step_status(item.get("status"), "pending")
+                required = bool(item.get("required", True))
+                payload = self._coerce_dict(item.get("payload") or item.get("metadata"))
+            else:
+                continue
+
+            if label == "":
+                continue
+            normalized.append(
+                {
+                    "label": label[:240],
+                    "details": details,
+                    "status": status,
+                    "required": required,
+                    "payload": payload,
+                }
+            )
+        return normalized
+
+    def _refresh_process_progress(self, cursor: Any, process_id: int) -> dict[str, Any]:
+        cursor.execute(
+            """SELECT process_status
+            FROM agent_processes
+            WHERE process_id = %s
+            LIMIT 1;""",
+            (process_id,),
+        )
+        process_row = cursor.fetchone()
+        if process_row is None:
+            return {"steps_total": 0, "steps_completed": 0, "completion_percent": 0.0}
+
+        current_status = self._normalize_process_status(process_row.get("process_status"), "active")
+        cursor.execute(
+            """SELECT
+                COUNT(*)::INT AS total_steps,
+                COALESCE(SUM(CASE WHEN step_status IN ('completed', 'skipped') THEN 1 ELSE 0 END), 0)::INT AS completed_steps
+            FROM agent_process_steps
+            WHERE process_id = %s;""",
+            (process_id,),
+        )
+        counts = cursor.fetchone() or {}
+        total_steps = max(0, self._as_int(counts.get("total_steps"), 0) or 0)
+        completed_steps = max(0, self._as_int(counts.get("completed_steps"), 0) or 0)
+        completion_percent = 0.0 if total_steps <= 0 else round((completed_steps / total_steps) * 100.0, 2)
+
+        next_status = current_status
+        completed_at = None
+        if current_status not in {"cancelled"}:
+            if total_steps > 0 and completed_steps >= total_steps:
+                next_status = "completed"
+                completed_at = datetime.now()
+            elif current_status == "completed" and completed_steps < total_steps:
+                next_status = "active"
+
+        cursor.execute(
+            """UPDATE agent_processes
+            SET process_status = %s,
+                steps_total = %s,
+                steps_completed = %s,
+                completion_percent = %s,
+                updated_at = NOW(),
+                completed_at = CASE
+                    WHEN %s = 'completed' THEN COALESCE(completed_at, NOW())
+                    WHEN %s != 'completed' THEN NULL
+                    ELSE completed_at
+                END
+            WHERE process_id = %s;""",
+            (
+                next_status,
+                total_steps,
+                completed_steps,
+                completion_percent,
+                next_status,
+                next_status,
+                process_id,
+            ),
+        )
+        return {
+            "steps_total": total_steps,
+            "steps_completed": completed_steps,
+            "completion_percent": completion_percent,
+            "process_status": next_status,
+        }
+
+    def listKnownUsers(
+        self,
+        queryString: str | None = None,
+        count: int = 20,
+        include_without_username: bool = False,
+    ) -> list[dict[str, Any]]:
+        limit = min(100, max(1, self._as_int(count, 20) or 20))
+        query = self._as_text(queryString).lower()
+        include_no_username = bool(include_without_username)
+
+        connection = None
+        response: list[dict[str, Any]] = []
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            where_parts = []
+            values: list[Any] = []
+            if not include_no_username:
+                where_parts.append("COALESCE(tg.username, '') <> ''")
+
+            if query:
+                like = f"%{query}%"
+                where_parts.append(
+                    "("
+                    "LOWER(COALESCE(tg.username, '')) LIKE %s "
+                    "OR LOWER(COALESCE(mem.first_name, '')) LIKE %s "
+                    "OR LOWER(COALESCE(mem.last_name, '')) LIKE %s "
+                    "OR CAST(mem.member_id AS TEXT) = %s "
+                    "OR CAST(COALESCE(tg.user_id, 0) AS TEXT) = %s"
+                    ")"
+                )
+                values.extend([like, like, like, query, query])
+
+            where_sql = ""
+            if where_parts:
+                where_sql = "WHERE " + " AND ".join(where_parts)
+
+            cursor.execute(
+                f"""SELECT mem.member_id, mem.first_name, mem.last_name, mem.community_score, mem.roles, tg.username, tg.user_id
+                FROM member_data AS mem
+                LEFT JOIN member_telegram AS tg
+                ON mem.member_id = tg.member_id
+                {where_sql}
+                ORDER BY LOWER(COALESCE(tg.username, '')), mem.member_id
+                LIMIT %s;""",
+                (*values, limit),
+            )
+            records = cursor.fetchall() or []
+            for row in records:
+                row_map = self._coerce_dict(row)
+                response.append(
+                    {
+                        "member_id": row_map.get("member_id"),
+                        "username": self._as_text(row_map.get("username")),
+                        "user_id": row_map.get("user_id"),
+                        "first_name": row_map.get("first_name"),
+                        "last_name": row_map.get("last_name"),
+                        "community_score": row_map.get("community_score"),
+                        "roles": row_map.get("roles") if isinstance(row_map.get("roles"), list) else [],
+                        "has_telegram_user_id": row_map.get("user_id") is not None,
+                    }
+                )
+            cursor.close()
+        except psycopg.Error as error:
+            logger.error(f"Exception while listing known users:\n{error}")
+        finally:
+            if connection:
+                connection.close()
+        return response
+
+    def resolveKnownUser(
+        self,
+        *,
+        username: str | None = None,
+        memberID: int | None = None,
+    ) -> dict[str, Any] | None:
+        clean_username = self._as_text(username).lstrip("@")
+        member_id = self._as_int(memberID)
+
+        if member_id is None and clean_username == "":
+            return None
+
+        connection = None
+        response = None
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            if member_id is not None:
+                cursor.execute(
+                    """SELECT mem.member_id, mem.first_name, mem.last_name, mem.community_score, mem.roles, tg.username, tg.user_id
+                    FROM member_data AS mem
+                    LEFT JOIN member_telegram AS tg
+                    ON mem.member_id = tg.member_id
+                    WHERE mem.member_id = %s
+                    LIMIT 1;""",
+                    (member_id,),
+                )
+            else:
+                cursor.execute(
+                    """SELECT mem.member_id, mem.first_name, mem.last_name, mem.community_score, mem.roles, tg.username, tg.user_id
+                    FROM member_data AS mem
+                    LEFT JOIN member_telegram AS tg
+                    ON mem.member_id = tg.member_id
+                    WHERE LOWER(COALESCE(tg.username, '')) = LOWER(%s)
+                    LIMIT 1;""",
+                    (clean_username,),
+                )
+            result = cursor.fetchone()
+            cursor.close()
+            if result is not None:
+                result_map = self._coerce_dict(result)
+                response = {
+                    "member_id": result_map.get("member_id"),
+                    "username": self._as_text(result_map.get("username")),
+                    "user_id": result_map.get("user_id"),
+                    "first_name": result_map.get("first_name"),
+                    "last_name": result_map.get("last_name"),
+                    "community_score": result_map.get("community_score"),
+                    "roles": result_map.get("roles") if isinstance(result_map.get("roles"), list) else [],
+                }
+        except psycopg.Error as error:
+            logger.error(f"Exception while resolving known user:\n{error}")
+        finally:
+            if connection:
+                connection.close()
+        return response
+
+    def createOrUpdateProcess(
+        self,
+        *,
+        ownerMemberID: int,
+        processLabel: str,
+        processDescription: str | None = None,
+        processSpec: Any = None,
+        processID: int | None = None,
+        processStatus: str = "active",
+        replaceSteps: bool = True,
+    ) -> dict[str, Any]:
+        owner_id = self._as_int(ownerMemberID)
+        if owner_id is None or owner_id <= 0:
+            return {"status": "error", "error": "owner_member_id_required"}
+
+        label = self._as_text(processLabel)
+        if label == "":
+            return {"status": "error", "error": "process_label_required"}
+        description = self._as_text(processDescription)
+        normalized_status = self._normalize_process_status(processStatus, "active")
+        normalized_steps = self._normalize_steps(processSpec)
+
+        parsed_spec: Any = processSpec
+        if isinstance(processSpec, str):
+            try:
+                parsed_spec = json.loads(processSpec)
+            except json.JSONDecodeError:
+                parsed_spec = {"raw_text": processSpec}
+        if isinstance(parsed_spec, list):
+            parsed_spec = {"steps": parsed_spec}
+        if not isinstance(parsed_spec, dict):
+            parsed_spec = {"spec": parsed_spec}
+        if "steps" not in parsed_spec and normalized_steps:
+            parsed_spec["steps"] = normalized_steps
+
+        connection = None
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            process_id = self._as_int(processID)
+            if process_id is not None and process_id > 0:
+                cursor.execute(
+                    """SELECT process_id
+                    FROM agent_processes
+                    WHERE process_id = %s AND owner_member_id = %s
+                    LIMIT 1;""",
+                    (process_id, owner_id),
+                )
+                existing = cursor.fetchone()
+                if existing is None:
+                    cursor.close()
+                    connection.rollback()
+                    return {"status": "error", "error": "process_not_found"}
+
+                cursor.execute(
+                    """UPDATE agent_processes
+                    SET process_label = %s,
+                        process_description = %s,
+                        process_status = %s,
+                        process_payload = %s::jsonb,
+                        updated_at = NOW()
+                    WHERE process_id = %s
+                    RETURNING process_id;""",
+                    (label[:160], description, normalized_status, json.dumps(parsed_spec), process_id),
+                )
+                updated = cursor.fetchone()
+                process_id = self._as_int(updated.get("process_id") if isinstance(updated, dict) else None)
+            else:
+                cursor.execute(
+                    """INSERT INTO agent_processes (
+                        owner_member_id,
+                        process_label,
+                        process_description,
+                        process_status,
+                        process_payload,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s::jsonb, NOW(), NOW())
+                    RETURNING process_id;""",
+                    (owner_id, label[:160], description, normalized_status, json.dumps(parsed_spec)),
+                )
+                inserted = cursor.fetchone()
+                process_id = self._as_int(inserted.get("process_id") if isinstance(inserted, dict) else None)
+
+            if process_id is None:
+                cursor.close()
+                connection.rollback()
+                return {"status": "error", "error": "process_write_failed"}
+
+            if replaceSteps:
+                cursor.execute(
+                    "DELETE FROM agent_process_steps WHERE process_id = %s;",
+                    (process_id,),
+                )
+
+            if normalized_steps:
+                for index, step in enumerate(normalized_steps, start=1):
+                    step_status = self._normalize_step_status(step.get("status"), "pending")
+                    cursor.execute(
+                        """INSERT INTO agent_process_steps (
+                            process_id,
+                            step_order,
+                            step_label,
+                            step_details,
+                            step_status,
+                            is_required,
+                            step_payload,
+                            created_at,
+                            updated_at,
+                            completed_at
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, %s::jsonb, NOW(), NOW(),
+                            CASE WHEN %s = 'completed' THEN NOW() ELSE NULL END
+                        );""",
+                        (
+                            process_id,
+                            index,
+                            self._as_text(step.get("label"))[:240],
+                            self._as_text(step.get("details")),
+                            step_status,
+                            bool(step.get("required", True)),
+                            json.dumps(self._coerce_dict(step.get("payload"))),
+                            step_status,
+                        ),
+                    )
+
+            self._refresh_process_progress(cursor, process_id)
+            connection.commit()
+            cursor.close()
+            result = self.getProcessByID(owner_id, process_id, include_steps=True)
+            if result is None:
+                return {"status": "error", "error": "process_lookup_failed"}
+            return {"status": "ok", "process": result}
+        except psycopg.Error as error:
+            if connection:
+                connection.rollback()
+            logger.error(f"Exception while creating/updating process workspace:\n{error}")
+            return {"status": "error", "error": "database_error", "detail": str(error)}
+        finally:
+            if connection:
+                connection.close()
+
+    def getProcessByID(
+        self,
+        ownerMemberID: int,
+        processID: int,
+        include_steps: bool = True,
+    ) -> dict[str, Any] | None:
+        owner_id = self._as_int(ownerMemberID)
+        process_id = self._as_int(processID)
+        if owner_id is None or process_id is None:
+            return None
+
+        connection = None
+        response = None
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            cursor.execute(
+                """SELECT
+                    process_id,
+                    owner_member_id,
+                    process_label,
+                    process_description,
+                    process_status,
+                    completion_percent,
+                    steps_total,
+                    steps_completed,
+                    process_payload,
+                    created_at,
+                    updated_at,
+                    completed_at
+                FROM agent_processes
+                WHERE process_id = %s
+                AND owner_member_id = %s
+                LIMIT 1;""",
+                (process_id, owner_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                cursor.close()
+                return None
+            process_row = self._coerce_dict(row)
+            response = {
+                "process_id": process_row.get("process_id"),
+                "owner_member_id": process_row.get("owner_member_id"),
+                "process_label": process_row.get("process_label"),
+                "process_description": process_row.get("process_description"),
+                "process_status": process_row.get("process_status"),
+                "completion_percent": process_row.get("completion_percent"),
+                "steps_total": process_row.get("steps_total"),
+                "steps_completed": process_row.get("steps_completed"),
+                "process_payload": self._coerce_dict(process_row.get("process_payload")),
+                "created_at": self._timestamp_iso(process_row.get("created_at")),
+                "updated_at": self._timestamp_iso(process_row.get("updated_at")),
+                "completed_at": self._timestamp_iso(process_row.get("completed_at")),
+            }
+
+            steps: list[dict[str, Any]] = []
+            if include_steps:
+                cursor.execute(
+                    """SELECT
+                        step_id,
+                        process_id,
+                        step_order,
+                        step_label,
+                        step_details,
+                        step_status,
+                        is_required,
+                        step_payload,
+                        created_at,
+                        updated_at,
+                        completed_at
+                    FROM agent_process_steps
+                    WHERE process_id = %s
+                    ORDER BY step_order ASC, step_id ASC;""",
+                    (process_id,),
+                )
+                rows = cursor.fetchall() or []
+                for step_row in rows:
+                    step_map = self._coerce_dict(step_row)
+                    steps.append(
+                        {
+                            "step_id": step_map.get("step_id"),
+                            "step_order": step_map.get("step_order"),
+                            "step_label": step_map.get("step_label"),
+                            "step_details": step_map.get("step_details"),
+                            "step_status": step_map.get("step_status"),
+                            "is_required": bool(step_map.get("is_required", True)),
+                            "step_payload": self._coerce_dict(step_map.get("step_payload")),
+                            "created_at": self._timestamp_iso(step_map.get("created_at")),
+                            "updated_at": self._timestamp_iso(step_map.get("updated_at")),
+                            "completed_at": self._timestamp_iso(step_map.get("completed_at")),
+                        }
+                    )
+                response["steps"] = steps
+                response["next_missing_steps"] = [
+                    step for step in steps if step.get("step_status") not in {"completed", "skipped", "cancelled"}
+                ][:5]
+            cursor.close()
+        except psycopg.Error as error:
+            logger.error(f"Exception while getting process workspace data:\n{error}")
+        finally:
+            if connection:
+                connection.close()
+        return response
+
+    def listProcesses(
+        self,
+        ownerMemberID: int,
+        processStatus: str | None = "active",
+        count: int = 12,
+        include_steps: bool = False,
+    ) -> list[dict[str, Any]]:
+        owner_id = self._as_int(ownerMemberID)
+        if owner_id is None or owner_id <= 0:
+            return []
+        limit = min(100, max(1, self._as_int(count, 12) or 12))
+        status_filter = self._as_text(processStatus, "active").lower()
+
+        connection = None
+        output: list[dict[str, Any]] = []
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            if status_filter in {"all", "*", ""}:
+                cursor.execute(
+                    """SELECT process_id
+                    FROM agent_processes
+                    WHERE owner_member_id = %s
+                    ORDER BY updated_at DESC, process_id DESC
+                    LIMIT %s;""",
+                    (owner_id, limit),
+                )
+            else:
+                cursor.execute(
+                    """SELECT process_id
+                    FROM agent_processes
+                    WHERE owner_member_id = %s
+                    AND process_status = %s
+                    ORDER BY updated_at DESC, process_id DESC
+                    LIMIT %s;""",
+                    (owner_id, status_filter, limit),
+                )
+            rows = cursor.fetchall() or []
+            cursor.close()
+            for row in rows:
+                process_id = self._as_int(self._coerce_dict(row).get("process_id"))
+                if process_id is None:
+                    continue
+                process_data = self.getProcessByID(owner_id, process_id, include_steps=include_steps)
+                if process_data is not None:
+                    output.append(process_data)
+        except psycopg.Error as error:
+            logger.error(f"Exception while listing process workspace records:\n{error}")
+        finally:
+            if connection:
+                connection.close()
+        return output
+
+    def updateProcessStep(
+        self,
+        *,
+        ownerMemberID: int,
+        processID: int,
+        stepID: int | None = None,
+        stepOrder: int | None = None,
+        stepLabel: str | None = None,
+        stepStatus: str = "completed",
+        stepDetails: str | None = None,
+        stepPayload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        owner_id = self._as_int(ownerMemberID)
+        process_id = self._as_int(processID)
+        if owner_id is None or process_id is None:
+            return {"status": "error", "error": "invalid_process_reference"}
+
+        normalized_status = self._normalize_step_status(stepStatus, "completed")
+        normalized_label = self._as_text(stepLabel)
+        payload_map = self._coerce_dict(stepPayload)
+
+        connection = None
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            cursor.execute(
+                """SELECT process_id
+                FROM agent_processes
+                WHERE process_id = %s AND owner_member_id = %s
+                LIMIT 1;""",
+                (process_id, owner_id),
+            )
+            process_row = cursor.fetchone()
+            if process_row is None:
+                cursor.close()
+                connection.rollback()
+                return {"status": "error", "error": "process_not_found"}
+
+            target_step_id = self._as_int(stepID)
+            step_row = None
+            if target_step_id is not None:
+                cursor.execute(
+                    """SELECT step_id, step_details, step_payload
+                    FROM agent_process_steps
+                    WHERE process_id = %s AND step_id = %s
+                    LIMIT 1;""",
+                    (process_id, target_step_id),
+                )
+                step_row = cursor.fetchone()
+            elif self._as_int(stepOrder) is not None:
+                cursor.execute(
+                    """SELECT step_id, step_details, step_payload
+                    FROM agent_process_steps
+                    WHERE process_id = %s AND step_order = %s
+                    LIMIT 1;""",
+                    (process_id, self._as_int(stepOrder)),
+                )
+                step_row = cursor.fetchone()
+            elif normalized_label:
+                cursor.execute(
+                    """SELECT step_id, step_details, step_payload
+                    FROM agent_process_steps
+                    WHERE process_id = %s
+                    AND LOWER(step_label) = LOWER(%s)
+                    LIMIT 1;""",
+                    (process_id, normalized_label),
+                )
+                step_row = cursor.fetchone()
+
+            if step_row is None and normalized_label:
+                cursor.execute(
+                    """SELECT COALESCE(MAX(step_order), 0)::INT AS max_step_order
+                    FROM agent_process_steps
+                    WHERE process_id = %s;""",
+                    (process_id,),
+                )
+                max_row = cursor.fetchone() or {}
+                next_order = (self._as_int(self._coerce_dict(max_row).get("max_step_order"), 0) or 0) + 1
+                cursor.execute(
+                    """INSERT INTO agent_process_steps (
+                        process_id,
+                        step_order,
+                        step_label,
+                        step_details,
+                        step_status,
+                        is_required,
+                        step_payload,
+                        created_at,
+                        updated_at,
+                        completed_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, TRUE, %s::jsonb, NOW(), NOW(),
+                        CASE WHEN %s = 'completed' THEN NOW() ELSE NULL END
+                    )
+                    RETURNING step_id;""",
+                    (
+                        process_id,
+                        next_order,
+                        normalized_label[:240],
+                        self._as_text(stepDetails),
+                        normalized_status,
+                        json.dumps(payload_map),
+                        normalized_status,
+                    ),
+                )
+                inserted = cursor.fetchone() or {}
+                target_step_id = self._as_int(self._coerce_dict(inserted).get("step_id"))
+            elif step_row is None:
+                cursor.close()
+                connection.rollback()
+                return {"status": "error", "error": "step_not_found"}
+            else:
+                step_map = self._coerce_dict(step_row)
+                target_step_id = self._as_int(step_map.get("step_id"))
+                existing_details = self._as_text(step_map.get("step_details"))
+                existing_payload = self._coerce_dict(step_map.get("step_payload"))
+                merged_payload = dict(existing_payload)
+                merged_payload.update(payload_map)
+                next_details = existing_details if stepDetails is None else self._as_text(stepDetails)
+                cursor.execute(
+                    """UPDATE agent_process_steps
+                    SET step_status = %s,
+                        step_details = %s,
+                        step_payload = %s::jsonb,
+                        updated_at = NOW(),
+                        completed_at = CASE
+                            WHEN %s = 'completed' THEN NOW()
+                            WHEN %s != 'completed' THEN NULL
+                            ELSE completed_at
+                        END
+                    WHERE process_id = %s AND step_id = %s;""",
+                    (
+                        normalized_status,
+                        next_details,
+                        json.dumps(merged_payload),
+                        normalized_status,
+                        normalized_status,
+                        process_id,
+                        target_step_id,
+                    ),
+                )
+
+            self._refresh_process_progress(cursor, process_id)
+            connection.commit()
+            cursor.close()
+            process_data = self.getProcessByID(owner_id, process_id, include_steps=True)
+            if process_data is None:
+                return {"status": "error", "error": "process_lookup_failed"}
+            return {"status": "ok", "process": process_data, "updated_step_id": target_step_id}
+        except psycopg.Error as error:
+            if connection:
+                connection.rollback()
+            logger.error(f"Exception while updating process step:\n{error}")
+            return {"status": "error", "error": "database_error", "detail": str(error)}
+        finally:
+            if connection:
+                connection.close()
+
+    def queueOrSendUserMessage(
+        self,
+        *,
+        senderMemberID: int | None,
+        targetUsername: str | None = None,
+        targetMemberID: int | None = None,
+        messageText: str,
+        deliveryChannel: str = "telegram",
+        processID: int | None = None,
+        sendNow: bool = True,
+    ) -> dict[str, Any]:
+        clean_message = self._as_text(messageText)
+        if clean_message == "":
+            return {"status": "error", "error": "message_text_required"}
+
+        target_member = self.resolveKnownUser(username=targetUsername, memberID=targetMemberID)
+        if target_member is None:
+            suggestions = self.listKnownUsers(queryString=targetUsername, count=5)
+            return {
+                "status": "error",
+                "error": "target_member_not_found",
+                "target_username": self._as_text(targetUsername),
+                "target_member_id": self._as_int(targetMemberID),
+                "known_user_suggestions": suggestions,
+            }
+
+        sender_id = self._as_int(senderMemberID)
+        target_member_id = self._as_int(target_member.get("member_id"))
+        target_telegram_id = self._as_int(target_member.get("user_id"))
+        channel = self._as_text(deliveryChannel, "telegram").lower()
+        process_id = self._as_int(processID)
+
+        connection = None
+        outbox_row: dict[str, Any] | None = None
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            cursor.execute(
+                """INSERT INTO member_outbox (
+                    sender_member_id,
+                    target_member_id,
+                    target_username,
+                    delivery_channel,
+                    message_text,
+                    delivery_status,
+                    process_id,
+                    metadata,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s::jsonb, NOW(), NOW())
+                RETURNING
+                    outbox_id,
+                    sender_member_id,
+                    target_member_id,
+                    target_username,
+                    delivery_channel,
+                    message_text,
+                    delivery_status,
+                    process_id,
+                    metadata,
+                    created_at,
+                    updated_at,
+                    delivered_at,
+                    failure_reason;""",
+                (
+                    sender_id,
+                    target_member_id,
+                    self._as_text(target_member.get("username")),
+                    channel,
+                    clean_message,
+                    process_id,
+                    json.dumps({"send_now_requested": bool(sendNow)}),
+                ),
+            )
+            inserted = cursor.fetchone()
+            outbox_row = self._coerce_dict(inserted)
+            outbox_id = self._as_int(outbox_row.get("outbox_id"))
+
+            delivery_status = "queued"
+            failure_reason = None
+            metadata_update = self._coerce_dict(outbox_row.get("metadata"))
+            delivery_result = None
+
+            if sendNow and channel == "telegram":
+                bot_token = self._as_text(ConfigManager()._instance.bot_token)
+                if bot_token == "":
+                    delivery_status = "failed"
+                    failure_reason = "bot_token_missing"
+                elif target_telegram_id is None:
+                    delivery_status = "failed"
+                    failure_reason = "target_user_missing_telegram_id"
+                else:
+                    send_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                    try:
+                        telegram_response = requests.post(
+                            send_url,
+                            json={"chat_id": target_telegram_id, "text": clean_message},
+                            timeout=12.0,
+                        )
+                        response_payload = telegram_response.json()
+                        delivery_result = response_payload
+                        metadata_update["telegram_http_status"] = telegram_response.status_code
+                        metadata_update["telegram_response"] = response_payload
+                        if telegram_response.ok and isinstance(response_payload, dict) and bool(response_payload.get("ok")):
+                            delivery_status = "sent"
+                        else:
+                            delivery_status = "failed"
+                            failure_reason = self._as_text(
+                                self._coerce_dict(response_payload).get("description"),
+                                f"telegram_send_http_{telegram_response.status_code}",
+                            )
+                    except Exception as error:  # noqa: BLE001
+                        delivery_status = "failed"
+                        failure_reason = f"telegram_send_exception:{error}"
+
+            if outbox_id is not None and delivery_status != "queued":
+                cursor.execute(
+                    """UPDATE member_outbox
+                    SET delivery_status = %s,
+                        updated_at = NOW(),
+                        delivered_at = CASE WHEN %s = 'sent' THEN NOW() ELSE delivered_at END,
+                        failure_reason = %s,
+                        metadata = %s::jsonb
+                    WHERE outbox_id = %s
+                    RETURNING
+                        outbox_id,
+                        sender_member_id,
+                        target_member_id,
+                        target_username,
+                        delivery_channel,
+                        message_text,
+                        delivery_status,
+                        process_id,
+                        metadata,
+                        created_at,
+                        updated_at,
+                        delivered_at,
+                        failure_reason;""",
+                    (
+                        delivery_status,
+                        delivery_status,
+                        failure_reason,
+                        json.dumps(metadata_update),
+                        outbox_id,
+                    ),
+                )
+                outbox_row = self._coerce_dict(cursor.fetchone())
+            connection.commit()
+            cursor.close()
+
+            outbox = {
+                "outbox_id": outbox_row.get("outbox_id"),
+                "sender_member_id": outbox_row.get("sender_member_id"),
+                "target_member_id": outbox_row.get("target_member_id"),
+                "target_username": outbox_row.get("target_username"),
+                "delivery_channel": outbox_row.get("delivery_channel"),
+                "message_text": outbox_row.get("message_text"),
+                "delivery_status": outbox_row.get("delivery_status"),
+                "process_id": outbox_row.get("process_id"),
+                "metadata": self._coerce_dict(outbox_row.get("metadata")),
+                "created_at": self._timestamp_iso(outbox_row.get("created_at")),
+                "updated_at": self._timestamp_iso(outbox_row.get("updated_at")),
+                "delivered_at": self._timestamp_iso(outbox_row.get("delivered_at")),
+                "failure_reason": outbox_row.get("failure_reason"),
+            }
+            return {
+                "status": "ok",
+                "target_member": target_member,
+                "outbox": outbox,
+                "delivery_result": delivery_result,
+            }
+        except psycopg.Error as error:
+            if connection:
+                connection.rollback()
+            logger.error(f"Exception while queueing/sending user message:\n{error}")
+            return {"status": "error", "error": "database_error", "detail": str(error)}
+        finally:
+            if connection:
+                connection.close()
+
+    def listOutboxForMember(
+        self,
+        *,
+        memberID: int,
+        count: int = 20,
+        deliveryStatus: str | None = None,
+    ) -> list[dict[str, Any]]:
+        member_id = self._as_int(memberID)
+        if member_id is None or member_id <= 0:
+            return []
+        limit = min(100, max(1, self._as_int(count, 20) or 20))
+        status_filter = self._as_text(deliveryStatus).lower()
+
+        connection = None
+        output: list[dict[str, Any]] = []
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+            if status_filter:
+                cursor.execute(
+                    """SELECT outbox_id, sender_member_id, target_member_id, target_username, delivery_channel,
+                    message_text, delivery_status, process_id, metadata, created_at, updated_at, delivered_at, failure_reason
+                    FROM member_outbox
+                    WHERE (sender_member_id = %s OR target_member_id = %s)
+                    AND delivery_status = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s;""",
+                    (member_id, member_id, status_filter, limit),
+                )
+            else:
+                cursor.execute(
+                    """SELECT outbox_id, sender_member_id, target_member_id, target_username, delivery_channel,
+                    message_text, delivery_status, process_id, metadata, created_at, updated_at, delivered_at, failure_reason
+                    FROM member_outbox
+                    WHERE (sender_member_id = %s OR target_member_id = %s)
+                    ORDER BY created_at DESC
+                    LIMIT %s;""",
+                    (member_id, member_id, limit),
+                )
+            rows = cursor.fetchall() or []
+            cursor.close()
+            for row in rows:
+                row_map = self._coerce_dict(row)
+                output.append(
+                    {
+                        "outbox_id": row_map.get("outbox_id"),
+                        "sender_member_id": row_map.get("sender_member_id"),
+                        "target_member_id": row_map.get("target_member_id"),
+                        "target_username": row_map.get("target_username"),
+                        "delivery_channel": row_map.get("delivery_channel"),
+                        "message_text": row_map.get("message_text"),
+                        "delivery_status": row_map.get("delivery_status"),
+                        "process_id": row_map.get("process_id"),
+                        "metadata": self._coerce_dict(row_map.get("metadata")),
+                        "created_at": self._timestamp_iso(row_map.get("created_at")),
+                        "updated_at": self._timestamp_iso(row_map.get("updated_at")),
+                        "delivered_at": self._timestamp_iso(row_map.get("delivered_at")),
+                        "failure_reason": row_map.get("failure_reason"),
+                    }
+                )
+        except psycopg.Error as error:
+            logger.error(f"Exception while listing outbox messages:\n{error}")
+        finally:
+            if connection:
+                connection.close()
+        return output
 
 
 class ChatHistoryManager:

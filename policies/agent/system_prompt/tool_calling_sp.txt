@@ -17,3 +17,12 @@ Priorities:
 - Prefer knowledgeSearch for project-specific facts.
 - Prefer braveSearch for external/current information.
 - If Message Analysis indicates a topic switch and memory_directive.history_search_allowed=false, do not call chatHistorySearch unless user explicitly asks for recall/history.
+- For inter-user/process workflows, use process tools intentionally:
+  - list_users -> knownUsersList
+  - send_message -> knownUsersList then messageKnownUser (when target resolution is needed)
+  - start_process -> upsertProcessWorkspace
+  - resume_process -> listProcessWorkspace
+  - update_process_step -> listProcessWorkspace then updateProcessWorkspaceStep
+  - list_outbox -> listOutboxMessages
+- When Known Context includes workspace_context.active_processes and the user is continuing prior work, prefer resume/update process tools before unrelated retrieval tools.
+- Keep process/tool plans compact (normally <= 2 calls unless strictly needed).
