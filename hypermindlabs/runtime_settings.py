@@ -83,6 +83,9 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
     "orchestrator": {
         "fast_path_small_talk_enabled": True,
         "fast_path_small_talk_max_chars": 96,
+        "analysis_max_output_tokens": 256,
+        "analysis_temperature": 0.1,
+        "analysis_context_summary_max_chars": 220,
     },
     "temporal": {
         "enabled": True,
@@ -240,6 +243,18 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     ),
     "orchestrator.fast_path_small_talk_max_chars": (
         ("RYO_ORCHESTRATOR_FAST_PATH_BREVITY_MAX_CHARS", "RYO_ORCHESTRATOR_FAST_PATH_SMALL_TALK_MAX_CHARS"),
+        "int",
+    ),
+    "orchestrator.analysis_max_output_tokens": (
+        ("RYO_ORCHESTRATOR_ANALYSIS_MAX_OUTPUT_TOKENS",),
+        "int",
+    ),
+    "orchestrator.analysis_temperature": (
+        ("RYO_ORCHESTRATOR_ANALYSIS_TEMPERATURE",),
+        "float",
+    ),
+    "orchestrator.analysis_context_summary_max_chars": (
+        ("RYO_ORCHESTRATOR_ANALYSIS_CONTEXT_SUMMARY_MAX_CHARS",),
         "int",
     ),
     "temporal.enabled": (("RYO_TEMPORAL_CONTEXT_ENABLED",), "bool"),

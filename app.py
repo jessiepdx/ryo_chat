@@ -113,6 +113,8 @@ CAPABILITY_TO_RUNTIME_MODEL_PATH: dict[str, str] = {
     "multimodal": "inference.default_multimodal_model",
 }
 LOCAL_DATABASE_HOSTS: set[str] = {"127.0.0.1", "localhost", "0.0.0.0", "::1", "::"}
+POLICY_MODELS_PATH_PREFIX = "policy_models."
+POLICY_MODELS_PATH_SUFFIX = ".allowed_models"
 
 
 def is_windows() -> bool:
@@ -1563,6 +1565,39 @@ ROUTE_CONFIG_SPECS: dict[str, RouteConfigSpec] = {
                         env_override_keys=("RYO_ORCHESTRATOR_FAST_PATH_BREVITY_MAX_CHARS", "RYO_ORCHESTRATOR_FAST_PATH_SMALL_TALK_MAX_CHARS"),
                     ),
                     RouteSettingSpec(
+                        id="analysis_max_output_tokens",
+                        label="Analysis Max Output Tokens",
+                        path="runtime.orchestrator.analysis_max_output_tokens",
+                        value_type="int",
+                        description="Hard cap for message-analysis JSON generation token count.",
+                        default_runtime_path="orchestrator.analysis_max_output_tokens",
+                        min_value=32,
+                        max_value=2048,
+                        env_override_keys=("RYO_ORCHESTRATOR_ANALYSIS_MAX_OUTPUT_TOKENS",),
+                    ),
+                    RouteSettingSpec(
+                        id="analysis_temperature",
+                        label="Analysis Temperature",
+                        path="runtime.orchestrator.analysis_temperature",
+                        value_type="float",
+                        description="Sampling temperature for message-analysis stage (lower is faster/more deterministic).",
+                        default_runtime_path="orchestrator.analysis_temperature",
+                        min_value=0.0,
+                        max_value=1.0,
+                        env_override_keys=("RYO_ORCHESTRATOR_ANALYSIS_TEMPERATURE",),
+                    ),
+                    RouteSettingSpec(
+                        id="analysis_context_summary_max_chars",
+                        label="Analysis Context Summary Max Chars",
+                        path="runtime.orchestrator.analysis_context_summary_max_chars",
+                        value_type="int",
+                        description="Post-normalization cap for context_summary field size.",
+                        default_runtime_path="orchestrator.analysis_context_summary_max_chars",
+                        min_value=60,
+                        max_value=2000,
+                        env_override_keys=("RYO_ORCHESTRATOR_ANALYSIS_CONTEXT_SUMMARY_MAX_CHARS",),
+                    ),
+                    RouteSettingSpec(
                         id="get_updates_write_timeout",
                         label="Updates Write Timeout",
                         path="runtime.telegram.get_updates_write_timeout",
@@ -1708,6 +1743,94 @@ ROUTE_CONFIG_SPECS: dict[str, RouteConfigSpec] = {
                         min_value=0,
                         max_value=200000,
                         env_override_keys=("RYO_EMBEDDING_MAX_INPUT_CHARS",),
+                    ),
+                ),
+            ),
+            RouteCategorySpec(
+                id="models",
+                label="Models / Profiles",
+                settings=(
+                    RouteSettingSpec(
+                        id="inference_embedding_model",
+                        label="Inference Embedding Model",
+                        path="inference.embedding.model",
+                        value_type="string",
+                        description="Embedding model used for vector generation and retrieval.",
+                        default_runtime_path="inference.default_embedding_model",
+                        required=True,
+                        env_override_keys=("OLLAMA_EMBED_MODEL", "RYO_DEFAULT_EMBEDDING_MODEL"),
+                    ),
+                    RouteSettingSpec(
+                        id="inference_chat_model",
+                        label="Inference Chat Model",
+                        path="inference.chat.model",
+                        value_type="string",
+                        description="Primary chat model used by conversation responses.",
+                        default_runtime_path="inference.default_chat_model",
+                        required=True,
+                        env_override_keys=("OLLAMA_CHAT_MODEL", "RYO_DEFAULT_CHAT_MODEL"),
+                    ),
+                    RouteSettingSpec(
+                        id="inference_tool_model",
+                        label="Inference Tool Model",
+                        path="inference.tool.model",
+                        value_type="string",
+                        description="Model used for tool planning/execution stages.",
+                        default_runtime_path="inference.default_tool_model",
+                        required=True,
+                        env_override_keys=("OLLAMA_TOOL_MODEL", "RYO_DEFAULT_TOOL_MODEL"),
+                    ),
+                    RouteSettingSpec(
+                        id="inference_generate_model",
+                        label="Inference Generate Model",
+                        path="inference.generate.model",
+                        value_type="string",
+                        description="Model used for non-chat generate paths.",
+                        default_runtime_path="inference.default_generate_model",
+                        required=True,
+                        env_override_keys=("OLLAMA_GENERATE_MODEL", "RYO_DEFAULT_GENERATE_MODEL"),
+                    ),
+                    RouteSettingSpec(
+                        id="inference_multimodal_model",
+                        label="Inference Multimodal Model",
+                        path="inference.multimodal.model",
+                        value_type="string",
+                        description="Model used when multimodal/image capability is requested.",
+                        default_runtime_path="inference.default_multimodal_model",
+                        required=True,
+                        env_override_keys=("OLLAMA_MULTIMODAL_MODEL", "RYO_DEFAULT_MULTIMODAL_MODEL"),
+                    ),
+                    RouteSettingSpec(
+                        id="profile_message_analysis_models",
+                        label="Profile: message_analysis",
+                        path="policy_models.message_analysis.allowed_models",
+                        value_type="model_list",
+                        description="Comma-separated model priority chain for message analysis profile.",
+                        required=True,
+                    ),
+                    RouteSettingSpec(
+                        id="profile_tool_calling_models",
+                        label="Profile: tool_calling",
+                        path="policy_models.tool_calling.allowed_models",
+                        value_type="model_list",
+                        description="Comma-separated model priority chain for tool calling profile.",
+                        required=True,
+                    ),
+                    RouteSettingSpec(
+                        id="profile_chat_conversation_models",
+                        label="Profile: chat_conversation",
+                        path="policy_models.chat_conversation.allowed_models",
+                        value_type="model_list",
+                        description="Comma-separated model priority chain for chat conversation profile.",
+                        required=True,
+                    ),
+                    RouteSettingSpec(
+                        id="profile_dev_test_models",
+                        label="Profile: dev_test",
+                        path="policy_models.dev_test.allowed_models",
+                        value_type="model_list",
+                        description="Comma-separated model priority chain for dev_test profile.",
+                        required=True,
                     ),
                 ),
             ),
@@ -1988,6 +2111,22 @@ def _dot_path_parts(path: str) -> list[str]:
     return [part for part in str(path).split(".") if part]
 
 
+def _policy_name_from_setting_path(path: str) -> str | None:
+    path_text = str(path or "").strip()
+    if not path_text.startswith(POLICY_MODELS_PATH_PREFIX):
+        return None
+    if not path_text.endswith(POLICY_MODELS_PATH_SUFFIX):
+        return None
+    policy_name = path_text[
+        len(POLICY_MODELS_PATH_PREFIX) : len(path_text) - len(POLICY_MODELS_PATH_SUFFIX)
+    ]
+    if not policy_name:
+        return None
+    if "." in policy_name:
+        return None
+    return policy_name
+
+
 def _get_config_path(config_data: dict[str, Any], path: str, default: Any = _MISSING) -> Any:
     cursor: Any = config_data
     for part in _dot_path_parts(path):
@@ -2020,6 +2159,8 @@ def _setting_runtime_path(setting: RouteSettingSpec) -> str | None:
 
 
 def _empty_value_for_setting(setting: RouteSettingSpec) -> Any:
+    if setting.value_type == "model_list":
+        return []
     if setting.value_type in {"string", "secret", "url"}:
         return ""
     if setting.value_type == "bool":
@@ -2036,6 +2177,15 @@ def _empty_value_for_setting(setting: RouteSettingSpec) -> Any:
 
 
 def _default_value_for_setting(setting: RouteSettingSpec) -> Any:
+    policy_name = _policy_name_from_setting_path(setting.path)
+    if setting.value_type == "model_list" and policy_name:
+        return _generated_allowed_models_for_policy(
+            policy_name,
+            config_data={},
+            runtime_settings=DEFAULT_RUNTIME_SETTINGS,
+            available_models=None,
+        )
+
     if setting.default is not None:
         return copy.deepcopy(setting.default)
 
@@ -2049,6 +2199,8 @@ def _default_value_for_setting(setting: RouteSettingSpec) -> Any:
 
 
 def _setting_env_override_active(setting: RouteSettingSpec) -> bool:
+    if _policy_name_from_setting_path(setting.path):
+        return False
     for env_key in setting.env_override_keys:
         raw = os.getenv(env_key)
         if raw is None:
@@ -2070,21 +2222,37 @@ def _resolve_setting_value(
         value = pending_changes[setting.path]
         source = "pending"
     else:
-        configured = _get_config_path(config_data, setting.path, _MISSING)
-        if configured is not _MISSING:
-            value = configured
-            source = "config"
-        else:
-            runtime_path = _setting_runtime_path(setting)
-            if runtime_path:
-                value = get_runtime_setting(runtime_settings, runtime_path, _default_value_for_setting(setting))
-                source = "runtime-default"
-            elif setting.default is not None:
-                value = copy.deepcopy(setting.default)
-                source = "spec-default"
+        policy_name = _policy_name_from_setting_path(setting.path)
+        if policy_name:
+            payload = _read_policy_payload_for_editor(policy_name)
+            explicit_policy_models = _policy_models_from_payload(payload)
+            if explicit_policy_models:
+                value = explicit_policy_models
+                source = "policy"
             else:
-                value = _default_value_for_setting(setting)
-                source = "unset"
+                value = _generated_allowed_models_for_policy(
+                    policy_name,
+                    config_data=config_data,
+                    runtime_settings=runtime_settings,
+                    available_models=None,
+                )
+                source = "generated"
+        else:
+            configured = _get_config_path(config_data, setting.path, _MISSING)
+            if configured is not _MISSING:
+                value = configured
+                source = "config"
+            else:
+                runtime_path = _setting_runtime_path(setting)
+                if runtime_path:
+                    value = get_runtime_setting(runtime_settings, runtime_path, _default_value_for_setting(setting))
+                    source = "runtime-default"
+                elif setting.default is not None:
+                    value = copy.deepcopy(setting.default)
+                    source = "spec-default"
+                else:
+                    value = _default_value_for_setting(setting)
+                    source = "unset"
 
     env_override_active = _setting_env_override_active(setting)
     if env_override_active:
@@ -2118,6 +2286,8 @@ def _format_setting_value(value: Any, *, sensitive: bool = False) -> str:
 
 
 def _setting_type_label(setting: RouteSettingSpec) -> str:
+    if setting.value_type == "model_list":
+        return "model-list"
     if setting.value_type == "bool":
         return "bool"
     if setting.value_type == "int":
@@ -2153,6 +2323,11 @@ def _coerce_setting_value(setting: RouteSettingSpec, raw_value: Any) -> tuple[bo
     try:
         if value_type == "bool":
             value = _coerce_bool(raw_value)
+        elif value_type == "model-list":
+            if isinstance(raw_value, list):
+                value = _dedupe_models([str(item).strip() for item in raw_value if str(item).strip()])
+            else:
+                value = _parse_allowed_models_input(str(raw_value))
         elif value_type == "int":
             if isinstance(raw_value, bool):
                 raise ValueError("expected integer")
@@ -2195,6 +2370,8 @@ def _coerce_setting_value(setting: RouteSettingSpec, raw_value: Any) -> tuple[bo
 
     if setting.required:
         if value is None:
+            return False, None, "value is required"
+        if isinstance(value, list) and len(value) == 0:
             return False, None, "value is required"
         if isinstance(value, str) and value.strip() == "":
             return False, None, "value is required"
@@ -3607,6 +3784,36 @@ def _edit_route_setting_curses(
             return False, current_value, error
         return True, parsed, "updated"
 
+    if type_label == "model-list":
+        current_models = current_value if isinstance(current_value, list) else []
+        default_text = ", ".join([str(item) for item in current_models if str(item).strip()])
+        if default_text == "":
+            fallback_default = _default_value_for_setting(setting)
+            if isinstance(fallback_default, list):
+                default_text = ", ".join([str(item) for item in fallback_default if str(item).strip()])
+
+        host = resolve_ollama_host(config_data, runtime_settings=runtime_settings)
+        probe_timeout = float(get_runtime_setting(runtime_settings, "inference.probe_timeout_seconds", 3.0))
+        available_models, discovery_error = fetch_ollama_models(host, timeout=probe_timeout)
+        if available_models:
+            preview = ", ".join(available_models[:8])
+            suffix = " ..." if len(available_models) > 8 else ""
+            details.append(f"Discovered models ({len(available_models)}): {preview}{suffix}")
+        elif discovery_error:
+            details.append(f"Model discovery warning: {discovery_error}")
+
+        raw_value = _curses_prompt_text(
+            stdscr,
+            title,
+            "Enter comma-separated model chain (priority order):",
+            default=default_text,
+            allow_empty=not setting.required,
+        )
+        ok, parsed, error = _coerce_setting_value(setting, raw_value)
+        if not ok:
+            return False, current_value, error
+        return True, parsed, "updated"
+
     if setting.sensitive:
         should_replace = _curses_prompt_yes_no(
             stdscr,
@@ -3811,7 +4018,7 @@ def _curses_route_config_workspace(
             return "no pending changes"
 
         next_config = copy.deepcopy(config_data)
-        changed_paths: list[str] = []
+        parsed_by_path: dict[str, Any] = {}
         for path, pending_value in pending_changes.items():
             setting = settings_by_path.get(path)
             if setting is None:
@@ -3824,22 +4031,72 @@ def _curses_route_config_workspace(
                     [f"Invalid value for {setting.label}", f"Reason: {error}"],
                 )
                 return f"save failed: {setting.label}"
-            _set_config_path(next_config, path, parsed)
-            changed_paths.append(path)
+            parsed_by_path[path] = parsed
 
-        if not changed_paths:
+        if not parsed_by_path:
             return "no valid pending changes"
 
-        try:
-            backup = backup_file(CONFIG_FILE)
-            write_json_atomic(CONFIG_FILE, next_config)
-        except OSError as error:
-            _curses_message(
-                stdscr,
-                "Save Failed",
-                [f"Could not write config file: {error}"],
-            )
-            return f"save failed: {error}"
+        changed_setting_paths: list[str] = list(parsed_by_path.keys())
+        changed_config_paths: list[str] = []
+        policy_updates: dict[str, list[str]] = {}
+
+        for path, parsed in parsed_by_path.items():
+            policy_name = _policy_name_from_setting_path(path)
+            if policy_name:
+                if isinstance(parsed, list):
+                    policy_updates[policy_name] = _dedupe_models(
+                        [str(item).strip() for item in parsed if str(item).strip()]
+                    )
+                else:
+                    policy_updates[policy_name] = _parse_allowed_models_input(str(parsed))
+                continue
+            _set_config_path(next_config, path, parsed)
+            changed_config_paths.append(path)
+
+        policy_saved_count = 0
+        policy_warning_count = 0
+        policy_backup_names: list[str] = []
+        if policy_updates:
+            policy_manager = PolicyManager(config_data=next_config)
+            policy_failures: list[str] = []
+            for policy_name, allowed_models in policy_updates.items():
+                save_result = policy_manager.save_policy(
+                    policy_name=policy_name,
+                    updates={"allowed_models": list(allowed_models)},
+                    strict_model_check=False,
+                )
+                if not save_result.saved:
+                    reason = save_result.report.errors[0] if save_result.report.errors else "unknown error"
+                    policy_failures.append(f"{policy_name}: {reason}")
+                    continue
+                policy_saved_count += 1
+                policy_warning_count += len(save_result.report.warnings)
+                if save_result.backup_path:
+                    policy_backup_names.append(Path(save_result.backup_path).name)
+
+            if policy_failures:
+                _curses_message(
+                    stdscr,
+                    "Policy Save Failed",
+                    [
+                        "One or more policy profiles could not be saved.",
+                        *policy_failures[:6],
+                    ],
+                )
+                return f"save failed: {len(policy_failures)} policy profile(s)"
+
+        backup = None
+        if changed_config_paths:
+            try:
+                backup = backup_file(CONFIG_FILE)
+                write_json_atomic(CONFIG_FILE, next_config)
+            except OSError as error:
+                _curses_message(
+                    stdscr,
+                    "Save Failed",
+                    [f"Could not write config file: {error}"],
+                )
+                return f"save failed: {error}"
 
         next_runtime = build_runtime_settings(config_data=next_config)
         config_data.clear()
@@ -3850,14 +4107,23 @@ def _curses_route_config_workspace(
 
         restart_required = any(
             settings_by_path[path].restart_required
-            for path in changed_paths
+            for path in changed_setting_paths
             if path in settings_by_path
         )
         pending_changes.clear()
 
-        save_message = f"saved {len(changed_paths)} setting(s)"
+        save_message = f"saved {len(changed_setting_paths)} setting(s)"
         if backup:
             save_message += f" (backup: {backup.name})"
+        if policy_saved_count > 0:
+            save_message += f" | policy profiles updated: {policy_saved_count}"
+            if policy_backup_names:
+                save_message += f" (policy backups: {', '.join(policy_backup_names[:2])}"
+                if len(policy_backup_names) > 2:
+                    save_message += f", +{len(policy_backup_names) - 2} more"
+                save_message += ")"
+            if policy_warning_count > 0:
+                save_message += f" | warnings: {policy_warning_count}"
 
         route_status = watchdog.status().get(route_key, {})
         is_running = bool(route_status.get("running"))

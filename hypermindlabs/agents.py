@@ -1025,6 +1025,12 @@ def _normalize_analysis_payload(
         )
     if transition_switched and transition_summary:
         context_summary = f"{transition_summary} {context_summary}".strip()
+    maxContextSummaryChars = max(60, _runtime_int("orchestrator.analysis_context_summary_max_chars", 220))
+    if len(context_summary) > maxContextSummaryChars:
+        if maxContextSummaryChars <= 3:
+            context_summary = context_summary[:maxContextSummaryChars]
+        else:
+            context_summary = context_summary[: maxContextSummaryChars - 3].rstrip() + "..."
 
     style_raw = payload.get("response_style")
     style = style_raw if isinstance(style_raw, dict) else {}
@@ -2272,6 +2278,12 @@ class MessageAnalysisAgent():
         
     async def generateResponse(self):
         logger.info(f"Generate a response for the message analysis agent.")
+        analysisMaxOutputTokens = max(32, _runtime_int("orchestrator.analysis_max_output_tokens", 256))
+        analysisTemperature = _runtime_float("orchestrator.analysis_temperature", 0.1)
+        if analysisTemperature < 0.0:
+            analysisTemperature = 0.0
+        if analysisTemperature > 1.0:
+            analysisTemperature = 1.0
         try:
             self._response, self._routing = await self._modelRouter.chat_with_fallback(
                 capability="analysis",
@@ -2280,6 +2292,10 @@ class MessageAnalysisAgent():
                 messages=self._messages,
                 stream=True,
                 format="json",
+                options={
+                    "num_predict": int(analysisMaxOutputTokens),
+                    "temperature": float(analysisTemperature),
+                },
             )
         except Exception as error:  # noqa: BLE001
             self._routing = _routing_from_error(error)

@@ -132,6 +132,13 @@
       "show_stage_json_details": false,
       "stage_detail_level": "normal"
     },
+    "orchestrator": {
+      "fast_path_small_talk_enabled": true,
+      "fast_path_small_talk_max_chars": 96,
+      "analysis_max_output_tokens": 256,
+      "analysis_temperature": 0.1,
+      "analysis_context_summary_max_chars": 220
+    },
     "security": {
       "password_min_length": 12
     },
