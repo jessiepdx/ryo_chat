@@ -76,11 +76,11 @@ _CURSES_TIMEOUT_MS_BY_WINDOW_ID: dict[int, int] = {}
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 INFERENCE_KEYS = ("embedding", "generate", "chat", "tool", "multimodal")
 DEFAULT_MODELS = {
-    "embedding": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_embedding_model", "nomic-embed-text:latest")),
-    "generate": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_generate_model", "llama3.2:latest")),
-    "chat": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_chat_model", "llama3.2:latest")),
-    "tool": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_tool_model", "llama3.2:latest")),
-    "multimodal": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_multimodal_model", "llama3.2-vision:latest")),
+    "embedding": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_embedding_model", "")),
+    "generate": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_generate_model", "")),
+    "chat": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_chat_model", "")),
+    "tool": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_tool_model", "")),
+    "multimodal": str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_multimodal_model", "")),
 }
 DEFAULT_OLLAMA_HOST = str(DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_ollama_host", DEFAULT_OLLAMA_HOST))
 SETUP_PLACEHOLDER_VALUES = {
@@ -965,7 +965,7 @@ def _generated_allowed_models_for_policy(
         runtime_settings=runtime_settings,
         capability="chat",
     )
-    return [fallback] if fallback else [DEFAULT_MODELS["chat"]]
+    return [fallback] if fallback else []
 
 
 def sync_agent_policies_from_runtime_models(
@@ -997,6 +997,12 @@ def sync_agent_policies_from_runtime_models(
             runtime_settings=runtime_settings,
             available_models=available_models,
         )
+        if not generated_allowed:
+            failures.append(
+                f"{policy_name}: no configured/discovered models available; skipped policy sync for this profile"
+            )
+            unchanged += 1
+            continue
         if existing_allowed == generated_allowed:
             unchanged += 1
             continue
@@ -5296,7 +5302,7 @@ def _curses_edit_policy(
                 f"Allowed Models: {policy_name}",
                 [
                     "Enter comma-separated model list.",
-                    "Example: qwen3-vl:latest, llama3.2:latest",
+                    "Example: qwen3-vl:latest, gemma3:4b",
                     f"Discovered models on host: {len(available_models)}",
                 ],
                 default=default_text,

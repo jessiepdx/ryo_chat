@@ -55,5 +55,5 @@ python3 scripts/policy_wizard.py \
   --policy chat_conversation \
   --non-interactive \
   --allow-custom-system-prompt false \
-  --allowed-models llama3.2:latest,gemma3:4b
+  --allowed-models qwen3-vl:8b,gemma3:4b
 ```

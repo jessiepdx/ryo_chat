@@ -2328,6 +2328,8 @@ class ConversationOrchestrator:
         self._devStats: dict[str, Any] = {}
         self._chatResponseMessage = ""
         self._runSummary: dict[str, Any] = {}
+        self._responseID: int | None = None
+        self._responseHistoryID: int | None = None
 
         self._message = message
         self._memberID = memberID
@@ -2424,7 +2426,18 @@ class ConversationOrchestrator:
             # If no message ID provided, increment one from the last message's id
             if self._messageID is None:
                 self._messageID = 1 if not shortHistory else shortHistory[-1].get("message_id")
-                self._responseID = self._messageID + 1
+        if self._messageID is None:
+            fallbackMessageID = self._options.get("message_id")
+            try:
+                self._messageID = int(fallbackMessageID) if fallbackMessageID is not None else 1
+            except (TypeError, ValueError):
+                self._messageID = 1
+        if self._messageID is not None:
+            try:
+                self._messageID = int(self._messageID)
+            except (TypeError, ValueError):
+                self._messageID = 1
+            self._responseID = int(self._messageID) + 1
                 
         # Add the newest message to local list and the database
         newMessage = Message(role="user", content=message)
@@ -3509,7 +3522,7 @@ class ConversationOrchestrator:
         self._chatResponseMessage = sanitizedResponseMessage
         #print(ConsoleColors["default"])
 
-        if hasattr(self, "_responseID") and not self._transientSession:
+        if self._responseID is not None and not self._transientSession:
             self.storeResponse(self._responseID)
         
         assistantMessage = Message(role="assistant", content=sanitizedResponseMessage)
@@ -3572,8 +3585,8 @@ class ConversationOrchestrator:
                         summary_text=_as_text(rollupResult.get("summary_text")),
                         summary_json=_coerce_dict(rollupResult.get("summary_json")),
                         compression_ratio=_coerce_float(rollupResult.get("compression_ratio"), 1.0),
-                        source_turn_start_id=self._promptHistoryID,
-                        source_turn_end_id=self._responseHistoryID,
+                        source_turn_start_id=self.promptHistoryID,
+                        source_turn_end_id=self.responseHistoryID,
                     )
                     personalityProfile = narrativeRollup.apply_rollup_to_profile(
                         profile=personalityProfile,
@@ -4375,7 +4388,9 @@ class ToolCallingAgent():
         self._systemPrompt = loadAgentSystemPrompt(agentName)
         self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
         self._allowed_models = resolveAllowedModels(agentName, policy)
-        self._model = self._allowed_models[0]
+        self._model = _select_initial_model_from_allowed(self._allowed_models, "tool")
+        if self._model and self._model not in self._allowed_models:
+            self._allowed_models = [self._model, *self._allowed_models]
         self._routing: dict[str, Any] = {}
         self._executionSummary: dict[str, Any] = {
             "requested_tool_calls": 0,
@@ -5757,7 +5772,9 @@ class MessageAnalysisAgent():
         self._systemPrompt = loadAgentSystemPrompt(agentName)
         self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
         self._allowed_models = resolveAllowedModels(agentName, policy)
-        self._model = self._allowed_models[0]
+        self._model = _select_initial_model_from_allowed(self._allowed_models, "analysis")
+        if self._model and self._model not in self._allowed_models:
+            self._allowed_models = [self._model, *self._allowed_models]
 
         # Check for options passed and if policy allows for those options
         if options:
@@ -5832,7 +5849,9 @@ class DevTestAgent():
         self._systemPrompt = loadAgentSystemPrompt(agentName)
         self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
         self._allowed_models = resolveAllowedModels(agentName, policy)
-        self._model = self._allowed_models[0]
+        self._model = _select_initial_model_from_allowed(self._allowed_models, "dev_test")
+        if self._model and self._model not in self._allowed_models:
+            self._allowed_models = [self._model, *self._allowed_models]
 
         # Check for options passed and if policy allows for those options
         if options:
@@ -5898,7 +5917,9 @@ class ChatConversationAgent():
         self._systemPrompt = loadAgentSystemPrompt(agentName)
         self._allowCustomSystemPrompt = policy.get("allow_custom_system_prompt")
         self._allowed_models = resolveAllowedModels(agentName, policy)
-        self._model = self._allowed_models[0]
+        self._model = _select_initial_model_from_allowed(self._allowed_models, "chat")
+        if self._model and self._model not in self._allowed_models:
+            self._allowed_models = [self._model, *self._allowed_models]
         optionMap = options if isinstance(options, dict) else {}
         self._ingressImages = [item for item in _as_string_list(optionMap.get("ingress_images")) if item]
         self._imageContext = _coerce_dict(optionMap.get("image_context"))
@@ -6445,6 +6466,29 @@ _POLICY_TO_INFERENCE_KEY = {
 }
 
 
+def _runtime_model_for_capability(capability: str) -> str:
+    runtimeKey = {
+        "tool": "inference.default_tool_model",
+        "chat": "inference.default_chat_model",
+        "analysis": "inference.default_chat_model",
+        "dev_test": "inference.default_chat_model",
+        "embedding": "inference.default_embedding_model",
+        "generate": "inference.default_generate_model",
+        "multimodal": "inference.default_multimodal_model",
+    }.get(capability, "inference.default_chat_model")
+    return _normalize_model_name(_runtime_value(runtimeKey, ""))
+
+
+def _select_initial_model_from_allowed(allowed_models: list[str], capability: str) -> str:
+    cleaned = _dedupe_models(list(allowed_models or []))
+    preferred = _runtime_model_for_capability(capability)
+    if preferred and preferred in cleaned:
+        return preferred
+    if cleaned:
+        return cleaned[0]
+    return preferred
+
+
 def _preferred_runtime_model_for_policy(policyName: str) -> str:
     inferenceKey = _POLICY_TO_INFERENCE_KEY.get(policyName, "chat")
     inferenceConfig = config._instance.inference if hasattr(config, "_instance") else {}
@@ -6454,14 +6498,7 @@ def _preferred_runtime_model_for_policy(policyName: str) -> str:
         if isinstance(configuredModel, str) and configuredModel.strip():
             return configuredModel.strip()
 
-    runtimeKey = {
-        "tool": "inference.default_tool_model",
-        "chat": "inference.default_chat_model",
-        "embedding": "inference.default_embedding_model",
-        "generate": "inference.default_generate_model",
-        "multimodal": "inference.default_multimodal_model",
-    }.get(inferenceKey, "inference.default_chat_model")
-    return _as_text(_runtime_value(runtimeKey, _runtime_value("inference.default_chat_model", "")))
+    return _runtime_model_for_capability(inferenceKey)
 
 
 def resolveAllowedModels(policyName: str, policy: dict) -> list[str]:
@@ -6521,7 +6558,15 @@ def resolveAllowedModels(policyName: str, policy: dict) -> list[str]:
     preferredFallback = _preferred_runtime_model_for_policy(policyName)
     if preferredFallback:
         return [preferredFallback]
-    return ["llama3.2:latest"]
+
+    manager = _policyManager()
+    discovered_models, _ = manager.discover_models(manager.resolve_host(policyName))
+    discovered = _dedupe_models(discovered_models)
+    if policyName == "tool_calling":
+        discovered = [name for name in discovered if not _looks_like_embedding_model(name)]
+    if discovered:
+        return [discovered[0]]
+    return []
 
 
 def _prune_unavailable_policy_models(

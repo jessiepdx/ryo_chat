@@ -15,11 +15,11 @@ from typing import Any, Mapping
 DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
     "inference": {
         "default_ollama_host": "http://127.0.0.1:11434",
-        "default_embedding_model": "nomic-embed-text:latest",
-        "default_generate_model": "llama3.2:latest",
-        "default_chat_model": "llama3.2:latest",
-        "default_tool_model": "llama3.2:latest",
-        "default_multimodal_model": "llama3.2-vision:latest",
+        "default_embedding_model": "",
+        "default_generate_model": "",
+        "default_chat_model": "",
+        "default_tool_model": "",
+        "default_multimodal_model": "",
         "tool_capable_models": [],
         "model_context_window": 4096,
         "probe_timeout_seconds": 3.0,

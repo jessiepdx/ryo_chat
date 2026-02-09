@@ -202,14 +202,18 @@ class PolicyManager:
             fallback = fallback.get(part)
         if isinstance(fallback, str) and fallback.strip():
             return fallback.strip()
-        return str(
-            DEFAULT_RUNTIME_SETTINGS.get("inference", {}).get("default_chat_model", "llama3.2:latest")
-        )
+
+        discovered_models, _ = self.discover_models(self.resolve_host(policy_name))
+        if discovered_models:
+            return str(discovered_models[0]).strip()
+        return ""
 
     def default_policy(self, policy_name: str) -> dict[str, Any]:
+        default_model = self._default_model_for_policy(policy_name)
+        allowed_models = [default_model] if default_model else []
         fallback = {
             "allow_custom_system_prompt": False,
-            "allowed_models": [self._default_model_for_policy(policy_name)],
+            "allowed_models": allowed_models,
         }
         if policy_name == "tool_calling":
             runtime_defaults = DEFAULT_RUNTIME_SETTINGS.get("tool_runtime", {})
@@ -262,7 +266,8 @@ class PolicyManager:
 
         if not cleaned_models:
             errors.append("Policy key 'allowed_models' must contain at least one model.")
-            cleaned_models = [self._default_model_for_policy(policy_name)]
+            fallback_model = self._default_model_for_policy(policy_name)
+            cleaned_models = [fallback_model] if fallback_model else []
 
         normalized["allowed_models"] = cleaned_models
 

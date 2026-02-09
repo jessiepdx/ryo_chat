@@ -2933,22 +2933,35 @@ class ConfigManager:
         defaultHost = ConfigManager._as_non_empty_string(
             get_runtime_setting(runtimeSettings, "inference.default_ollama_host", "http://127.0.0.1:11434")
         ) or "http://127.0.0.1:11434"
+        def _section_model(section_name: str) -> str:
+            section = inferenceConfig.get(section_name)
+            if isinstance(section, dict):
+                return ConfigManager._as_non_empty_string(section.get("model")) or ""
+            return ""
+        fallbackModelFromConfig = (
+            _section_model("chat")
+            or _section_model("tool")
+            or _section_model("generate")
+            or _section_model("multimodal")
+            or _section_model("embedding")
+            or ""
+        )
         modelDefaults = {
             "embedding": ConfigManager._as_non_empty_string(
-                get_runtime_setting(runtimeSettings, "inference.default_embedding_model", "nomic-embed-text:latest")
-            ) or "nomic-embed-text:latest",
+                get_runtime_setting(runtimeSettings, "inference.default_embedding_model", "")
+            ) or fallbackModelFromConfig,
             "generate": ConfigManager._as_non_empty_string(
-                get_runtime_setting(runtimeSettings, "inference.default_generate_model", "llama3.2:latest")
-            ) or "llama3.2:latest",
+                get_runtime_setting(runtimeSettings, "inference.default_generate_model", "")
+            ) or fallbackModelFromConfig,
             "chat": ConfigManager._as_non_empty_string(
-                get_runtime_setting(runtimeSettings, "inference.default_chat_model", "llama3.2:latest")
-            ) or "llama3.2:latest",
+                get_runtime_setting(runtimeSettings, "inference.default_chat_model", "")
+            ) or fallbackModelFromConfig,
             "tool": ConfigManager._as_non_empty_string(
-                get_runtime_setting(runtimeSettings, "inference.default_tool_model", "llama3.2:latest")
-            ) or "llama3.2:latest",
+                get_runtime_setting(runtimeSettings, "inference.default_tool_model", "")
+            ) or fallbackModelFromConfig,
             "multimodal": ConfigManager._as_non_empty_string(
-                get_runtime_setting(runtimeSettings, "inference.default_multimodal_model", "llama3.2-vision:latest")
-            ) or "llama3.2-vision:latest",
+                get_runtime_setting(runtimeSettings, "inference.default_multimodal_model", "")
+            ) or fallbackModelFromConfig,
         }
 
         hydrated: dict[str, dict[str, str]] = {}

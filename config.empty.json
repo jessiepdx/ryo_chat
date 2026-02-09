@@ -37,23 +37,23 @@
   "inference": {
     "embedding": {
       "url": "http://127.0.0.1:11434",
-      "model": "nomic-embed-text:latest"
+      "model": ""
     },
     "generate": {
       "url": "http://127.0.0.1:11434",
-      "model": "llama3.2:latest"
+      "model": ""
     },
     "chat": {
       "url": "http://127.0.0.1:11434",
-      "model": "llama3.2:latest"
+      "model": ""
     },
     "tool": {
       "url": "http://127.0.0.1:11434",
-      "model": "llama3.2:latest"
+      "model": ""
     },
     "multimodal": {
       "url": "http://127.0.0.1:11434",
-      "model": "llama3.2-vision:latest"
+      "model": ""
     }
   },
   "community_score_requirements": {
@@ -67,11 +67,11 @@
   "runtime": {
     "inference": {
       "default_ollama_host": "http://127.0.0.1:11434",
-      "default_embedding_model": "nomic-embed-text:latest",
-      "default_generate_model": "llama3.2:latest",
-      "default_chat_model": "llama3.2:latest",
-      "default_tool_model": "llama3.2:latest",
-      "default_multimodal_model": "llama3.2-vision:latest",
+      "default_embedding_model": "",
+      "default_generate_model": "",
+      "default_chat_model": "",
+      "default_tool_model": "",
+      "default_multimodal_model": "",
       "model_context_window": 4096,
       "probe_timeout_seconds": 3.0,
       "embedding_timeout_seconds": 12.0,

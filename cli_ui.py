@@ -64,7 +64,7 @@ settings = {
     "show_stats": False,
     "model": config.inference.get("chat", {}).get(
         "model",
-        config.runtimeValue("inference.default_chat_model", "llama3.2:latest"),
+        config.runtimeValue("inference.default_chat_model", ""),
     ),
 }
 
