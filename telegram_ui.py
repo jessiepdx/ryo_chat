@@ -3869,7 +3869,7 @@ async def linkHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await context.bot.send_message(
                 chat_id=chat.id,
                 message_thread_id=topicID,
-                text=f"You need a minimum community score of {minimumCommunityScore} to send links in the {community.get("community_name")} chat."
+                text=f"You need a minimum community score of {minimumCommunityScore} to send links in the {community.get('community_name')} chat."
             )
         except Exception as err:
             logger.error(f"Exception while handling potential spam message (containing a link):\n{err}")
@@ -4065,7 +4065,7 @@ async def handleForwardedMessage(update: Update, context: ContextTypes.DEFAULT_T
             await context.bot.send_message(
                 chat_id=chat.id,
                 message_thread_id=topicID,
-                text=f"You need a minimum community score of {minimumCommunityScore} to forward messages in the {community.get("community_name")} chat."
+                text=f"You need a minimum community score of {minimumCommunityScore} to forward messages in the {community.get('community_name')} chat."
             )
         except Exception as err:
             logger.error(f"Exception while handling potential spam message (forwarded message):\n{err}")
