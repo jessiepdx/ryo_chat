@@ -2424,17 +2424,54 @@ class UsageManager:
         
         return cls._instance
 
+    @staticmethod
+    def _usage_stat_int(stats: dict | None, key: str, default: int = 0) -> int:
+        payload = stats if isinstance(stats, dict) else {}
+        raw_value = payload.get(key, default)
+        if raw_value is None:
+            return int(default)
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            return int(default)
+        return max(0, value)
+
     def addUsage(self, promptHistoryID: int, responseHistoryID: int, stats: dict):
         logger.info("Add usage data.")
+        if promptHistoryID is None or responseHistoryID is None:
+            logger.warning(
+                "Skipping usage insert because prompt/response history id is missing "
+                f"(prompt={promptHistoryID}, response={responseHistoryID})."
+            )
+            return
         
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
+
+            loadDuration = self._usage_stat_int(stats, "load_duration", 0)
+            promptEvalCount = self._usage_stat_int(stats, "prompt_eval_count", 0)
+            promptEvalDuration = self._usage_stat_int(stats, "prompt_eval_duration", 0)
+            evalCount = self._usage_stat_int(stats, "eval_count", 0)
+            evalDuration = self._usage_stat_int(stats, "eval_duration", 0)
+            totalDuration = self._usage_stat_int(stats, "total_duration", 0)
             
             addUsage_sql = """INSERT INTO inference_usage (prompt_history_id, response_history_id, load_duration, prompt_eval_count, prompt_eval_duration, eval_count, eval_duration, total_duration) 
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s);"""
-            cursor.execute(addUsage_sql, (promptHistoryID, responseHistoryID, stats["load_duration"], stats["prompt_eval_count"], stats["prompt_eval_duration"], stats["eval_count"], stats["eval_duration"], stats["total_duration"]))
+            cursor.execute(
+                addUsage_sql,
+                (
+                    promptHistoryID,
+                    responseHistoryID,
+                    loadDuration,
+                    promptEvalCount,
+                    promptEvalDuration,
+                    evalCount,
+                    evalDuration,
+                    totalDuration,
+                ),
+            )
             
             connection.commit()
             # Close the cursor

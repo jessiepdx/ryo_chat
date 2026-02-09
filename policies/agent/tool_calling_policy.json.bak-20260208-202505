@@ -1,9 +1,7 @@
 {
   "allow_custom_system_prompt": false,
   "allowed_models": [
-    "qwen3-vl:latest",
-    "gemma3:4b",
-    "gemma3:1b"
+    "qwen3-vl:latest"
   ],
   "tool_runtime": {
     "default_timeout_seconds": 8.0,
