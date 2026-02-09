@@ -71,6 +71,7 @@ POLICIES_DIR = PROJECT_ROOT / "policies" / "agent"
 LIVE_LOG_BUFFER_LINE_LIMIT = 400
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 DB_CONNINFO_PASSWORD_RE = re.compile(r"(password=)([^\s]+)", re.IGNORECASE)
+_CURSES_TIMEOUT_MS_BY_WINDOW_ID: dict[int, int] = {}
 
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 INFERENCE_KEYS = ("embedding", "generate", "chat", "tool", "multimodal")
@@ -1080,6 +1081,20 @@ def _safe_addstr(stdscr: Any, row: int, col: int, text: str, attr: int = 0) -> N
         return
 
 
+def _set_curses_timeout(stdscr: Any, timeout_ms: int) -> None:
+    if not hasattr(stdscr, "timeout"):
+        return
+    try:
+        stdscr.timeout(int(timeout_ms))
+        _CURSES_TIMEOUT_MS_BY_WINDOW_ID[id(stdscr)] = int(timeout_ms)
+    except Exception:
+        return
+
+
+def _get_curses_timeout(stdscr: Any) -> int:
+    return int(_CURSES_TIMEOUT_MS_BY_WINDOW_ID.get(id(stdscr), -1))
+
+
 def _curses_prompt_yes_no(stdscr: Any, title: str, body_lines: list[str], default: bool = True) -> bool:
     selected = 0 if default else 1
     options = ["Yes", "No"]
@@ -1130,6 +1145,7 @@ def _curses_prompt_text(
     *,
     allow_empty: bool = False,
 ) -> str:
+    previous_timeout = _get_curses_timeout(stdscr)
     while True:
         stdscr.erase()
         _safe_addstr(stdscr, 0, 0, title, curses.A_BOLD if curses else 0)
@@ -1140,11 +1156,17 @@ def _curses_prompt_text(
             _safe_addstr(stdscr, 3, 0, "Default: (empty)")
         _safe_addstr(stdscr, 5, 0, "> ")
         stdscr.refresh()
+        # Force blocking input for edit fields so dashboard polling timeout
+        # cannot auto-submit values.
+        _set_curses_timeout(stdscr, -1)
         if curses:
             curses.echo()
-        raw = stdscr.getstr(5, 2, 256)
-        if curses:
-            curses.noecho()
+        try:
+            raw = stdscr.getstr(5, 2, 256)
+        finally:
+            if curses:
+                curses.noecho()
+            _set_curses_timeout(stdscr, previous_timeout)
         value = raw.decode(errors="ignore").strip()
         if value == "":
             if default:
@@ -5272,7 +5294,7 @@ def watchdog_dashboard_curses(
         if curses:
             curses.curs_set(0)
             stdscr.keypad(True)
-        stdscr.timeout(800)
+        _set_curses_timeout(stdscr, 800)
 
         auto_start_routes = bool(
             get_runtime_setting(
