@@ -23,10 +23,12 @@ import json
 import logging
 import os
 import psycopg
+import queue
 import re
 import secrets
 import sys
 import string
+import threading
 import textstat
 import time
 import uuid
@@ -131,6 +133,9 @@ VECTOR_DIMENSION_MIGRATIONS: set[str] = {
     "040_knowledge.sql",
     "060_spam.sql",
 }
+_EMBEDDING_WRITE_QUEUE: queue.Queue[dict[str, Any]] | None = None
+_EMBEDDING_WORKER_THREAD: threading.Thread | None = None
+_EMBEDDING_WORKER_LOCK = threading.Lock()
 
 
 def _render_migration_sql(sql_text: str, context: dict[str, Any] | None = None) -> str:
@@ -223,6 +228,120 @@ def ensure_startup_database_migrations() -> dict[str, Any]:
             connection.close()
 
     return report
+
+
+def _defer_embeddings_on_write_enabled() -> bool:
+    try:
+        return ConfigManager().runtimeBool("inference.defer_embeddings_on_write", True)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _embedding_write_queue_max_size() -> int:
+    try:
+        size = int(ConfigManager().runtimeInt("inference.embedding_write_queue_size", 512))
+    except Exception:  # noqa: BLE001
+        size = 512
+    return max(16, size)
+
+
+def _persist_chat_embedding(history_id: int, message_text: str, *, source: str = "sync") -> bool:
+    if history_id is None:
+        return False
+
+    embedding = getEmbeddings(message_text)
+    if embedding is None:
+        logger.warning("Skipping chat embeddings persistence because embedding model returned no vector.")
+        return False
+
+    connection = None
+    try:
+        connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+        cursor = connection.cursor()
+        insertEmbeddings_sql = """INSERT INTO chat_history_embeddings (history_id, embeddings)
+        VALUES (%s, %s);"""
+        cursor.execute(insertEmbeddings_sql, (history_id, embedding))
+        connection.commit()
+        cursor.close()
+        logger.debug(f"Chat embeddings persisted ({source}) for history id {history_id}.")
+        return True
+    except (Exception, psycopg.DatabaseError) as error:
+        if connection is not None:
+            connection.rollback()
+        logger.warning(f"Unable to persist chat embeddings ({source}) for history id {history_id}:\n{error}")
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _embedding_worker_loop() -> None:
+    global _EMBEDDING_WRITE_QUEUE
+    logger.info("Embedding worker started for deferred chat history persistence.")
+    while True:
+        workQueue = _EMBEDDING_WRITE_QUEUE
+        if workQueue is None:
+            break
+        try:
+            job = workQueue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Embedding worker queue error: {error}")
+            continue
+
+        if not isinstance(job, dict):
+            continue
+
+        history_id = job.get("history_id")
+        message_text = str(job.get("message_text") or "")
+        if not isinstance(history_id, int) or history_id <= 0:
+            continue
+        if message_text.strip() == "":
+            continue
+
+        try:
+            _persist_chat_embedding(history_id, message_text, source="deferred")
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Embedding worker failed for history id {history_id}: {error}")
+
+
+def _ensure_embedding_worker_started() -> queue.Queue[dict[str, Any]]:
+    global _EMBEDDING_WRITE_QUEUE
+    global _EMBEDDING_WORKER_THREAD
+
+    with _EMBEDDING_WORKER_LOCK:
+        expectedSize = _embedding_write_queue_max_size()
+        if _EMBEDDING_WRITE_QUEUE is None:
+            _EMBEDDING_WRITE_QUEUE = queue.Queue(maxsize=expectedSize)
+        if _EMBEDDING_WORKER_THREAD is None or not _EMBEDDING_WORKER_THREAD.is_alive():
+            _EMBEDDING_WORKER_THREAD = threading.Thread(
+                target=_embedding_worker_loop,
+                name="ryo-embedding-writer",
+                daemon=True,
+            )
+            _EMBEDDING_WORKER_THREAD.start()
+    return _EMBEDDING_WRITE_QUEUE
+
+
+def _enqueue_chat_embedding(history_id: int, message_text: str) -> bool:
+    if not _defer_embeddings_on_write_enabled():
+        return False
+    if not isinstance(history_id, int) or history_id <= 0:
+        return False
+    if str(message_text or "").strip() == "":
+        return False
+
+    try:
+        workQueue = _ensure_embedding_worker_started()
+        workQueue.put_nowait({"history_id": history_id, "message_text": str(message_text)})
+        return True
+    except queue.Full:
+        logger.warning("Embedding queue is full; skipping deferred embedding enqueue for history id %s.", history_id)
+        return False
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"Unable to enqueue deferred embedding for history id {history_id}: {error}")
+        return False
 
 
 # NOTE OLD - but other aspects of code still use... Maybe make into a class for dot syntax use
@@ -918,8 +1037,8 @@ class ChatHistoryManager:
             return
         
         chatType = "community" if communityID is not None else "member"
-        
-        embedding = getEmbeddings(messageText)
+        deferEmbeddings = _defer_embeddings_on_write_enabled()
+        embedding = None if deferEmbeddings else getEmbeddings(messageText)
 
         if isinstance(timestamp, datetime):
             timestampValue = timestamp
@@ -949,7 +1068,15 @@ class ChatHistoryManager:
 
             connection.commit()
 
-            if embedding is not None:
+            if deferEmbeddings:
+                enqueued = _enqueue_chat_embedding(historyID, messageText)
+                if not enqueued:
+                    logger.warning(
+                        "Deferred embedding enqueue failed for history id %s; falling back to synchronous persistence.",
+                        historyID,
+                    )
+                    _persist_chat_embedding(historyID, messageText, source="sync-fallback")
+            elif embedding is not None:
                 try:
                     insertEmbeddings_sql = """INSERT INTO chat_history_embeddings (history_id, embeddings)
                     VALUES (%s, %s);"""

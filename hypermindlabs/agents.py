@@ -16,6 +16,7 @@
 # IMPORTS #
 ###########
 
+import copy
 from datetime import datetime, timedelta, timezone
 import inspect
 import json
@@ -85,6 +86,11 @@ logger = logging.getLogger(__name__)
 timezone(-timedelta(hours=7), "Pacific")
 
 
+_CONTROL_PLANE_MANAGER_CACHE: dict[str, dict[str, Any]] = {}
+_CONTROL_PLANE_POLICY_CACHE: dict[str, dict[str, Any]] = {}
+_CONTROL_PLANE_PROMPT_CACHE: dict[str, dict[str, Any]] = {}
+
+
 def _runtime_int(path: str, default: int) -> int:
     return config.runtimeInt(path, default)
 
@@ -99,6 +105,26 @@ def _runtime_value(path: str, default: Any = None) -> Any:
 
 def _runtime_bool(path: str, default: bool) -> bool:
     return config.runtimeBool(path, default)
+
+
+def _control_plane_cache_enabled() -> bool:
+    return _runtime_bool("orchestrator.control_plane_cache_enabled", True)
+
+
+def _control_plane_cache_ttl_seconds() -> float:
+    ttl = _runtime_float("orchestrator.control_plane_cache_ttl_seconds", 60.0)
+    if ttl <= 0:
+        return 0.0
+    return max(0.25, float(ttl))
+
+
+def _cache_valid(entry: dict[str, Any], ttl_seconds: float) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    cached_at = entry.get("cached_at")
+    if not isinstance(cached_at, (int, float)):
+        return False
+    return (time.monotonic() - float(cached_at)) <= ttl_seconds
 
 
 def _fallback_stream(message_text: str) -> AsyncIterator[Any]:
@@ -1147,6 +1173,43 @@ def _sanitize_final_response(
     return "I can help with that. Could you restate what you want me to focus on?"
 
 
+def _is_low_signal_response(text: str) -> bool:
+    cleaned = _as_text(text)
+    if not cleaned:
+        return True
+    alnum_count = len(re.sub(r"[^A-Za-z0-9]+", "", cleaned))
+    if alnum_count < 6:
+        return True
+    if re.fullmatch(r"[\s\{\}\[\]\":,`'.\-_/\\]+", cleaned):
+        return True
+    return False
+
+
+def _truncate_for_prompt(text: Any, max_chars: int = 300) -> str:
+    cleaned = _as_text(text)
+    if len(cleaned) <= max_chars:
+        return cleaned
+    if max_chars <= 3:
+        return cleaned[:max_chars]
+    return cleaned[: max_chars - 3].rstrip() + "..."
+
+
+def _tool_results_repair_preview(tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    preview: list[dict[str, Any]] = []
+    for item in tool_results[:4]:
+        if not isinstance(item, dict):
+            continue
+        preview.append(
+            {
+                "tool_name": _as_text(item.get("tool_name"), "unknown"),
+                "status": _as_text(item.get("status"), "unknown"),
+                "error": _coerce_dict(item.get("error")),
+                "tool_results_excerpt": _truncate_for_prompt(item.get("tool_results"), 260),
+            }
+        )
+    return preview
+
+
 
 ################
 # ORCHESTRATOR #
@@ -1293,6 +1356,68 @@ class ConversationOrchestrator:
                 await maybeAwaitable
         except Exception as error:  # noqa: BLE001
             logger.warning(f"Stage callback failed [{stage}]: {error}")
+
+    async def _attempt_response_repair(
+        self,
+        *,
+        normalized_analysis: dict[str, Any],
+        tool_responses: list[dict[str, Any]],
+        tool_execution_mode: str,
+    ) -> tuple[str, dict[str, Any]]:
+        endpoint_override = self._options.get("ollama_host")
+        router = ModelRouter(
+            inference_config=config._instance.inference,
+            endpoint_override=endpoint_override,
+        )
+        chat_routing = _coerce_dict(getattr(self._chatConversationAgent, "routing", {}))
+        requested_model = (
+            _as_text(chat_routing.get("selected_model"))
+            or _as_text(chat_routing.get("requested_model"))
+            or _as_text(getattr(self._chatConversationAgent, "_model", ""))
+        )
+        allowed_models = _as_string_list(getattr(self._chatConversationAgent, "_allowed_models", []))
+        if requested_model and requested_model not in allowed_models:
+            allowed_models.insert(0, requested_model)
+
+        repair_prompt = (
+            "You are producing the final user-facing answer for a chat assistant. "
+            "Respond directly to the user's request in plain text. "
+            "Do not output JSON, code fences, analysis metadata, or internal orchestration details."
+        )
+        repair_payload = {
+            "user_message": _truncate_for_prompt(self._message, 500),
+            "analysis": {
+                "topic": _as_text(normalized_analysis.get("topic"), "general"),
+                "intent": _as_text(normalized_analysis.get("intent"), "answer_user"),
+                "context_summary": _truncate_for_prompt(normalized_analysis.get("context_summary"), 240),
+                "needs_tools": bool(normalized_analysis.get("needs_tools")),
+            },
+            "tool_execution_mode": _as_text(tool_execution_mode, "native_tools"),
+            "tool_results": _tool_results_repair_preview(tool_responses),
+        }
+        repair_messages = [
+            Message(role="system", content=repair_prompt),
+            Message(
+                role="user",
+                content="Produce a clean final reply from this context:\n"
+                + json.dumps(repair_payload, ensure_ascii=False),
+            ),
+        ]
+        response, routing = await router.chat_with_fallback(
+            capability="chat",
+            requested_model=requested_model or None,
+            allowed_models=allowed_models or None,
+            messages=repair_messages,
+            stream=False,
+        )
+        response_message = getattr(response, "message", None)
+        repaired_text = _as_text(getattr(response_message, "content", ""))
+        repaired_text = _sanitize_final_response(
+            repaired_text,
+            user_message=self._message,
+            allow_internal_diagnostics=False,
+        )
+        return repaired_text, _coerce_dict(routing)
 
 
     async def runAgents(self):
@@ -1488,6 +1613,7 @@ class ConversationOrchestrator:
         )
 
         toolResponses: list[dict[str, Any]] = []
+        toolExecutionMode = "skipped_fast_path" if fastPathActive else "native_tools"
         if fastPathActive:
             await self._emit_stage(
                 "orchestrator.fast_path",
@@ -1524,6 +1650,7 @@ class ConversationOrchestrator:
             self._toolsAgent = ToolCallingAgent(toolStageMessages, options=toolOptions)
             toolResponses = await self._toolsAgent.generateResponse()
             toolSummary = _coerce_dict(getattr(self._toolsAgent, "execution_summary", {}))
+            toolExecutionMode = _as_text(toolSummary.get("execution_mode"), "native_tools")
             toolsRouting = _coerce_dict(getattr(self._toolsAgent, "routing", {}))
             requestedToolCalls = toolSummary.get("requested_tool_calls")
             executedToolCalls = toolSummary.get("executed_tool_calls")
@@ -1644,8 +1771,51 @@ class ConversationOrchestrator:
             user_message=self._message,
             allow_internal_diagnostics=allowDiagnostics,
         )
+        if _is_low_signal_response(sanitizedResponseMessage):
+            await self._emit_stage(
+                "response.repair",
+                "Primary response was low-signal; running recovery generation.",
+                json={
+                    "execution_mode": toolExecutionMode,
+                    "response_chars": len(_as_text(sanitizedResponseMessage)),
+                },
+            )
+            try:
+                repairedText, repairRouting = await self._attempt_response_repair(
+                    normalized_analysis=normalizedAnalysis,
+                    tool_responses=toolResponses,
+                    tool_execution_mode=toolExecutionMode,
+                )
+                if not _is_low_signal_response(repairedText):
+                    sanitizedResponseMessage = repairedText
+                    await self._emit_stage(
+                        "response.repair.complete",
+                        "Recovery generation produced a user-facing reply.",
+                        selected_model=repairRouting.get("selected_model"),
+                        json={"routing": repairRouting},
+                    )
+                else:
+                    await self._emit_stage(
+                        "response.repair.complete",
+                        "Recovery generation returned low-signal output.",
+                        selected_model=repairRouting.get("selected_model"),
+                        json={"routing": repairRouting},
+                    )
+            except Exception as repairError:  # noqa: BLE001
+                logger.warning(f"Response repair generation failed: {repairError}")
+                await self._emit_stage(
+                    "response.repair.complete",
+                    "Recovery generation failed; using fallback response text.",
+                    error=str(repairError),
+                )
         if not str(sanitizedResponseMessage or "").strip():
-            sanitizedResponseMessage = "I could not generate a complete reply this turn. Please try again."
+            if toolExecutionMode == "pseudo_structured_output":
+                sanitizedResponseMessage = (
+                    "I completed tool planning in compatibility mode, but the final response model "
+                    "did not return usable text. Try a different chat model for this route."
+                )
+            else:
+                sanitizedResponseMessage = "I could not generate a complete reply this turn. Please try again."
             await self._emit_stage(
                 "response.fallback",
                 "Model returned empty output; emitted fallback response text.",
@@ -3239,11 +3409,28 @@ DO NOT put quotes around the tweet."""
 ####################
 
 def _policyManager(endpointOverride: str | None = None) -> PolicyManager:
+    normalizedOverride = str(endpointOverride or "").strip().rstrip("/")
+    cacheKey = normalizedOverride or "__default__"
+    cacheEnabled = _control_plane_cache_enabled()
+    cacheTtlSeconds = _control_plane_cache_ttl_seconds()
+    if cacheEnabled and cacheTtlSeconds > 0:
+        cached = _CONTROL_PLANE_MANAGER_CACHE.get(cacheKey)
+        if _cache_valid(cached, cacheTtlSeconds):
+            manager = cached.get("manager")
+            if isinstance(manager, PolicyManager):
+                return manager
+
     inference = config._instance.inference if hasattr(config, "_instance") else {}
-    return PolicyManager(
+    manager = PolicyManager(
         inference_config=inference,
-        endpoint_override=endpointOverride,
+        endpoint_override=normalizedOverride or None,
     )
+    if cacheEnabled and cacheTtlSeconds > 0:
+        _CONTROL_PLANE_MANAGER_CACHE[cacheKey] = {
+            "cached_at": time.monotonic(),
+            "manager": manager,
+        }
+    return manager
 
 
 _POLICY_TO_INFERENCE_KEY = {
@@ -3306,8 +3493,19 @@ def resolveAllowedModels(policyName: str, policy: dict) -> list[str]:
 
 
 def loadAgentPolicy(policyName: str, endpointOverride: str | None = None) -> dict:
+    normalizedOverride = str(endpointOverride or "").strip().rstrip("/")
+    cacheKey = f"{policyName}|{normalizedOverride or '__default__'}"
+    cacheEnabled = _control_plane_cache_enabled()
+    cacheTtlSeconds = _control_plane_cache_ttl_seconds()
+    if cacheEnabled and cacheTtlSeconds > 0:
+        cached = _CONTROL_PLANE_POLICY_CACHE.get(cacheKey)
+        if _cache_valid(cached, cacheTtlSeconds):
+            payload = cached.get("policy")
+            if isinstance(payload, dict):
+                return copy.deepcopy(payload)
+
     logger.info(f"Loading agent policy for: {policyName}")
-    manager = _policyManager(endpointOverride=endpointOverride)
+    manager = _policyManager(endpointOverride=normalizedOverride or None)
     report = manager.validate_policy(policy_name=policyName, strict_model_check=False)
 
     for warning in report.warnings:
@@ -3316,20 +3514,44 @@ def loadAgentPolicy(policyName: str, endpointOverride: str | None = None) -> dic
         logger.error(f"Policy validation error [{policyName}]: {error}")
 
     if report.errors:
-        return manager.default_policy(policyName)
-    if isinstance(report.normalized_policy, dict):
-        return report.normalized_policy
-    return manager.default_policy(policyName)
+        resolved = manager.default_policy(policyName)
+    elif isinstance(report.normalized_policy, dict):
+        resolved = report.normalized_policy
+    else:
+        resolved = manager.default_policy(policyName)
+
+    if cacheEnabled and cacheTtlSeconds > 0:
+        _CONTROL_PLANE_POLICY_CACHE[cacheKey] = {
+            "cached_at": time.monotonic(),
+            "policy": copy.deepcopy(resolved),
+        }
+    return copy.deepcopy(resolved)
 
 
 def loadAgentSystemPrompt(policyName: str) -> str:
+    cacheEnabled = _control_plane_cache_enabled()
+    cacheTtlSeconds = _control_plane_cache_ttl_seconds()
+    if cacheEnabled and cacheTtlSeconds > 0:
+        cached = _CONTROL_PLANE_PROMPT_CACHE.get(policyName)
+        if _cache_valid(cached, cacheTtlSeconds):
+            payload = cached.get("prompt")
+            if isinstance(payload, str):
+                return payload
+
     logger.info(f"Loading agent system prompt for: {policyName}")
     manager = _policyManager()
     try:
-        return manager.load_system_prompt(policy_name=policyName, strict=True)
+        prompt = manager.load_system_prompt(policy_name=policyName, strict=True)
     except PolicyValidationError as error:
         logger.error(f"System prompt load failed [{policyName}]: {error}")
-        return manager.load_system_prompt(policy_name=policyName, strict=False)
+        prompt = manager.load_system_prompt(policy_name=policyName, strict=False)
+
+    if cacheEnabled and cacheTtlSeconds > 0:
+        _CONTROL_PLANE_PROMPT_CACHE[policyName] = {
+            "cached_at": time.monotonic(),
+            "prompt": str(prompt),
+        }
+    return str(prompt)
 
 
 def toolCaller(toolName: str, toolArgs: dict) -> dict:

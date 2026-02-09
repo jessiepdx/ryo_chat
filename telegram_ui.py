@@ -328,6 +328,7 @@ class TelegramStageStatus:
         history_limit: int = 8,
         json_char_limit: int = 1400,
         message_char_limit: int = 3800,
+        update_min_interval_seconds: float = 1.0,
     ):
         self._context = context
         self._chat_id = chat_id
@@ -342,9 +343,15 @@ class TelegramStageStatus:
         self._history_limit = max(3, int(history_limit))
         self._json_char_limit = max(200, int(json_char_limit))
         self._message_char_limit = max(800, int(message_char_limit))
+        self._update_min_interval_seconds = max(0.1, float(update_min_interval_seconds))
         self._message = None
         self._lines: list[str] = []
         self._last_text: str = ""
+        self._last_edit_monotonic = 0.0
+        self._edit_lock = asyncio.Lock()
+        self._flush_task: asyncio.Task | None = None
+        self._flush_pending = False
+        self._flush_shutdown = False
 
     def _stage_visible(self, stage: str, meta: dict[str, Any]) -> bool:
         if self._detail_level == "debug":
@@ -630,17 +637,51 @@ class TelegramStageStatus:
         if str(text or "").strip() == "":
             logger.warning("Failed to update stage status message: Message text is empty")
             return False
+        async with self._edit_lock:
+            try:
+                kwargs: dict[str, Any] = {}
+                if parse_html:
+                    kwargs["parse_mode"] = constants.ParseMode.HTML
+                    kwargs["disable_web_page_preview"] = True
+                await self._message.edit_text(text=text, **kwargs)
+                self._last_text = text
+                self._last_edit_monotonic = time.monotonic()
+                return True
+            except Exception as error:  # noqa: BLE001
+                logger.warning(f"Failed to update stage status message: {error}")
+                return False
+
+    async def _flush_stage_loop(self) -> None:
+        while not self._flush_shutdown:
+            if not self._flush_pending:
+                break
+            self._flush_pending = False
+            elapsed = time.monotonic() - self._last_edit_monotonic
+            if elapsed < self._update_min_interval_seconds:
+                await asyncio.sleep(self._update_min_interval_seconds - elapsed)
+            await self._safe_edit(self._render(), parse_html=True)
+
+    def _schedule_stage_flush(self) -> None:
+        if self._flush_shutdown:
+            return
+        self._flush_pending = True
+        if self._flush_task is not None and not self._flush_task.done():
+            return
+        self._flush_task = asyncio.create_task(self._flush_stage_loop())
+
+    async def _stop_stage_flush(self) -> None:
+        self._flush_shutdown = True
+        task = self._flush_task
+        self._flush_task = None
+        if task is None:
+            return
+        if task.done():
+            return
+        task.cancel()
         try:
-            kwargs: dict[str, Any] = {}
-            if parse_html:
-                kwargs["parse_mode"] = constants.ParseMode.HTML
-                kwargs["disable_web_page_preview"] = True
-            await self._message.edit_text(text=text, **kwargs)
-            self._last_text = text
-            return True
-        except Exception as error:  # noqa: BLE001
-            logger.warning(f"Failed to update stage status message: {error}")
-            return False
+            await task
+        except asyncio.CancelledError:
+            pass
 
     async def start(self) -> None:
         if not self._enabled:
@@ -669,6 +710,7 @@ class TelegramStageStatus:
                     disable_web_page_preview=True,
                 )
             self._last_text = text
+            self._last_edit_monotonic = time.monotonic()
         except Exception as error:  # noqa: BLE001
             logger.warning(f"Unable to send stage status message: {error}")
             self._message = None
@@ -702,9 +744,10 @@ class TelegramStageStatus:
         self._lines.append(entry)
         if len(self._lines) > max(self._history_limit * 4, 24):
             self._lines = self._lines[-max(self._history_limit * 4, 24) :]
-        await self._safe_edit(self._render(), parse_html=True)
+        self._schedule_stage_flush()
 
     async def finalize(self, final_text: str):
+        await self._stop_stage_flush()
         final_text_safe = self._normalize_final_reply_text(final_text)
         if self._message is not None:
             edited = await self._safe_edit(final_text_safe, parse_html=False)
@@ -727,6 +770,7 @@ class TelegramStageStatus:
             raise
 
     async def fail(self, error_text: str) -> None:
+        await self._stop_stage_flush()
         if self._message is not None:
             await self._safe_edit(error_text)
             return
@@ -2612,6 +2656,7 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         enabled=_runtime_bool("telegram.show_stage_progress", True),
         show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
         detail_level=_runtime_str("telegram.stage_detail_level", "minimal"),
+        update_min_interval_seconds=_runtime_float("telegram.stage_update_min_interval_seconds", 1.0),
     )
     await stageStatus.start()
 
@@ -2758,6 +2803,7 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         enabled=_runtime_bool("telegram.show_stage_progress", True),
         show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
         detail_level=_runtime_str("telegram.stage_detail_level", "minimal"),
+        update_min_interval_seconds=_runtime_float("telegram.stage_update_min_interval_seconds", 1.0),
     )
     await stageStatus.start()
 
@@ -3116,6 +3162,7 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         enabled=_runtime_bool("telegram.show_stage_progress", True),
         show_json_details=_runtime_bool("telegram.show_stage_json_details", True),
         detail_level=_runtime_str("telegram.stage_detail_level", "minimal"),
+        update_min_interval_seconds=_runtime_float("telegram.stage_update_min_interval_seconds", 1.0),
     )
     await stageStatus.start()
 

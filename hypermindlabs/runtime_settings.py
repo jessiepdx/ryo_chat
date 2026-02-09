@@ -24,6 +24,8 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "probe_timeout_seconds": 3.0,
         "embedding_timeout_seconds": 12.0,
         "embedding_max_input_chars": 6000,
+        "defer_embeddings_on_write": True,
+        "embedding_write_queue_size": 512,
         "prompt_model_selection_on_startup": False,
     },
     "database": {
@@ -82,6 +84,7 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "show_stage_progress": True,
         "show_stage_json_details": False,
         "stage_detail_level": "normal",
+        "stage_update_min_interval_seconds": 1.0,
     },
     "orchestrator": {
         "fast_path_small_talk_enabled": True,
@@ -89,6 +92,8 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "analysis_max_output_tokens": 256,
         "analysis_temperature": 0.1,
         "analysis_context_summary_max_chars": 220,
+        "control_plane_cache_enabled": True,
+        "control_plane_cache_ttl_seconds": 60.0,
     },
     "temporal": {
         "enabled": True,
@@ -200,6 +205,8 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "inference.probe_timeout_seconds": (("RYO_OLLAMA_PROBE_TIMEOUT_SECONDS",), "float"),
     "inference.embedding_timeout_seconds": (("RYO_OLLAMA_EMBED_TIMEOUT_SECONDS",), "float"),
     "inference.embedding_max_input_chars": (("RYO_EMBEDDING_MAX_INPUT_CHARS",), "int"),
+    "inference.defer_embeddings_on_write": (("RYO_DEFER_EMBEDDINGS_ON_WRITE",), "bool"),
+    "inference.embedding_write_queue_size": (("RYO_EMBEDDING_WRITE_QUEUE_SIZE",), "int"),
     "inference.prompt_model_selection_on_startup": (("RYO_PROMPT_MODEL_SELECTION_ON_STARTUP",), "bool"),
     "database.default_primary_host": (("RYO_DB_DEFAULT_PRIMARY_HOST", "POSTGRES_HOST"), "str"),
     "database.default_primary_port": (("RYO_DB_DEFAULT_PRIMARY_PORT", "POSTGRES_PORT"), "str"),
@@ -243,6 +250,7 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "telegram.show_stage_progress": (("RYO_TELEGRAM_SHOW_STAGE_PROGRESS",), "bool"),
     "telegram.show_stage_json_details": (("RYO_TELEGRAM_SHOW_STAGE_JSON_DETAILS",), "bool"),
     "telegram.stage_detail_level": (("RYO_TELEGRAM_STAGE_DETAIL_LEVEL",), "str"),
+    "telegram.stage_update_min_interval_seconds": (("RYO_TELEGRAM_STAGE_UPDATE_MIN_INTERVAL_SECONDS",), "float"),
     "orchestrator.fast_path_small_talk_enabled": (
         ("RYO_ORCHESTRATOR_FAST_PATH_BREVITY_ENABLED", "RYO_ORCHESTRATOR_FAST_PATH_SMALL_TALK_ENABLED"),
         "bool",
@@ -262,6 +270,14 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "orchestrator.analysis_context_summary_max_chars": (
         ("RYO_ORCHESTRATOR_ANALYSIS_CONTEXT_SUMMARY_MAX_CHARS",),
         "int",
+    ),
+    "orchestrator.control_plane_cache_enabled": (
+        ("RYO_ORCHESTRATOR_CONTROL_PLANE_CACHE_ENABLED",),
+        "bool",
+    ),
+    "orchestrator.control_plane_cache_ttl_seconds": (
+        ("RYO_ORCHESTRATOR_CONTROL_PLANE_CACHE_TTL_SECONDS",),
+        "float",
     ),
     "temporal.enabled": (("RYO_TEMPORAL_CONTEXT_ENABLED",), "bool"),
     "temporal.default_timezone": (("RYO_TEMPORAL_DEFAULT_TIMEZONE",), "str"),
