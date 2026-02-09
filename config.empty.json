@@ -147,6 +147,29 @@
         "curlRequest"
       ]
     },
+    "personality": {
+      "enabled": true,
+      "adaptive_enabled": true,
+      "narrative_enabled": true,
+      "max_injection_chars": 900,
+      "narrative_summary_max_chars": 360,
+      "narrative_source_history_limit": 8,
+      "rollup_turn_threshold": 8,
+      "rollup_char_threshold": 2200,
+      "max_active_chunks": 6,
+      "adaptation_min_turns": 4,
+      "adaptation_max_step_per_window": 1,
+      "adaptation_window_turns": 4,
+      "verbosity_short_token_threshold": 10,
+      "verbosity_long_token_threshold": 36,
+      "default_tone": "friendly",
+      "default_verbosity": "brief",
+      "default_reading_level": "moderate",
+      "default_format": "plain",
+      "default_humor": "low",
+      "default_emoji": "off",
+      "default_language": "en"
+    },
     "security": {
       "password_min_length": 12
     },

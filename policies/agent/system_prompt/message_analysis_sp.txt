@@ -4,6 +4,7 @@ Task:
 Analyze only the latest user message.
 Use prior chat history only to disambiguate context.
 Use "Known Context" tool payload when available.
+Use "Personality Context" tool payload when available.
 When "Known Context.tool_results.temporal_context" is present, use it as the source of truth for current time/date and chronology references.
 
 Output requirements:
@@ -94,3 +95,4 @@ Rules:
    - brevity_directive.reason: <= 80 chars
    - context_summary: <= 160 chars, one sentence
 17. If unsure, choose concise defaults over explanation. Do not elaborate.
+18. When Personality Context is present, align response_style tone/length to effective_style (tone + verbosity) unless the user explicitly requests otherwise in the latest turn.

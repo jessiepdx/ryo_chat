@@ -283,6 +283,13 @@ _ORCHESTRATION_STAGE_LABELS = {
     "orchestrator.fast_path_blocked": "Fast path blocked",
     "context.workspace": "Workspace context",
     "context.built": "Context built",
+    "persona.load": "Persona loaded",
+    "persona.directive": "Persona directive",
+    "persona.inject": "Persona injected",
+    "persona.style": "Persona style",
+    "persona.adapt": "Persona adapted",
+    "persona.rollup": "Narrative rollup",
+    "persona.error": "Persona warning",
     "analysis.start": "Analyzing message",
     "analysis.progress": "Analyzing message",
     "analysis.complete": "Analysis complete",
@@ -311,6 +318,10 @@ _MINIMAL_VISIBLE_STAGES = {
     "orchestrator.fast_path",
     "orchestrator.fast_path_blocked",
     "context.workspace",
+    "persona.load",
+    "persona.directive",
+    "persona.inject",
+    "persona.style",
     "analysis.start",
     "analysis.progress",
     "analysis.complete",
@@ -325,6 +336,9 @@ _MINIMAL_VISIBLE_STAGES = {
     "response.progress",
     "response.timeout",
     "response.complete",
+    "persona.adapt",
+    "persona.rollup",
+    "persona.error",
 }
 _NORMAL_HIDDEN_STAGES = {
     "analysis.payload",
@@ -821,6 +835,43 @@ class TelegramStageStatus:
 
         if stage == "analysis.start":
             return "Running message analysis and model routing."
+
+        if stage == "persona.load":
+            chunk_count = meta.get("chunk_count")
+            if isinstance(chunk_count, int):
+                return f"Loaded personality profile and {chunk_count} narrative chunk(s)."
+            return "Loaded personality profile and narrative context."
+
+        if stage == "persona.inject":
+            return "Injected style and narrative guidance into downstream stages."
+
+        if stage == "persona.directive":
+            return "Applied explicit per-user personality directive update."
+
+        if stage == "persona.style":
+            tone = str(meta.get("tone") or "").strip()
+            verbosity = str(meta.get("verbosity") or "").strip()
+            if tone and verbosity:
+                return f"Applied style targets (tone={tone}, verbosity={verbosity})."
+            return "Applied personality style targets for this response."
+
+        if stage == "persona.adapt":
+            changed_fields = meta.get("changed_fields")
+            if isinstance(changed_fields, list) and changed_fields:
+                return self._truncate_text(
+                    "Adaptive profile updated: " + ", ".join(str(item) for item in changed_fields[:4]),
+                    320,
+                )
+            return "Updated adaptation signal state for this user."
+
+        if stage == "persona.rollup":
+            chunk_index = meta.get("chunk_index")
+            if isinstance(chunk_index, int) and chunk_index > 0:
+                return f"Narrative continuity rolled up into chunk #{chunk_index}."
+            return "Narrative continuity rolled up into compact memory."
+
+        if stage == "persona.error":
+            return "Personality subsystem degraded this turn; using fallback style behavior."
 
         if stage == "analysis.progress":
             chunks = meta.get("chunks")

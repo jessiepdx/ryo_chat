@@ -37,6 +37,10 @@ from hypermindlabs.history_recall import (
     ProgressiveHistoryExplorerConfig,
 )
 from hypermindlabs.model_router import ModelExecutionError, ModelRouter
+from hypermindlabs.personality_engine import PersonalityEngine, PersonalityRuntimeConfig
+from hypermindlabs.personality_injector import PersonalityInjector
+from hypermindlabs.personality_rollup import NarrativeRollupEngine
+from hypermindlabs.personality_store import PersonalityStoreManager
 from hypermindlabs.policy_manager import PolicyManager, PolicyValidationError
 from hypermindlabs.temporal_context import (
     build_temporal_context,
@@ -85,6 +89,10 @@ knowledge = KnowledgeManager()
 members = MemberManager()
 usage = UsageManager()
 collaboration = CollaborationWorkspaceManager()
+personalityStore = PersonalityStoreManager()
+personalityEngine = PersonalityEngine()
+personalityInjector = PersonalityInjector()
+narrativeRollup = NarrativeRollupEngine()
 
 # Enable logging
 logging.basicConfig(
@@ -630,6 +638,7 @@ def _known_context_stage_preview(tool_results: dict[str, Any] | None) -> dict[st
             "routing_note": _coerce_dict(payload.get("memory_circuit")).get("routing_note"),
         },
         "workspace_context": _workspace_context_stage_preview(payload.get("workspace_context")),
+        "personality_context": _personality_context_stage_preview(payload.get("personality_context")),
     }
     return preview
 
@@ -743,6 +752,31 @@ def _workspace_context_stage_preview(workspace_context: dict[str, Any] | None) -
         "resume_recommended": _as_bool(payload.get("resume_recommended"), bool(active_preview)),
         "active_processes": active_preview,
         "recent_outbox": outbox_preview,
+    }
+
+
+def _personality_runtime_config() -> PersonalityRuntimeConfig:
+    payload = _coerce_dict(_runtime_value("personality", {}))
+    return PersonalityRuntimeConfig.from_runtime(payload)
+
+
+def _personality_context_stage_preview(payload: dict[str, Any] | None) -> dict[str, Any]:
+    injection = _coerce_dict(payload)
+    style = _coerce_dict(injection.get("effective_style"))
+    return {
+        "schema": _as_text(injection.get("schema"), "ryo.personality_injection.v1"),
+        "member_id": injection.get("member_id"),
+        "effective_style": {
+            "tone": style.get("tone"),
+            "verbosity": style.get("verbosity"),
+            "reading_level": style.get("reading_level"),
+            "format": style.get("format"),
+        },
+        "adaptive": _coerce_dict(injection.get("adaptive")),
+        "narrative_summary_excerpt": _truncate_for_prompt(injection.get("narrative_summary"), 180),
+        "directive_rule_count": len(_as_string_list(injection.get("directive_rules"))),
+        "behavior_rule_count": len(_as_string_list(injection.get("behavior_rules"))),
+        "hard_constraint_count": len(_as_string_list(injection.get("hard_constraints"))),
     }
 
 
@@ -2474,6 +2508,19 @@ class ConversationOrchestrator:
         analysisBypassSmallTalk = _runtime_bool("orchestrator.analysis_bypass_small_talk_enabled", False)
         autoExpandToolStage = _runtime_bool("orchestrator.auto_expand_tool_stage_enabled", True)
         autoExpandMaxRounds = max(0, _runtime_int("orchestrator.auto_expand_max_rounds", 1))
+        personalityRuntime = _personality_runtime_config()
+        personalityEnabled = (
+            personalityRuntime.enabled
+            and not self._transientSession
+            and isinstance(self._memberID, int)
+            and self._memberID > 0
+        )
+        personalityProfile: dict[str, Any] = {}
+        personalityPromptPayload: dict[str, Any] = {}
+        personalityPromptMessage: dict[str, Any] = {}
+        personalityStagePreview: dict[str, Any] = {}
+        personalityAdaptationState: dict[str, Any] = {}
+        personalityRollupState: dict[str, Any] = {}
 
         # Create all the agent calls in the flow as methods to call, each handles the messages passed to the actual agent
         # Build and append machine-readable known context for all downstream stages.
@@ -2536,6 +2583,84 @@ class ConversationOrchestrator:
                 json=workspaceContextPreview,
             )
 
+        if personalityEnabled:
+            try:
+                latestNarrativeChunk = personalityStore.get_latest_narrative_chunk(self._memberID)
+                narrativeSummary = (
+                    _as_text(_coerce_dict(latestNarrativeChunk).get("summary_text"))
+                    if isinstance(latestNarrativeChunk, dict)
+                    else ""
+                )
+                narrativeChunkCount = _safe_int(
+                    _coerce_dict(latestNarrativeChunk).get("chunk_index"),
+                    0,
+                )
+                storedProfile = personalityStore.get_profile(self._memberID)
+                personalityProfile = personalityEngine.resolve_profile(
+                    member_id=self._memberID,
+                    stored_profile=storedProfile,
+                    runtime_config=personalityRuntime,
+                    latest_narrative_summary=narrativeSummary,
+                    narrative_chunk_count=narrativeChunkCount,
+                    last_chunk_index=narrativeChunkCount,
+                )
+                explicitDirective = _coerce_dict(self._context.get("personality_directive"))
+                if explicitDirective:
+                    personalityProfile = personalityEngine.apply_explicit_directive(
+                        profile=personalityProfile,
+                        directive=explicitDirective,
+                        runtime_config=personalityRuntime,
+                    )
+                    persistedDirectiveProfile = personalityStore.upsert_profile_payload(
+                        self._memberID,
+                        personalityProfile,
+                    )
+                    personalityStore.append_event(
+                        member_id=self._memberID,
+                        event_type="explicit_update",
+                        before_json={"explicit": _coerce_dict(_coerce_dict(storedProfile).get("explicit_directive_json"))},
+                        after_json={"explicit": _coerce_dict(_coerce_dict(personalityProfile).get("explicit"))},
+                        reason_code="context_personality_directive",
+                        reason_detail="Explicit personality directive applied from orchestrator context.",
+                    )
+                    await self._emit_stage(
+                        "persona.directive",
+                        "Applied explicit personality directive update for this user.",
+                        profile_version=_safe_int(_coerce_dict(persistedDirectiveProfile).get("profile_version"), 0),
+                        json={"directive": explicitDirective},
+                    )
+                personalityPromptPayload = personalityInjector.build_payload(
+                    profile=personalityProfile,
+                    narrative_summary=narrativeSummary,
+                    max_injection_chars=personalityRuntime.max_injection_chars,
+                )
+                personalityStagePreview = _personality_context_stage_preview(personalityPromptPayload)
+                personalityPromptMessage = {
+                    "tool_name": "Personality Context",
+                    "tool_results": personalityPromptPayload,
+                }
+                await self._emit_stage(
+                    "persona.load",
+                    "Loaded user personality profile and narrative continuity.",
+                    profile_version=_safe_int(_coerce_dict(storedProfile).get("profile_version"), 0),
+                    chunk_count=_safe_int(
+                        _coerce_dict(_coerce_dict(personalityProfile).get("narrative")).get("chunk_count"),
+                        0,
+                    ),
+                    json=personalityStagePreview,
+                )
+            except Exception as error:  # noqa: BLE001
+                personalityEnabled = False
+                personalityProfile = {}
+                personalityPromptPayload = {}
+                personalityPromptMessage = {}
+                personalityStagePreview = {}
+                await self._emit_stage(
+                    "persona.error",
+                    "Personality profile load failed; falling back to default response style.",
+                    error=str(error),
+                )
+
         knownContext = {
             "tool_name": "Known Context",
             "tool_results": {
@@ -2549,6 +2674,7 @@ class ConversationOrchestrator:
                 "memory_circuit": memoryCircuit,
                 "workspace_context": workspaceContext,
                 "image_context": _coerce_dict(self._imageContext),
+                "personality_context": personalityStagePreview,
             }
         }
         knownContextPreview = _known_context_stage_preview(knownContext.get("tool_results"))
@@ -2562,6 +2688,15 @@ class ConversationOrchestrator:
             json=knownContextPreview,
         )
         self._messages.append(Message(role="tool", content=json.dumps(knownContextPrompt, ensure_ascii=False)))
+        if personalityEnabled and personalityPromptMessage:
+            self._messages.append(
+                Message(role="tool", content=json.dumps(personalityPromptMessage, ensure_ascii=False))
+            )
+            await self._emit_stage(
+                "persona.inject",
+                "Injected personality and narrative guidance for downstream stages.",
+                json=personalityStagePreview,
+            )
 
         def _recent_dialogue_messages(limit: int) -> list[Message]:
             dialogue = [
@@ -2663,6 +2798,10 @@ class ConversationOrchestrator:
 
             analysisMessages = _recent_dialogue_messages(analysisHistoryLimit)
             analysisMessages.append(Message(role="tool", content=json.dumps(knownContextPrompt, ensure_ascii=False)))
+            if personalityEnabled and personalityPromptMessage:
+                analysisMessages.append(
+                    Message(role="tool", content=json.dumps(personalityPromptMessage, ensure_ascii=False))
+                )
 
             await self._emit_stage("analysis.start", "Running message analysis policy and model selection.")
             self._analysisAgent = MessageAnalysisAgent(analysisMessages, options=self._options)
@@ -2804,6 +2943,20 @@ class ConversationOrchestrator:
                     process_id=processDirective.get("process_id"),
                     json=processDirective,
                 )
+
+        if personalityEnabled and personalityProfile:
+            normalizedAnalysis = personalityEngine.apply_analysis_style(
+                analysis_payload=normalizedAnalysis,
+                profile=personalityProfile,
+            )
+            effectiveStyle = _coerce_dict(_coerce_dict(personalityProfile).get("effective"))
+            await self._emit_stage(
+                "persona.style",
+                "Applied personality style targets to response planning.",
+                tone=effectiveStyle.get("tone"),
+                verbosity=effectiveStyle.get("verbosity"),
+                reading_level=effectiveStyle.get("reading_level"),
+            )
 
         normalizedToolHints = [
             hint
@@ -2989,6 +3142,10 @@ class ConversationOrchestrator:
             toolHistoryLimit = max(2, _runtime_int("orchestrator.tool_history_limit", 6))
             stageMessages = _recent_dialogue_messages(toolHistoryLimit)
             stageMessages.append(Message(role="tool", content=json.dumps(knownContextPrompt, ensure_ascii=False)))
+            if personalityEnabled and personalityPromptMessage:
+                stageMessages.append(
+                    Message(role="tool", content=json.dumps(personalityPromptMessage, ensure_ascii=False))
+                )
             stageMessages.append(Message(role="tool", content=json.dumps(analysisMessagePayload, ensure_ascii=False)))
             if _safe_int(toolSuggestionPlan.get("suggestion_count"), 0) > 0:
                 stageMessages.append(Message(role="tool", content=json.dumps(toolSuggestionPayload, ensure_ascii=False)))
@@ -3115,6 +3272,10 @@ class ConversationOrchestrator:
         responseHistoryLimit = max(2, _runtime_int("orchestrator.response_history_limit", 10))
         responseMessages = _recent_dialogue_messages(responseHistoryLimit)
         responseMessages.append(Message(role="tool", content=json.dumps(knownContextPrompt, ensure_ascii=False)))
+        if personalityEnabled and personalityPromptMessage:
+            responseMessages.append(
+                Message(role="tool", content=json.dumps(personalityPromptMessage, ensure_ascii=False))
+            )
         responseMessages.append(Message(role="tool", content=json.dumps(analysisMessagePayload, ensure_ascii=False)))
         if memorySelectionPreview.get("selected_count", 0):
             responseMessages.append(Message(role="tool", content=json.dumps(memoryMessagePayload, ensure_ascii=False)))
@@ -3306,6 +3467,112 @@ class ConversationOrchestrator:
         assistantMessage = Message(role="assistant", content=sanitizedResponseMessage)
         # Add the final response to the overall chat history (role ASSISTANT)
         self._messages.append(assistantMessage)
+        if personalityEnabled and personalityProfile:
+            try:
+                adaptationResult = personalityEngine.adapt_after_turn(
+                    profile=personalityProfile,
+                    user_message=self._message,
+                    assistant_message=sanitizedResponseMessage,
+                    analysis_payload=normalizedAnalysis,
+                    runtime_config=personalityRuntime,
+                )
+                personalityProfile = _coerce_dict(adaptationResult.get("profile"))
+                persistedProfile = personalityStore.upsert_profile_payload(
+                    self._memberID,
+                    personalityProfile,
+                )
+                personalityAdaptationState = {
+                    "changed_fields": _coerce_list(adaptationResult.get("changed_fields")),
+                    "signals": _coerce_dict(adaptationResult.get("signals")),
+                    "reason_code": _as_text(adaptationResult.get("reason_code")),
+                    "reason_detail": _as_text(adaptationResult.get("reason_detail")),
+                    "profile_version": _safe_int(_coerce_dict(persistedProfile).get("profile_version"), 0),
+                }
+                personalityStore.append_event(
+                    member_id=self._memberID,
+                    event_type="adaptive_update",
+                    before_json=_coerce_dict(adaptationResult.get("before")),
+                    after_json=_coerce_dict(adaptationResult.get("after")),
+                    reason_code=_as_text(adaptationResult.get("reason_code")),
+                    reason_detail=_as_text(adaptationResult.get("reason_detail")),
+                )
+                await self._emit_stage(
+                    "persona.adapt",
+                    "Updated adaptive personality state from turn-level behavior signals.",
+                    changed_fields=personalityAdaptationState.get("changed_fields"),
+                    profile_version=personalityAdaptationState.get("profile_version"),
+                    json=personalityAdaptationState,
+                )
+
+                if personalityRuntime.narrative_enabled and narrativeRollup.should_rollup(
+                    profile=personalityProfile,
+                    turn_threshold=personalityRuntime.rollup_turn_threshold,
+                    char_threshold=personalityRuntime.rollup_char_threshold,
+                ):
+                    rollupResult = narrativeRollup.build_rollup(
+                        profile=personalityProfile,
+                        history_messages=self._shortHistory,
+                        user_message=self._message,
+                        assistant_message=sanitizedResponseMessage,
+                        analysis_payload=normalizedAnalysis,
+                        max_source_messages=personalityRuntime.narrative_source_history_limit,
+                        max_summary_chars=personalityRuntime.narrative_summary_max_chars,
+                    )
+                    chunkRecord = personalityStore.insert_narrative_chunk(
+                        member_id=self._memberID,
+                        chunk_index=_safe_int(rollupResult.get("chunk_index"), 1),
+                        summary_text=_as_text(rollupResult.get("summary_text")),
+                        summary_json=_coerce_dict(rollupResult.get("summary_json")),
+                        compression_ratio=_coerce_float(rollupResult.get("compression_ratio"), 1.0),
+                        source_turn_start_id=self._promptHistoryID,
+                        source_turn_end_id=self._responseHistoryID,
+                    )
+                    personalityProfile = narrativeRollup.apply_rollup_to_profile(
+                        profile=personalityProfile,
+                        rollup_result=rollupResult,
+                    )
+                    personalityStore.upsert_profile_payload(self._memberID, personalityProfile)
+                    personalityStore.append_event(
+                        member_id=self._memberID,
+                        event_type="rollup",
+                        before_json={"narrative": _coerce_dict(_coerce_dict(adaptationResult.get("before")).get("narrative"))},
+                        after_json={"narrative": _coerce_dict(_coerce_dict(personalityProfile).get("narrative"))},
+                        reason_code="narrative_rollup_threshold",
+                        reason_detail="Narrative rollup triggered from turn/char threshold.",
+                    )
+                    personalityRollupState = {
+                        "chunk_index": _safe_int(rollupResult.get("chunk_index"), 0),
+                        "compression_ratio": _coerce_float(rollupResult.get("compression_ratio"), 1.0),
+                        "summary_chars": len(_as_text(rollupResult.get("summary_text"))),
+                        "recorded_chunk_id": _safe_int(_coerce_dict(chunkRecord).get("chunk_id"), 0),
+                    }
+                    await self._emit_stage(
+                        "persona.rollup",
+                        "Rolled up narrative continuity into a compact profile chunk.",
+                        chunk_index=personalityRollupState.get("chunk_index"),
+                        compression_ratio=personalityRollupState.get("compression_ratio"),
+                        json=personalityRollupState,
+                    )
+            except Exception as error:  # noqa: BLE001
+                await self._emit_stage(
+                    "persona.error",
+                    "Personality adaptation failed; continuing without profile mutation.",
+                    error=str(error),
+                )
+        personalityRunPreview: dict[str, Any] = {}
+        if personalityEnabled and personalityProfile:
+            try:
+                latestNarrativeSummary = _as_text(
+                    _coerce_dict(_coerce_dict(personalityProfile).get("narrative")).get("active_summary")
+                )
+                latestInjection = personalityInjector.build_payload(
+                    profile=personalityProfile,
+                    narrative_summary=latestNarrativeSummary,
+                    max_injection_chars=personalityRuntime.max_injection_chars,
+                )
+                personalityRunPreview = _personality_context_stage_preview(latestInjection)
+            except Exception:  # noqa: BLE001
+                personalityRunPreview = _personality_context_stage_preview(personalityPromptPayload)
         self._runSummary = {
             "known_context": _coerce_dict(knownContext.get("tool_results")),
             "image_context": _coerce_dict(self._imageContext),
@@ -3323,6 +3590,12 @@ class ConversationOrchestrator:
             "response": {
                 "text": sanitizedResponseMessage,
                 "sanitized": bool(sanitizedResponseMessage != responseMessage),
+            },
+            "personality": {
+                "enabled": personalityEnabled,
+                "profile": personalityRunPreview,
+                "adaptation": _coerce_dict(personalityAdaptationState),
+                "rollup": _coerce_dict(personalityRollupState),
             },
             "chat_routing": _coerce_dict(getattr(self._chatConversationAgent, "routing", {})),
             "response_stats": responseStatsSummary,

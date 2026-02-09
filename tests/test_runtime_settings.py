@@ -119,6 +119,26 @@ class TestRuntimeSettings(unittest.TestCase):
         self.assertEqual(settings["retrieval"]["progressive_history_round_windows_hours"], ["6", "24", "72"])
         self.assertEqual(settings["retrieval"]["progressive_history_match_threshold"], 0.51)
 
+    def test_build_runtime_settings_supports_personality_overrides(self):
+        settings = build_runtime_settings(
+            config_data={
+                "runtime": {
+                    "personality": {
+                        "rollup_turn_threshold": 12,
+                        "default_tone": "professional",
+                    }
+                }
+            },
+            env_data={
+                "RYO_PERSONALITY_ENABLED": "false",
+                "RYO_PERSONALITY_DEFAULT_VERBOSITY": "detailed",
+            },
+        )
+        self.assertFalse(settings["personality"]["enabled"])
+        self.assertEqual(settings["personality"]["rollup_turn_threshold"], 12)
+        self.assertEqual(settings["personality"]["default_tone"], "professional")
+        self.assertEqual(settings["personality"]["default_verbosity"], "detailed")
+
     def test_build_runtime_settings_hydrates_from_public_community_requirements(self):
         config_data = {
             "runtime": {

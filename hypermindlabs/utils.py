@@ -123,6 +123,9 @@ STARTUP_CORE_MIGRATIONS: tuple[str, ...] = (
     "083_run_artifacts.sql",
     "084_agent_process_workspace.sql",
     "085_member_outbox.sql",
+    "086_member_personality_profile.sql",
+    "087_member_narrative_chunks.sql",
+    "088_member_personality_events.sql",
 )
 STARTUP_VECTOR_MIGRATIONS: tuple[str, ...] = (
     "011_create_vector_extension.sql",
