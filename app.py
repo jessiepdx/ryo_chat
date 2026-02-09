@@ -4234,7 +4234,13 @@ def _curses_route_config_workspace(
         policy_warning_count = 0
         policy_backup_names: list[str] = []
         if policy_updates:
-            policy_manager = PolicyManager(config_data=next_config)
+            policy_manager = PolicyManager(
+                inference_config=next_config.get("inference"),
+                endpoint_override=resolve_ollama_host(
+                    next_config,
+                    runtime_settings=build_runtime_settings(config_data=next_config),
+                ),
+            )
             policy_failures: list[str] = []
             for policy_name, allowed_models in policy_updates.items():
                 save_result = policy_manager.save_policy(
