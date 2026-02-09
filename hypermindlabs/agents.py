@@ -2464,10 +2464,11 @@ class ConversationOrchestrator:
         brevityMode = _normalize_brevity_mode(brevityDirective.get("mode"), "standard")
         brevityReason = _as_text(brevityDirective.get("reason"), "analysis_reasoned_standard")
         fastPathEnabled = _runtime_bool("orchestrator.fast_path_small_talk_enabled", True)
+        fastPathMaxChars = max(1, _runtime_int("orchestrator.fast_path_small_talk_max_chars", 96))
         messageCharCount = len(_as_text(self._message))
         analysisNeedsTools = _as_bool(normalizedAnalysis.get("needs_tools"), fallback=False)
         analysisToolHints = [hint for hint in _as_string_list(normalizedAnalysis.get("tool_hints")) if hint != "skipTools"]
-        if autoExpandToolStage and not analysisNeedsTools and analysisToolHints and not smallTalkTurn:
+        if autoExpandToolStage and not analysisNeedsTools and analysisToolHints:
             analysisNeedsTools = True
             normalizedAnalysis["needs_tools"] = True
             await self._emit_stage(
@@ -2478,12 +2479,41 @@ class ConversationOrchestrator:
                     "hints": analysisToolHints,
                 },
             )
+        suggestionCount = _safe_int(toolSuggestionPlan.get("suggestion_count"), 0)
+        processDirectiveForFastPath = _coerce_dict(normalizedAnalysis.get("process_directive"))
+        processActionForFastPath = _as_text(processDirectiveForFastPath.get("action"), "none")
+        fastPathBlockedReasons: list[str] = []
+        if messageCharCount > fastPathMaxChars:
+            fastPathBlockedReasons.append("message_too_long")
+        if suggestionCount > 0:
+            fastPathBlockedReasons.append("tool_suggestions_present")
+        if processActionForFastPath != "none":
+            fastPathBlockedReasons.append("process_action_present")
+        if analysisNeedsTools:
+            fastPathBlockedReasons.append("analysis_requires_tools")
+        if preflightToolRequested:
+            fastPathBlockedReasons.append("preflight_tool_intent")
         fastPathActive = (
             fastPathEnabled
             and brevityMode == "brief_social"
             and not analysisNeedsTools
             and not preflightToolRequested
+            and messageCharCount <= fastPathMaxChars
+            and suggestionCount <= 0
+            and processActionForFastPath == "none"
         )
+        if fastPathEnabled and not fastPathActive and fastPathBlockedReasons:
+            await self._emit_stage(
+                "orchestrator.fast_path_blocked",
+                "Fast-path disabled for this turn due to tool/process signals.",
+                json={
+                    "reasons": fastPathBlockedReasons,
+                    "message_chars": messageCharCount,
+                    "max_chars": fastPathMaxChars,
+                    "suggestion_count": suggestionCount,
+                    "process_action": processActionForFastPath,
+                },
+            )
 
         toolResponses: list[dict[str, Any]] = []
         toolSummary: dict[str, Any] = {}

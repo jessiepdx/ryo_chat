@@ -281,6 +281,7 @@ def _guard_message_handler(handler):
 _ORCHESTRATION_STAGE_LABELS = {
     "orchestrator.start": "Accepted request",
     "orchestrator.fast_path": "Fast path",
+    "orchestrator.fast_path_blocked": "Fast path blocked",
     "context.workspace": "Workspace context",
     "context.built": "Context built",
     "analysis.start": "Analyzing message",
@@ -309,6 +310,7 @@ _TELEGRAM_FALLBACK_FINAL_REPLY = "I could not generate a complete reply this tur
 _MINIMAL_VISIBLE_STAGES = {
     "orchestrator.start",
     "orchestrator.fast_path",
+    "orchestrator.fast_path_blocked",
     "context.workspace",
     "analysis.start",
     "analysis.progress",
