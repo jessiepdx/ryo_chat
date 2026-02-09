@@ -29,6 +29,14 @@ Output requirements:
     "reason": "string"
   },
   "risk_flags": ["none"],
+  "knowledge_state": {
+    "classification": "known|probably_unknown|unknown",
+    "confidence": "low|medium|high",
+    "unknown_score": 0.0,
+    "certainty_score": 1.0,
+    "discovery_required": false,
+    "reason": "string"
+  },
   "topic_transition": {
     "switched": false,
     "from_topic": "string",
@@ -60,6 +68,8 @@ Rules:
 3. Keep "context_summary" short and factual.
 4. Do not include internal reasoning, chain-of-thought, or references to future agents/stages.
 5. If uncertain, still return valid JSON using conservative defaults.
+5a. If the user asks for factual details that are not clearly grounded in Known Context or current turn context, set knowledge_state.classification to probably_unknown or unknown and set discovery_required=true.
+5b. When knowledge_state.classification is probably_unknown or unknown, set needs_tools=true and include discovery tool_hints (braveSearch first, curlRequest when URL fetch is useful).
 6. If user asks for time/date/day/recency, capture that need explicitly in "intent" and "context_summary" using temporal_context values.
 7. If Known Context includes "topic_transition.switched=true", set "topic" to the new topic and set memory_directive.mode="focus_new_topic".
 8. When topic_transition indicates a switch, suppress stale-topic carryover; allow history search only if user explicitly requests recall.
@@ -78,6 +88,7 @@ Rules:
    - tool_hints: <= 3 items
    - process_directive.reason: <= 120 chars
    - risk_flags: <= 2 items
+   - knowledge_state.reason: <= 120 chars
    - topic_transition.summary: <= 120 chars
    - memory_directive.reason: <= 120 chars
    - brevity_directive.reason: <= 80 chars

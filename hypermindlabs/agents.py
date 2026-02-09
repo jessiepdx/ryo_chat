@@ -1378,15 +1378,181 @@ def _select_memory_recall(
     }
 
 
+def _normalize_knowledge_classification(value: Any, fallback: str = "known") -> str:
+    label = _as_text(value, fallback).strip().lower()
+    if label in {"unknown", "probably_unknown", "known"}:
+        return label
+    if label in {"likely_unknown", "uncertain", "unclear", "partially_unknown"}:
+        return "probably_unknown"
+    return fallback if fallback in {"unknown", "probably_unknown", "known"} else "known"
+
+
+def _analysis_question_form_score(message_text: str) -> float:
+    text = _as_text(message_text).strip()
+    if not text:
+        return 0.0
+    has_question = "?" in text
+    token_count = len(re.findall(r"[A-Za-z0-9']+", text))
+    if has_question and token_count >= 4:
+        return 1.0
+    if has_question:
+        return 0.7
+    if token_count >= 10:
+        return 0.35
+    return 0.0
+
+
+def _derive_knowledge_state(
+    *,
+    payload: dict[str, Any],
+    current_message: str,
+    process_action: str,
+) -> dict[str, Any]:
+    raw_state = _coerce_dict(payload.get("knowledge_state"))
+    provided_class = _normalize_knowledge_classification(raw_state.get("classification"), "")
+    if provided_class not in {"known", "probably_unknown", "unknown"}:
+        provided_class = ""
+    provided_confidence = _as_text(raw_state.get("confidence"), "").strip().lower()
+    if provided_confidence not in {"low", "medium", "high"}:
+        provided_confidence = ""
+
+    unknown_threshold = max(
+        0.1,
+        min(0.95, _runtime_float("orchestrator.discovery_unknown_threshold", 0.67)),
+    )
+    probably_unknown_threshold = max(
+        0.05,
+        min(unknown_threshold - 0.05, _runtime_float("orchestrator.discovery_probably_unknown_threshold", 0.4)),
+    )
+
+    needs_tools = _as_bool(payload.get("needs_tools"), False)
+    tool_hints = [hint for hint in _as_string_list(payload.get("tool_hints")) if hint and hint != "skipTools"]
+    risk_flags = [flag.lower() for flag in _as_string_list(payload.get("risk_flags"))]
+    question_form_score = _analysis_question_form_score(current_message)
+
+    weights: dict[str, float] = {}
+
+    def add_weight(name: str, score: float) -> None:
+        if score <= 0:
+            return
+        weights[name] = round(score, 4)
+
+    if process_action == "none" and needs_tools:
+        add_weight("analysis_needs_tools", 0.46)
+    if process_action == "none" and tool_hints:
+        add_weight("tool_hints", min(0.28, 0.09 * len(tool_hints)))
+    if "uncertain" in risk_flags:
+        add_weight("risk_uncertain", 0.32)
+    if "none" not in risk_flags and risk_flags:
+        add_weight("risk_signal", 0.16)
+    if process_action == "none" and question_form_score > 0:
+        add_weight("question_form", 0.1 * question_form_score)
+
+    unknown_score = _coerce_float(raw_state.get("unknown_score"), -1.0)
+    certainty_score = _coerce_float(raw_state.get("certainty_score"), -1.0)
+    heuristic_score = max(0.0, min(1.0, sum(weights.values())))
+
+    if unknown_score < 0.0 or unknown_score > 1.0:
+        unknown_score = heuristic_score
+    elif heuristic_score > 0:
+        # Blend model-provided score with deterministic safety signals.
+        unknown_score = max(0.0, min(1.0, (unknown_score * 0.75) + (heuristic_score * 0.25)))
+
+    if provided_class:
+        class_baseline = {
+            "known": 0.2,
+            "probably_unknown": max(probably_unknown_threshold + 0.02, 0.5),
+            "unknown": max(unknown_threshold + 0.02, 0.82),
+        }.get(provided_class, 0.2)
+        unknown_score = max(0.0, min(1.0, (unknown_score * 0.8) + (class_baseline * 0.2)))
+
+    if certainty_score < 0.0 or certainty_score > 1.0:
+        certainty_score = max(0.0, min(1.0, 1.0 - unknown_score))
+    else:
+        certainty_score = max(0.0, min(1.0, (certainty_score * 0.8) + ((1.0 - unknown_score) * 0.2)))
+
+    if unknown_score >= unknown_threshold:
+        derived_class = "unknown"
+    elif unknown_score >= probably_unknown_threshold:
+        derived_class = "probably_unknown"
+    else:
+        derived_class = "known"
+
+    classification = provided_class or derived_class
+    if provided_class == "known" and derived_class in {"probably_unknown", "unknown"}:
+        classification = derived_class
+    elif provided_class == "probably_unknown" and derived_class == "unknown":
+        classification = "unknown"
+
+    discovery_force = _runtime_bool("orchestrator.discovery_force_tools_on_uncertainty", True)
+    discovery_required = _as_bool(
+        raw_state.get("discovery_required"),
+        fallback=(classification != "known"),
+    )
+    if discovery_force and classification in {"probably_unknown", "unknown"}:
+        discovery_required = True
+
+    reason = _as_text(raw_state.get("reason"))
+    if not reason:
+        if not weights:
+            reason = "No strong uncertainty signals; proceed with direct response unless tools are explicitly requested."
+        else:
+            top_signals = sorted(weights.items(), key=lambda item: item[1], reverse=True)[:2]
+            label_map = {
+                "analysis_needs_tools": "analysis marked tool usage",
+                "tool_hints": "tool hints indicate external lookup",
+                "risk_uncertain": "analysis flagged uncertainty",
+                "risk_signal": "risk flags require verification",
+                "question_form": "question structure suggests factual lookup",
+            }
+            reason = " + ".join(label_map.get(name, name) for name, _ in top_signals)
+            reason = f"Discovery confidence derived from: {reason}."
+    reason = _truncate_for_prompt(reason, 180)
+
+    confidence = provided_confidence
+    if not confidence:
+        if classification == "known":
+            confidence = "high" if unknown_score <= (probably_unknown_threshold * 0.55) else "medium"
+        elif classification == "unknown":
+            confidence = "high" if unknown_score >= min(1.0, unknown_threshold + 0.12) else "medium"
+        else:
+            mid_point = (unknown_threshold + probably_unknown_threshold) / 2.0
+            confidence = "high" if abs(unknown_score - mid_point) >= 0.14 else "medium"
+    if confidence not in {"low", "medium", "high"}:
+        confidence = "medium"
+
+    return {
+        "classification": classification,
+        "confidence": confidence,
+        "unknown_score": round(max(0.0, min(1.0, unknown_score)), 4),
+        "certainty_score": round(max(0.0, min(1.0, certainty_score)), 4),
+        "discovery_required": bool(discovery_required),
+        "reason": reason,
+        "weights": weights,
+    }
+
+
 def _normalize_analysis_payload(
     raw_analysis_text: str,
     known_context: dict[str, Any] | None = None,
+    current_message: str | None = None,
 ) -> dict[str, Any]:
     parsed = _parse_json_like(raw_analysis_text)
     payload = parsed if isinstance(parsed, dict) else {}
     tool_results = payload.get("tool_results")
     if isinstance(tool_results, dict):
         payload = tool_results
+    if _as_text(payload.get("analysis")).lower() == "unavailable":
+        payload.setdefault("risk_flags", ["uncertain"])
+    if not any(
+        key in payload
+        for key in ("topic", "intent", "needs_tools", "tool_hints", "process_directive", "knowledge_state")
+    ):
+        payload.setdefault("risk_flags", ["uncertain"])
+        payload.setdefault(
+            "context_summary",
+            "Analysis output unavailable; defaulting to conservative discovery posture.",
+        )
 
     context_data = known_context if isinstance(known_context, dict) else {}
     context_topic_transition = _coerce_dict(context_data.get("topic_transition"))
@@ -1530,11 +1696,52 @@ def _normalize_analysis_payload(
     for hinted_tool in process_action_hints.get(process_action, []):
         if hinted_tool in _ALLOWED_TOOL_HINTS and hinted_tool not in tool_hints:
             tool_hints.append(hinted_tool)
+
+    risk_flags = _as_string_list(payload.get("risk_flags")) or ["none"]
+    needs_tools = _as_bool(payload.get("needs_tools"), fallback=False)
+    if process_action != "none":
+        needs_tools = True
+
+    normalized_payload_for_knowledge = {
+        "needs_tools": needs_tools,
+        "tool_hints": list(tool_hints),
+        "risk_flags": list(risk_flags),
+        "process_directive": {"action": process_action},
+        "knowledge_state": _coerce_dict(payload.get("knowledge_state")),
+    }
+    knowledge_state = _derive_knowledge_state(
+        payload=normalized_payload_for_knowledge,
+        current_message=_as_text(current_message, ""),
+        process_action=process_action,
+    )
+    discovery_layer_enabled = _runtime_bool("orchestrator.discovery_layer_enabled", True)
+    discovery_required = _as_bool(
+        knowledge_state.get("discovery_required"),
+        fallback=knowledge_state.get("classification") in {"probably_unknown", "unknown"},
+    )
+    if not discovery_layer_enabled:
+        discovery_required = False
+        knowledge_state["discovery_required"] = False
+    if discovery_required:
+        needs_tools = True
+        default_discovery_hints = [
+            hint
+            for hint in _as_string_list(
+                _runtime_value(
+                    "orchestrator.discovery_default_tool_hints",
+                    ["braveSearch", "curlRequest"],
+                )
+            )
+            if hint in _ALLOWED_TOOL_HINTS and hint != "skipTools"
+        ]
+        for hinted_tool in default_discovery_hints:
+            if hinted_tool not in tool_hints:
+                tool_hints.append(hinted_tool)
+
     max_hints = max(1, min(8, _runtime_int("orchestrator.analysis_tool_hints_max", 3)))
     if len(tool_hints) > max_hints:
         tool_hints = tool_hints[:max_hints]
 
-    risk_flags = _as_string_list(payload.get("risk_flags")) or ["none"]
     topic = _as_text(payload.get("topic"), transition_to_topic or "general")
     if transition_switched and transition_to_topic:
         topic = transition_to_topic
@@ -1562,10 +1769,6 @@ def _normalize_analysis_payload(
         "analysis_reasoned_briefness" if brevity_mode == "brief_social" else "analysis_reasoned_standard",
     )
 
-    needs_tools = _as_bool(payload.get("needs_tools"), fallback=False)
-    if process_action != "none":
-        needs_tools = True
-
     return {
         "topic": topic,
         "intent": intent,
@@ -1573,6 +1776,7 @@ def _normalize_analysis_payload(
         "tool_hints": tool_hints,
         "process_directive": process_directive,
         "risk_flags": risk_flags,
+        "knowledge_state": knowledge_state,
         "topic_transition": {
             "switched": transition_switched,
             "from_topic": transition_from_topic,
@@ -1760,6 +1964,14 @@ def _tool_suggestion_plan(
     needs_tools = _as_bool(payload.get("needs_tools"), False)
     process_directive = _coerce_dict(payload.get("process_directive"))
     process_action = _as_text(process_directive.get("action"), "none")
+    knowledge_state = _coerce_dict(payload.get("knowledge_state"))
+    knowledge_class = _normalize_knowledge_classification(knowledge_state.get("classification"), "known")
+    discovery_required = _as_bool(
+        knowledge_state.get("discovery_required"),
+        fallback=knowledge_class in {"probably_unknown", "unknown"},
+    )
+    if discovery_required:
+        needs_tools = True
     first_url = _extract_first_url(current_message)
 
     suggestions: list[dict[str, Any]] = []
@@ -1791,6 +2003,25 @@ def _tool_suggestion_plan(
     }
     for idx, (tool_name, reason) in enumerate(process_action_map.get(process_action, []), start=1):
         add_suggestion(tool_name, reason, idx)
+
+    if discovery_required and process_action == "none":
+        add_suggestion(
+            "braveSearch",
+            "Knowledge confidence is uncertain; discover grounded external sources before replying.",
+            1,
+        )
+        if first_url:
+            add_suggestion(
+                "curlRequest",
+                "A direct URL is present; fetch it to verify concrete details.",
+                2,
+            )
+        else:
+            add_suggestion(
+                "curlRequest",
+                "Follow search discoveries with direct URL fetch for factual validation.",
+                3,
+            )
 
     for idx, hint in enumerate(hints, start=1):
         if hint == "braveSearch":
@@ -1852,6 +2083,10 @@ def _tool_suggestion_plan(
     return {
         "needs_tools": needs_tools,
         "process_action": process_action,
+        "knowledge_state": {
+            "classification": knowledge_class,
+            "discovery_required": discovery_required,
+        },
         "suggested_tools": suggestions[:6],
         "suggestion_count": len(suggestions[:6]),
         "has_direct_url": bool(first_url),
@@ -2222,6 +2457,15 @@ class ConversationOrchestrator:
                     "reason": "analysis_bypass_small_talk",
                 },
                 "risk_flags": ["none"],
+                "knowledge_state": {
+                    "classification": "known",
+                    "confidence": "high",
+                    "unknown_score": 0.05,
+                    "certainty_score": 0.95,
+                    "discovery_required": False,
+                    "reason": "Social brevity turn; no discovery needed.",
+                    "weights": {},
+                },
                 "topic_transition": _coerce_dict(topicTransition),
                 "memory_directive": {
                     "mode": "lightweight_social",
@@ -2389,6 +2633,7 @@ class ConversationOrchestrator:
             normalizedAnalysis = _normalize_analysis_payload(
                 analysisResponseMessage if analysisDoneSeen else "",
                 knownContext.get("tool_results"),
+                current_message=self._message,
             )
             await self._emit_stage(
                 "analysis.payload",
@@ -2416,6 +2661,43 @@ class ConversationOrchestrator:
                 normalizedToolHints.append(hint)
         if normalizedToolHints:
             normalizedAnalysis["tool_hints"] = normalizedToolHints
+
+        discoveryState = _coerce_dict(normalizedAnalysis.get("knowledge_state"))
+        discoveryClassification = _normalize_knowledge_classification(
+            discoveryState.get("classification"),
+            "known",
+        )
+        discoveryRequired = _as_bool(
+            discoveryState.get("discovery_required"),
+            fallback=discoveryClassification in {"probably_unknown", "unknown"},
+        )
+        if _runtime_bool("orchestrator.discovery_layer_enabled", True):
+            await self._emit_stage(
+                "discovery.state",
+                "Epistemic confidence state computed for discovery routing.",
+                classification=discoveryClassification,
+                unknown_score=discoveryState.get("unknown_score"),
+                certainty_score=discoveryState.get("certainty_score"),
+                discovery_required=discoveryRequired,
+                json=discoveryState,
+            )
+
+        if discoveryRequired and not _as_bool(normalizedAnalysis.get("needs_tools"), False):
+            normalizedAnalysis["needs_tools"] = True
+            normalizedAnalysis["brevity_directive"] = {
+                "mode": "standard",
+                "reason": "knowledge_uncertainty_requires_discovery",
+            }
+            await self._emit_stage(
+                "orchestrator.expand",
+                "Escalating to discovery tools due to uncertain/unknown knowledge state.",
+                json={
+                    "reason": "knowledge_state_requires_discovery",
+                    "classification": discoveryClassification,
+                    "unknown_score": discoveryState.get("unknown_score"),
+                    "hints": normalizedToolHints,
+                },
+            )
 
         if preflightToolRequested and not _as_bool(normalizedAnalysis.get("needs_tools"), False):
             normalizedAnalysis["needs_tools"] = True
@@ -2499,6 +2781,15 @@ class ConversationOrchestrator:
         suggestionCount = _safe_int(toolSuggestionPlan.get("suggestion_count"), 0)
         processDirectiveForFastPath = _coerce_dict(normalizedAnalysis.get("process_directive"))
         processActionForFastPath = _as_text(processDirectiveForFastPath.get("action"), "none")
+        knowledgeStateForFastPath = _coerce_dict(normalizedAnalysis.get("knowledge_state"))
+        discoveryRequiredForFastPath = _as_bool(
+            knowledgeStateForFastPath.get("discovery_required"),
+            fallback=_normalize_knowledge_classification(
+                knowledgeStateForFastPath.get("classification"),
+                "known",
+            )
+            in {"probably_unknown", "unknown"},
+        )
         fastPathBlockedReasons: list[str] = []
         if messageCharCount > fastPathMaxChars:
             fastPathBlockedReasons.append("message_too_long")
@@ -2508,6 +2799,8 @@ class ConversationOrchestrator:
             fastPathBlockedReasons.append("process_action_present")
         if analysisNeedsTools:
             fastPathBlockedReasons.append("analysis_requires_tools")
+        if discoveryRequiredForFastPath:
+            fastPathBlockedReasons.append("knowledge_uncertainty_requires_discovery")
         if preflightToolRequested:
             fastPathBlockedReasons.append("preflight_tool_intent")
         fastPathActive = (
@@ -4021,6 +4314,26 @@ class ToolCallingAgent():
             if hint in self._toolSpecs and hint not in hints:
                 hints.append(hint)
 
+        knowledge_state = _coerce_dict(self._analysisPayload.get("knowledge_state"))
+        knowledge_class = _normalize_knowledge_classification(
+            knowledge_state.get("classification"),
+            "known",
+        )
+        discovery_required = _as_bool(
+            knowledge_state.get("discovery_required"),
+            fallback=knowledge_class in {"probably_unknown", "unknown"},
+        )
+        if discovery_required:
+            default_hints = _as_string_list(
+                _runtime_value(
+                    "orchestrator.discovery_default_tool_hints",
+                    ["braveSearch", "curlRequest"],
+                )
+            )
+            for hint in default_hints:
+                if hint in self._toolSpecs and hint not in hints and hint != "skipTools":
+                    hints.append(hint)
+
         process_directive = self._analysis_process_directive()
         for hint in self._process_action_hints(_as_text(process_directive.get("action"), "none")):
             if hint in self._toolSpecs and hint not in hints:
@@ -4082,6 +4395,16 @@ class ToolCallingAgent():
     def _analysis_requires_tools(self) -> bool:
         process_directive = self._analysis_process_directive()
         if _as_text(process_directive.get("action"), "none") != "none":
+            return True
+        knowledge_state = _coerce_dict(self._analysisPayload.get("knowledge_state"))
+        knowledge_class = _normalize_knowledge_classification(
+            knowledge_state.get("classification"),
+            "known",
+        )
+        if _as_bool(
+            knowledge_state.get("discovery_required"),
+            fallback=knowledge_class in {"probably_unknown", "unknown"},
+        ):
             return True
         needs_tools = _as_bool(self._analysisPayload.get("needs_tools"), False)
         if not needs_tools:

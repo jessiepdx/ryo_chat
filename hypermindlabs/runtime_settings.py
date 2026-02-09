@@ -117,6 +117,11 @@ DEFAULT_RUNTIME_SETTINGS: dict[str, Any] = {
         "analysis_context_summary_max_chars": 220,
         "control_plane_cache_enabled": True,
         "control_plane_cache_ttl_seconds": 60.0,
+        "discovery_layer_enabled": True,
+        "discovery_force_tools_on_uncertainty": True,
+        "discovery_unknown_threshold": 0.67,
+        "discovery_probably_unknown_threshold": 0.4,
+        "discovery_default_tool_hints": ["braveSearch", "curlRequest"],
     },
     "temporal": {
         "enabled": True,
@@ -355,6 +360,26 @@ ENV_OVERRIDES: dict[str, tuple[tuple[str, ...], str]] = {
     "orchestrator.control_plane_cache_ttl_seconds": (
         ("RYO_ORCHESTRATOR_CONTROL_PLANE_CACHE_TTL_SECONDS",),
         "float",
+    ),
+    "orchestrator.discovery_layer_enabled": (
+        ("RYO_ORCHESTRATOR_DISCOVERY_LAYER_ENABLED",),
+        "bool",
+    ),
+    "orchestrator.discovery_force_tools_on_uncertainty": (
+        ("RYO_ORCHESTRATOR_DISCOVERY_FORCE_TOOLS",),
+        "bool",
+    ),
+    "orchestrator.discovery_unknown_threshold": (
+        ("RYO_ORCHESTRATOR_DISCOVERY_UNKNOWN_THRESHOLD",),
+        "float",
+    ),
+    "orchestrator.discovery_probably_unknown_threshold": (
+        ("RYO_ORCHESTRATOR_DISCOVERY_PROBABLY_UNKNOWN_THRESHOLD",),
+        "float",
+    ),
+    "orchestrator.discovery_default_tool_hints": (
+        ("RYO_ORCHESTRATOR_DISCOVERY_DEFAULT_TOOL_HINTS",),
+        "csv",
     ),
     "temporal.enabled": (("RYO_TEMPORAL_CONTEXT_ENABLED",), "bool"),
     "temporal.default_timezone": (("RYO_TEMPORAL_DEFAULT_TIMEZONE",), "str"),

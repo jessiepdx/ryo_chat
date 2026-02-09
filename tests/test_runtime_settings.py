@@ -76,6 +76,27 @@ class TestRuntimeSettings(unittest.TestCase):
         self.assertEqual(settings["temporal"]["history_limit"], 44)
         self.assertEqual(settings["temporal"]["excerpt_max_chars"], 220)
 
+    def test_build_runtime_settings_supports_discovery_overrides(self):
+        settings = build_runtime_settings(
+            config_data={
+                "runtime": {
+                    "orchestrator": {
+                        "discovery_unknown_threshold": 0.71,
+                        "discovery_default_tool_hints": ["knowledgeSearch", "curlRequest"],
+                    }
+                }
+            },
+            env_data={
+                "RYO_ORCHESTRATOR_DISCOVERY_FORCE_TOOLS": "false",
+            },
+        )
+        self.assertEqual(settings["orchestrator"]["discovery_unknown_threshold"], 0.71)
+        self.assertEqual(
+            settings["orchestrator"]["discovery_default_tool_hints"],
+            ["knowledgeSearch", "curlRequest"],
+        )
+        self.assertFalse(settings["orchestrator"]["discovery_force_tools_on_uncertainty"])
+
     def test_build_runtime_settings_hydrates_from_public_community_requirements(self):
         config_data = {
             "runtime": {

@@ -137,7 +137,15 @@
       "fast_path_small_talk_max_chars": 96,
       "analysis_max_output_tokens": 256,
       "analysis_temperature": 0.1,
-      "analysis_context_summary_max_chars": 220
+      "analysis_context_summary_max_chars": 220,
+      "discovery_layer_enabled": true,
+      "discovery_force_tools_on_uncertainty": true,
+      "discovery_unknown_threshold": 0.67,
+      "discovery_probably_unknown_threshold": 0.4,
+      "discovery_default_tool_hints": [
+        "braveSearch",
+        "curlRequest"
+      ]
     },
     "security": {
       "password_min_length": 12
