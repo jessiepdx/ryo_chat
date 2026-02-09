@@ -220,6 +220,110 @@ def ensure_requirements_installed() -> None:
     print("[bootstrap] Requirements installation complete.")
 
 
+def _extract_pinned_psycopg_version() -> str | None:
+    if not REQUIREMENTS_FILE.exists():
+        return None
+    pattern = re.compile(r"^\s*psycopg(?:\[[^\]]+\])?\s*==\s*([^\s#]+)\s*$", re.IGNORECASE)
+    try:
+        for raw_line in REQUIREMENTS_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            match = pattern.match(line)
+            if match:
+                return match.group(1).strip()
+    except OSError:
+        return None
+    return None
+
+
+def _probe_psycopg_runtime(python_bin: Path) -> tuple[bool, str]:
+    probe = run_command(
+        [
+            str(python_bin),
+            "-c",
+            "import psycopg; from psycopg import pq; print('psycopg-pq-ok')",
+        ],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+    )
+    output = "\n".join(
+        part.strip() for part in (probe.stdout or "", probe.stderr or "") if part and part.strip()
+    )
+    return probe.returncode == 0, output
+
+
+def _is_missing_psycopg_pq_wrapper(error_text: str) -> bool:
+    haystack = (error_text or "").lower()
+    return any(
+        token in haystack
+        for token in (
+            "no pq wrapper available",
+            "libpq library not found",
+            "couldn't import psycopg 'binary' implementation",
+            "couldn't import psycopg 'c' implementation",
+            "couldn't import psycopg 'python' implementation",
+        )
+    )
+
+
+def ensure_psycopg_runtime_available() -> None:
+    python_bin = venv_python_path(VENV_DIR)
+    if not python_bin.exists():
+        python_bin = Path(sys.executable)
+
+    ok, output = _probe_psycopg_runtime(python_bin)
+    if ok:
+        return
+
+    if not _is_missing_psycopg_pq_wrapper(output):
+        print("[bootstrap] WARNING: psycopg import probe failed for an unexpected reason.")
+        if output:
+            print(output)
+        return
+
+    pinned_version = _extract_pinned_psycopg_version()
+    preferred_spec = f"psycopg[binary]=={pinned_version}" if pinned_version else "psycopg[binary]"
+    fallback_spec = f"psycopg-binary=={pinned_version}" if pinned_version else "psycopg-binary"
+
+    print(
+        "[bootstrap] psycopg runtime is missing a pq wrapper/libpq. "
+        f"Attempting auto-fix via `{preferred_spec}` ..."
+    )
+    install_result = run_command(
+        [str(python_bin), "-m", "pip", "install", "--upgrade", preferred_spec],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+    )
+    if install_result.returncode != 0:
+        print("[bootstrap] Primary psycopg auto-fix failed. Trying fallback package ...")
+        _print_command_output("[bootstrap] ", install_result.stdout or "")
+        _print_command_output("[bootstrap] ", install_result.stderr or "")
+        install_result = run_command(
+            [str(python_bin), "-m", "pip", "install", "--upgrade", fallback_spec],
+            cwd=PROJECT_ROOT,
+            check=False,
+            capture_output=True,
+        )
+
+    _print_command_output("[bootstrap] ", install_result.stdout or "")
+    _print_command_output("[bootstrap] ", install_result.stderr or "")
+    ok, output = _probe_psycopg_runtime(python_bin)
+    if ok:
+        print("[bootstrap] psycopg runtime dependency repaired successfully.")
+        return
+
+    print("[bootstrap] ERROR: Unable to repair psycopg runtime dependency automatically.")
+    if output:
+        print(output)
+    raise RuntimeError(
+        "psycopg runtime unavailable (no pq wrapper/libpq). "
+        "Launcher aborted before starting routes."
+    )
+
+
 def load_json(path: Path, fallback: Any = None) -> Any:
     if not path.exists():
         return fallback
@@ -5304,6 +5408,7 @@ def main() -> int:
 
     ensure_venv_and_reexec()
     ensure_requirements_installed()
+    ensure_psycopg_runtime_available()
 
     artifacts = ensure_project_artifacts()
     state = load_state()
