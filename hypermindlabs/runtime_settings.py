@@ -504,6 +504,7 @@ def build_runtime_settings(
     env_data: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     settings = copy.deepcopy(DEFAULT_RUNTIME_SETTINGS)
+    community_requirements_from_config: dict[str, Any] | None = None
     if isinstance(config_data, dict):
         runtime_config = config_data.get("runtime")
         if isinstance(runtime_config, dict):
@@ -511,6 +512,7 @@ def build_runtime_settings(
 
         community_requirements = config_data.get("community_score_requirements")
         if isinstance(community_requirements, dict):
+            community_requirements_from_config = dict(community_requirements)
             for public_key, runtime_key in COMMUNITY_SCORE_REQUIREMENT_MAP.items():
                 raw_value = community_requirements.get(public_key)
                 if raw_value is None:
@@ -539,5 +541,20 @@ def build_runtime_settings(
         except (TypeError, ValueError):
             continue
         set_runtime_setting(settings, path, parsed)
+
+    # Keep visible community-score requirements authoritative when explicitly configured.
+    # This prevents .env defaults from unintentionally overriding config.json values.
+    if isinstance(community_requirements_from_config, dict):
+        for public_key, runtime_key in COMMUNITY_SCORE_REQUIREMENT_MAP.items():
+            raw_value = community_requirements_from_config.get(public_key)
+            if raw_value is None:
+                continue
+            try:
+                parsed = int(str(raw_value).strip())
+            except (TypeError, ValueError):
+                continue
+            if parsed < 0:
+                parsed = 0
+            set_runtime_setting(settings, f"telegram.{runtime_key}", parsed)
 
     return settings

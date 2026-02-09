@@ -97,6 +97,14 @@ COMMUNITY_SCORE_REQUIREMENTS: tuple[tuple[str, str, str], ...] = (
     ("link_sharing", "minimum_community_score_link", "Link sharing"),
     ("message_forwarding", "minimum_community_score_forward", "Message forwarding"),
 )
+COMMUNITY_SCORE_REQUIREMENT_ENV_KEYS: dict[str, str] = {
+    "private_chat": "RYO_TELEGRAM_MIN_SCORE_PRIVATE_CHAT",
+    "private_image": "RYO_TELEGRAM_MIN_SCORE_PRIVATE_IMAGE",
+    "group_image": "RYO_TELEGRAM_MIN_SCORE_GROUP_IMAGE",
+    "other_group": "RYO_TELEGRAM_MIN_SCORE_OTHER_GROUP",
+    "link_sharing": "RYO_TELEGRAM_MIN_SCORE_LINK",
+    "message_forwarding": "RYO_TELEGRAM_MIN_SCORE_FORWARD",
+}
 
 POLICY_TO_CAPABILITY_ORDER: dict[str, tuple[str, ...]] = {
     "message_analysis": ("tool", "chat", "generate"),
@@ -613,6 +621,24 @@ def _sync_db_env_from_config(config_data: dict[str, Any]) -> bool:
         if value:
             updates[env_key] = value
 
+    return _upsert_env_values(ENV_FILE, updates)
+
+
+def _sync_community_score_env_from_config(config_data: dict[str, Any]) -> bool:
+    section = config_data.get("community_score_requirements")
+    if not isinstance(section, dict):
+        return False
+
+    updates: dict[str, str] = {}
+    for config_key, env_key in COMMUNITY_SCORE_REQUIREMENT_ENV_KEYS.items():
+        if config_key not in section:
+            continue
+        value = _coerce_nonnegative_int(section.get(config_key), 0)
+        updates[env_key] = str(value)
+        os.environ[env_key] = str(value)
+
+    if not updates:
+        return False
     return _upsert_env_values(ENV_FILE, updates)
 
 
@@ -4686,6 +4712,8 @@ def _curses_route_config_workspace(
                 )
                 return f"save failed: {error}"
 
+        _sync_community_score_env_from_config(next_config)
+
         next_runtime = build_runtime_settings(config_data=next_config)
         config_data.clear()
         config_data.update(next_config)
@@ -5606,6 +5634,9 @@ def main() -> int:
         if backup:
             print(f"[bootstrap] Backed up config to: {backup}")
         print(f"[bootstrap] Updated config: {CONFIG_FILE}")
+
+    if _sync_community_score_env_from_config(config_data):
+        print("[bootstrap] Synced community score requirements to .env runtime overrides.")
 
     runtime_settings = build_runtime_settings(config_data=config_data)
     db_status: dict[str, Any] | None = None
