@@ -70,6 +70,7 @@ WATCHDOG_LOG_DIR = LOGS_DIR / "watchdog"
 POLICIES_DIR = PROJECT_ROOT / "policies" / "agent"
 LIVE_LOG_BUFFER_LINE_LIMIT = 400
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+DB_CONNINFO_PASSWORD_RE = re.compile(r"(password=)([^\s]+)", re.IGNORECASE)
 
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 INFERENCE_KEYS = ("embedding", "generate", "chat", "tool", "multimodal")
@@ -111,6 +112,7 @@ CAPABILITY_TO_RUNTIME_MODEL_PATH: dict[str, str] = {
     "tool": "inference.default_tool_model",
     "multimodal": "inference.default_multimodal_model",
 }
+LOCAL_DATABASE_HOSTS: set[str] = {"127.0.0.1", "localhost", "0.0.0.0", "::1", "::"}
 
 
 def is_windows() -> bool:
@@ -303,6 +305,185 @@ def run_setup_wizard(non_interactive: bool) -> bool:
         )
         return False
     return True
+
+
+def _redact_conninfo(conninfo: str | None) -> str | None:
+    if conninfo is None:
+        return None
+    text = str(conninfo).strip()
+    if not text:
+        return None
+    return DB_CONNINFO_PASSWORD_RE.sub(r"\1***", text)
+
+
+def _is_local_database_host(value: Any) -> bool:
+    host = str(value or "").strip().lower()
+    return host in LOCAL_DATABASE_HOSTS
+
+
+def _database_section_complete(section: Any) -> bool:
+    if not isinstance(section, dict):
+        return False
+    required = ("db_name", "user", "password", "host")
+    for key in required:
+        value = str(section.get(key) or "").strip()
+        if not value:
+            return False
+    return True
+
+
+def _fallback_enabled(config_data: dict[str, Any]) -> bool:
+    fallback = config_data.get("database_fallback")
+    return isinstance(fallback, dict) and bool(fallback.get("enabled", False))
+
+
+def _bootstrap_target_from_config(config_data: dict[str, Any]) -> str:
+    fallback = config_data.get("database_fallback")
+    if isinstance(fallback, dict) and bool(fallback.get("enabled", False)) and _database_section_complete(fallback):
+        return "both"
+    return "primary"
+
+
+def _is_local_bootstrap_candidate(config_data: dict[str, Any]) -> bool:
+    database = config_data.get("database")
+    if not _database_section_complete(database):
+        return False
+    if not _is_local_database_host(database.get("host")):
+        return False
+
+    fallback = config_data.get("database_fallback")
+    if isinstance(fallback, dict) and bool(fallback.get("enabled", False)):
+        if not _database_section_complete(fallback):
+            return False
+        if not _is_local_database_host(fallback.get("host")):
+            return False
+    return True
+
+
+def read_database_route_status(
+    *,
+    config_data: dict[str, Any],
+    runtime_settings: dict[str, Any],
+) -> dict[str, Any]:
+    status: dict[str, Any] = {
+        "status": "unknown",
+        "active_target": "unknown",
+        "active_conninfo": None,
+        "primary_conninfo": None,
+        "fallback_conninfo": None,
+        "primary_available": False,
+        "fallback_available": False,
+        "fallback_enabled": _fallback_enabled(config_data),
+        "errors": [],
+    }
+
+    try:
+        from hypermindlabs.database_router import DatabaseRouter
+    except Exception as error:  # noqa: BLE001
+        status["status"] = "error"
+        status["errors"] = [f"database router import failed: {error}"]
+        return status
+
+    try:
+        connect_timeout = max(1, int(get_runtime_setting(runtime_settings, "database.connect_timeout_seconds", 2)))
+        router = DatabaseRouter(
+            primary_database=config_data.get("database"),
+            fallback_database=config_data.get("database_fallback"),
+            fallback_enabled=_fallback_enabled(config_data),
+            connect_timeout=connect_timeout,
+        )
+        route = router.resolve().to_dict()
+        status.update(route)
+        status["active_conninfo"] = _redact_conninfo(status.get("active_conninfo"))
+        status["primary_conninfo"] = _redact_conninfo(status.get("primary_conninfo"))
+        status["fallback_conninfo"] = _redact_conninfo(status.get("fallback_conninfo"))
+        errors = status.get("errors")
+        if not isinstance(errors, list):
+            status["errors"] = [str(errors)]
+        else:
+            status["errors"] = [str(item) for item in errors]
+    except Exception as error:  # noqa: BLE001
+        status["status"] = "error"
+        status["errors"] = [f"database route inspection failed: {error}"]
+
+    return status
+
+
+def _print_command_output(prefix: str, text: str, *, max_lines: int = 24) -> None:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return
+    lines = cleaned.splitlines()
+    for line in lines[:max(1, int(max_lines))]:
+        print(f"{prefix}{line}")
+    remaining = len(lines) - min(len(lines), max(1, int(max_lines)))
+    if remaining > 0:
+        print(f"{prefix}... ({remaining} additional line(s) omitted)")
+
+
+def ensure_database_route_ready(
+    *,
+    config_data: dict[str, Any],
+    runtime_settings: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    db_status = read_database_route_status(config_data=config_data, runtime_settings=runtime_settings)
+    status_value = str(db_status.get("status", "unknown")).strip().lower()
+    if status_value not in {"failed_all", "error"}:
+        return config_data, runtime_settings, db_status
+
+    auto_bootstrap = bool(get_runtime_setting(runtime_settings, "database.auto_bootstrap_on_app_start", True))
+    if not auto_bootstrap:
+        print("[db] Auto-bootstrap disabled (`runtime.database.auto_bootstrap_on_app_start=false`).")
+        return config_data, runtime_settings, db_status
+
+    if not _is_local_bootstrap_candidate(config_data):
+        print("[db] Route unhealthy and local auto-bootstrap criteria not met; leaving DB config unchanged.")
+        return config_data, runtime_settings, db_status
+
+    use_docker = bool(get_runtime_setting(runtime_settings, "database.auto_bootstrap_use_docker", True))
+    target = _bootstrap_target_from_config(config_data)
+    command = [
+        sys.executable,
+        "-m",
+        "scripts.bootstrap_postgres",
+        "--config",
+        str(CONFIG_FILE),
+        "--target",
+        target,
+    ]
+    if use_docker:
+        command.append("--docker")
+
+    print(
+        "[db] Route unhealthy "
+        f"(status={db_status.get('status')}, target={db_status.get('active_target')}). "
+        f"Attempting auto-bootstrap (target={target}, docker={'yes' if use_docker else 'no'})."
+    )
+    result = run_command(command, cwd=PROJECT_ROOT, check=False, capture_output=True)
+    _print_command_output("[db/bootstrap] ", result.stdout or "")
+    _print_command_output("[db/bootstrap] ", result.stderr or "")
+
+    config_data = load_config()
+    runtime_settings = build_runtime_settings(config_data=config_data)
+    refreshed_status = read_database_route_status(config_data=config_data, runtime_settings=runtime_settings)
+    refreshed_value = str(refreshed_status.get("status", "unknown")).strip().lower()
+    if result.returncode == 0 and refreshed_value in {"primary", "fallback"}:
+        print(
+            "[db] Auto-bootstrap recovered database route "
+            f"(status={refreshed_status.get('status')}, target={refreshed_status.get('active_target')})."
+        )
+    elif refreshed_value in {"primary", "fallback"}:
+        print(
+            "[db] Database route became healthy after bootstrap attempt "
+            f"(status={refreshed_status.get('status')}, target={refreshed_status.get('active_target')})."
+        )
+    else:
+        error_count = len(refreshed_status.get("errors", []))
+        print(
+            "[db] WARNING: database route still unhealthy after bootstrap attempt "
+            f"(status={refreshed_status.get('status')}, errors={error_count})."
+        )
+    return config_data, runtime_settings, refreshed_status
 
 
 def ensure_database_migrations(runtime_settings: dict[str, Any]) -> None:
@@ -1506,6 +1687,28 @@ ROUTE_CONFIG_SPECS: dict[str, RouteConfigSpec] = {
                         required=True,
                         env_override_keys=("RYO_DEFAULT_OLLAMA_HOST", "OLLAMA_HOST"),
                     ),
+                    RouteSettingSpec(
+                        id="embedding_timeout_seconds",
+                        label="Embedding Timeout (s)",
+                        path="runtime.inference.embedding_timeout_seconds",
+                        value_type="float",
+                        description="Max seconds to wait for each Ollama embedding request before fallback.",
+                        default_runtime_path="inference.embedding_timeout_seconds",
+                        min_value=0.5,
+                        max_value=300.0,
+                        env_override_keys=("RYO_OLLAMA_EMBED_TIMEOUT_SECONDS",),
+                    ),
+                    RouteSettingSpec(
+                        id="embedding_max_input_chars",
+                        label="Embedding Max Input Chars",
+                        path="runtime.inference.embedding_max_input_chars",
+                        value_type="int",
+                        description="Truncate embedding input above this size to avoid long blocking inference calls.",
+                        default_runtime_path="inference.embedding_max_input_chars",
+                        min_value=0,
+                        max_value=200000,
+                        env_override_keys=("RYO_EMBEDDING_MAX_INPUT_CHARS",),
+                    ),
                 ),
             ),
             RouteCategorySpec(
@@ -2603,6 +2806,45 @@ def _postgres_links(config_data: dict[str, Any]) -> tuple[str, str | None]:
     return primary, fallback_link
 
 
+def _database_status_label(db_status: dict[str, Any] | None) -> str:
+    if not isinstance(db_status, dict):
+        return "unknown"
+
+    status_value = str(db_status.get("status", "unknown")).strip().lower()
+    active_target = str(db_status.get("active_target", "unknown")).strip().lower()
+    primary_available = bool(db_status.get("primary_available", False))
+    fallback_available = bool(db_status.get("fallback_available", False))
+
+    if status_value == "primary":
+        return f"primary healthy (active={active_target or 'primary'})"
+    if status_value == "fallback":
+        return f"fallback healthy (active={active_target or 'fallback'})"
+    if status_value == "failed_all":
+        return (
+            f"unhealthy (primary={'up' if primary_available else 'down'}, "
+            f"fallback={'up' if fallback_available else 'down'})"
+        )
+    if status_value == "error":
+        return "route-inspection error"
+    return status_value or "unknown"
+
+
+def _database_errors_preview(db_status: dict[str, Any] | None, *, limit: int = 2) -> str:
+    if not isinstance(db_status, dict):
+        return ""
+    errors = db_status.get("errors")
+    if not isinstance(errors, list):
+        return ""
+    chunks = [str(item).strip() for item in errors if str(item).strip()]
+    if not chunks:
+        return ""
+    preview = "; ".join(chunks[: max(1, int(limit))])
+    extra = len(chunks) - min(len(chunks), max(1, int(limit)))
+    if extra > 0:
+        preview = f"{preview}; +{extra} more"
+    return preview
+
+
 def _route_runtime_state(entry: dict[str, Any]) -> str:
     if entry.get("running"):
         return "running"
@@ -3039,7 +3281,12 @@ def _route_open_action(
     return False, [f"Route: {route_key}", "No open action implemented."]
 
 
-def print_launcher_summary(config_data: dict[str, Any], runtime_settings: dict[str, Any]) -> None:
+def print_launcher_summary(
+    config_data: dict[str, Any],
+    runtime_settings: dict[str, Any],
+    *,
+    db_status: dict[str, Any] | None = None,
+) -> None:
     ollama_host = resolve_ollama_host(config_data, runtime_settings=runtime_settings)
     primary_pg_link, fallback_pg_link = _postgres_links(config_data)
     chat_model = current_model(config_data, "chat") or "-"
@@ -3055,6 +3302,10 @@ def print_launcher_summary(config_data: dict[str, Any], runtime_settings: dict[s
     print(f"Postgres:     {primary_pg_link}")
     if fallback_pg_link:
         print(f"Postgres fb:  {fallback_pg_link}")
+    print(f"DB route:     {_database_status_label(db_status)}")
+    db_errors = _database_errors_preview(db_status, limit=2)
+    if db_errors:
+        print(f"DB errors:    {db_errors}")
     print(
         "Models: "
         f"chat={chat_model} | tool={tool_model} | generate={generate_model} | embedding={embedding_model}"
@@ -3117,6 +3368,7 @@ def monitor_dashboard(
     watchdog: InterfaceWatchdog,
     config_data: dict[str, Any],
     runtime_settings: dict[str, Any],
+    db_status: dict[str, Any] | None = None,
     *,
     refresh_seconds: float = 1.0,
 ) -> None:
@@ -3127,7 +3379,11 @@ def monitor_dashboard(
     keys = watchdog.route_keys()
     while True:
         _clear_screen()
-        print_launcher_summary(config_data=config_data, runtime_settings=runtime_settings)
+        print_launcher_summary(
+            config_data=config_data,
+            runtime_settings=runtime_settings,
+            db_status=db_status,
+        )
         print_watchdog_status(watchdog)
         print("\nDashboard commands:")
         print("  q                 Back to launcher menu")
@@ -3182,10 +3438,15 @@ def route_menu(
     watchdog: InterfaceWatchdog,
     config_data: dict[str, Any],
     runtime_settings: dict[str, Any],
+    db_status: dict[str, Any] | None = None,
 ) -> None:
     while True:
         _clear_screen()
-        print_launcher_summary(config_data=config_data, runtime_settings=runtime_settings)
+        print_launcher_summary(
+            config_data=config_data,
+            runtime_settings=runtime_settings,
+            db_status=db_status,
+        )
         print_watchdog_status(watchdog)
         print("\nActions:")
         print("  1. Toggle a route")
@@ -3222,7 +3483,12 @@ def route_menu(
             continue
 
         if choice == "5":
-            monitor_dashboard(watchdog, config_data=config_data, runtime_settings=runtime_settings)
+            monitor_dashboard(
+                watchdog,
+                config_data=config_data,
+                runtime_settings=runtime_settings,
+                db_status=db_status,
+            )
             continue
 
         if choice == "6":
@@ -4118,6 +4384,7 @@ def watchdog_dashboard_curses(
     *,
     config_data: dict[str, Any],
     runtime_settings: dict[str, Any],
+    db_status: dict[str, Any] | None = None,
 ) -> None:
     def _runner(stdscr: Any) -> None:
         if curses:
@@ -4175,29 +4442,36 @@ def watchdog_dashboard_curses(
             web_status = status.get("web", {})
             web_ui_url = str(web_status.get("endpoint_url") or "").strip() or _web_local_endpoint_from_runtime(runtime_settings)
             telegram_url = _telegram_bot_link(config_data) or "(not configured)"
+            db_status_text = _database_status_label(db_status)
+            db_error_text = _database_errors_preview(db_status, limit=1)
             _safe_addstr(stdscr, 1, 0, f"Ollama: {ollama_host}")
             _safe_addstr(stdscr, 2, 0, f"Postgres: {primary_pg_link}")
             _safe_addstr(stdscr, 3, 0, f"Postgres fallback: {fallback_pg_link or '(disabled)'}")
-            _safe_addstr(stdscr, 4, 0, f"Web: {web_ui_url}")
-            _safe_addstr(stdscr, 5, 0, f"Telegram: {telegram_url}")
+            _safe_addstr(stdscr, 4, 0, f"DB route: {db_status_text}")
+            if db_error_text:
+                _safe_addstr(stdscr, 5, 0, f"DB errors: {db_error_text}")
+            else:
+                _safe_addstr(stdscr, 5, 0, "DB errors: (none)")
+            _safe_addstr(stdscr, 6, 0, f"Web: {web_ui_url}")
+            _safe_addstr(stdscr, 7, 0, f"Telegram: {telegram_url}")
             stage_progress_enabled = bool(get_runtime_setting(runtime_settings, "telegram.show_stage_progress", True))
             _safe_addstr(
                 stdscr,
-                6,
+                8,
                 0,
                 f"Telegram stage progress: {'on' if stage_progress_enabled else 'off'}",
             )
             _safe_addstr(
                 stdscr,
-                7,
+                9,
                 0,
                 "Controls: Up/Down select | Enter config | p policy editor | r open interface | Space toggle | s start (manual opens terminal) | x stop | a/o auto-all | l logs | q quit",
             )
-            _safe_addstr(stdscr, 8, 0, f"Status: {last_status_text}")
-            _safe_addstr(stdscr, 10, 0, "Route      Desired Running PID      User      Uptime   Restarts LastExit Policy  State")
-            _safe_addstr(stdscr, 11, 0, "------------------------------------------------------------------------------------------------")
+            _safe_addstr(stdscr, 10, 0, f"Status: {last_status_text}")
+            _safe_addstr(stdscr, 12, 0, "Route      Desired Running PID      User      Uptime   Restarts LastExit Policy  State")
+            _safe_addstr(stdscr, 13, 0, "------------------------------------------------------------------------------------------------")
 
-            row = 12
+            row = 14
             for idx, key in enumerate(keys):
                 entry = status[key]
                 desired = "on" if entry["desired"] else "off"
@@ -4479,6 +4753,11 @@ def main() -> int:
         print(f"[bootstrap] Updated config: {CONFIG_FILE}")
 
     runtime_settings = build_runtime_settings(config_data=config_data)
+    db_status: dict[str, Any] | None = None
+    config_data, runtime_settings, db_status = ensure_database_route_ready(
+        config_data=config_data,
+        runtime_settings=runtime_settings,
+    )
     policy_probe_timeout = float(
         get_runtime_setting(runtime_settings, "inference.probe_timeout_seconds", 3.0)
     )
@@ -4512,6 +4791,7 @@ def main() -> int:
             state["policy_model_sync_fingerprint"] = desired_policy_fingerprint
 
     ensure_database_migrations(runtime_settings=runtime_settings)
+    db_status = read_database_route_status(config_data=config_data, runtime_settings=runtime_settings)
 
     state["last_run_epoch"] = int(time.time())
     save_state(state)
@@ -4540,12 +4820,18 @@ def main() -> int:
                 watchdog,
                 config_data=config_data,
                 runtime_settings=runtime_settings,
+                db_status=db_status,
             )
         else:
             if bool(get_runtime_setting(runtime_settings, "watchdog.auto_start_routes", True)):
                 watchdog.start_all(include_manual=False)
                 print("[launcher] Auto-started auto routes (web/telegram).")
-            route_menu(watchdog, config_data=config_data, runtime_settings=runtime_settings)
+            route_menu(
+                watchdog,
+                config_data=config_data,
+                runtime_settings=runtime_settings,
+                db_status=db_status,
+            )
     except KeyboardInterrupt:
         print("\n[launcher] Shutdown requested.")
     finally:

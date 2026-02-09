@@ -74,6 +74,8 @@
       "default_multimodal_model": "llama3.2-vision:latest",
       "model_context_window": 4096,
       "probe_timeout_seconds": 3.0,
+      "embedding_timeout_seconds": 12.0,
+      "embedding_max_input_chars": 6000,
       "prompt_model_selection_on_startup": false
     },
     "database": {
@@ -85,6 +87,8 @@
       "bootstrap_connect_retries": 15,
       "bootstrap_retry_delay_seconds": 1.0,
       "bootstrap_port_scan_limit": 100,
+      "auto_bootstrap_on_app_start": true,
+      "auto_bootstrap_use_docker": true,
       "auto_migrate_on_app_start": true
     },
     "tool_runtime": {
@@ -124,7 +128,9 @@
       "minimum_community_score_link": 20,
       "minimum_community_score_forward": 20,
       "get_updates_write_timeout": 500,
-      "show_stage_progress": true
+      "show_stage_progress": true,
+      "show_stage_json_details": false,
+      "stage_detail_level": "normal"
     },
     "security": {
       "password_min_length": 12

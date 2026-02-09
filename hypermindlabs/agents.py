@@ -324,10 +324,68 @@ def _stream_human_preview(value: Any, max_chars: int = 220) -> str:
     return "..." + text[-(max_chars - 3) :]
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _duration_seconds_from_ns(value: Any) -> float:
+    nanoseconds = _safe_int(value, 0)
+    if nanoseconds <= 0:
+        return 0.0
+    return float(nanoseconds) / 1_000_000_000.0
+
+
+def _tokens_per_second(tokens: int, duration_seconds: float) -> float | None:
+    if tokens <= 0 or duration_seconds <= 0.0:
+        return None
+    return float(tokens) / float(duration_seconds)
+
+
+def _ollama_stream_stats_summary(stats: dict[str, Any] | None) -> dict[str, Any]:
+    payload = _coerce_dict(stats)
+    prompt_tokens = max(0, _safe_int(payload.get("prompt_eval_count"), 0))
+    completion_tokens = max(0, _safe_int(payload.get("eval_count"), 0))
+    total_tokens = prompt_tokens + completion_tokens
+
+    prompt_seconds = _duration_seconds_from_ns(payload.get("prompt_eval_duration"))
+    completion_seconds = _duration_seconds_from_ns(payload.get("eval_duration"))
+    total_eval_seconds = prompt_seconds + completion_seconds
+    total_duration_seconds = _duration_seconds_from_ns(payload.get("total_duration"))
+    load_duration_seconds = _duration_seconds_from_ns(payload.get("load_duration"))
+
+    prompt_tps = _tokens_per_second(prompt_tokens, prompt_seconds)
+    completion_tps = _tokens_per_second(completion_tokens, completion_seconds)
+    total_tps = _tokens_per_second(total_tokens, total_eval_seconds)
+
+    summary: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "prompt_seconds": round(prompt_seconds, 4),
+        "completion_seconds": round(completion_seconds, 4),
+        "total_eval_seconds": round(total_eval_seconds, 4),
+        "total_duration_seconds": round(total_duration_seconds, 4),
+        "load_duration_seconds": round(load_duration_seconds, 4),
+    }
+    if prompt_tps is not None:
+        summary["prompt_tokens_per_second"] = round(prompt_tps, 2)
+    if completion_tps is not None:
+        summary["completion_tokens_per_second"] = round(completion_tps, 2)
+    if total_tps is not None:
+        summary["total_tokens_per_second"] = round(total_tps, 2)
+    return summary
+
+
 def _stage_meta_log_summary(meta: dict[str, Any] | None) -> dict[str, Any]:
     payload = _coerce_dict(meta)
     summary: dict[str, Any] = {}
     for key in ("model", "selected_model", "tool_calls", "requested_tool_calls", "executed_tool_calls"):
+        if key in payload:
+            summary[key] = payload.get(key)
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens_per_second"):
         if key in payload:
             summary[key] = payload.get(key)
 
@@ -1360,13 +1418,21 @@ class ConversationOrchestrator:
                     "[stream.analysis] "
                     f"done chunks={analysisChunkCount} chars={analysisCharCount} eval_count={chunk.eval_count}"
                 )
+        analysisStatsSummary = _ollama_stream_stats_summary(self._analysisStats)
         await self._emit_stage(
             "analysis.complete",
             "Analysis stage complete.",
             model=getattr(self._analysisAgent, "_model", None),
             selected_model=_coerce_dict(getattr(self._analysisAgent, "routing", {})).get("selected_model"),
+            prompt_tokens=analysisStatsSummary.get("prompt_tokens"),
+            completion_tokens=analysisStatsSummary.get("completion_tokens"),
+            total_tokens=analysisStatsSummary.get("total_tokens"),
+            prompt_tokens_per_second=analysisStatsSummary.get("prompt_tokens_per_second"),
+            completion_tokens_per_second=analysisStatsSummary.get("completion_tokens_per_second"),
+            total_tokens_per_second=analysisStatsSummary.get("total_tokens_per_second"),
             json={
                 "routing": _coerce_dict(getattr(self._analysisAgent, "routing", {})),
+                "stats": analysisStatsSummary,
             },
         )
 
@@ -1525,7 +1591,23 @@ class ConversationOrchestrator:
                     "[stream.response] "
                     f"done chunks={responseChunkCount} chars={responseCharCount} eval_count={chunk.eval_count}"
                 )
-        await self._emit_stage("response.complete", "Final response generated.")
+        responseStatsSummary = _ollama_stream_stats_summary(self._devStats)
+        await self._emit_stage(
+            "response.complete",
+            "Final response generated.",
+            model=getattr(self._chatConversationAgent, "_model", None),
+            selected_model=_coerce_dict(getattr(self._chatConversationAgent, "routing", {})).get("selected_model"),
+            prompt_tokens=responseStatsSummary.get("prompt_tokens"),
+            completion_tokens=responseStatsSummary.get("completion_tokens"),
+            total_tokens=responseStatsSummary.get("total_tokens"),
+            prompt_tokens_per_second=responseStatsSummary.get("prompt_tokens_per_second"),
+            completion_tokens_per_second=responseStatsSummary.get("completion_tokens_per_second"),
+            total_tokens_per_second=responseStatsSummary.get("total_tokens_per_second"),
+            json={
+                "chat_routing": _coerce_dict(getattr(self._chatConversationAgent, "routing", {})),
+                "stats": responseStatsSummary,
+            },
+        )
 
         allowDiagnostics = bool(self._options.get("allow_internal_diagnostics", False))
         sanitizedResponseMessage = _sanitize_final_response(
@@ -1560,6 +1642,7 @@ class ConversationOrchestrator:
                     "chars": len(sanitizedResponseMessage),
                     "sanitized": bool(sanitizedResponseMessage != responseMessage),
                 },
+                "stats": _ollama_stream_stats_summary(self._devStats),
             },
         )
 

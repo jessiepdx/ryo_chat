@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 import html
 import json
 import logging
+import time
 from typing import Any
 from ollama import AsyncClient
 import os
@@ -244,7 +245,6 @@ _MINIMAL_VISIBLE_STAGES = {
     "response.complete",
 }
 _NORMAL_HIDDEN_STAGES = {
-    "context.built",
     "analysis.payload",
 }
 
@@ -310,6 +310,13 @@ class TelegramStageStatus:
             cursor = cursor.get(key)
         return cursor
 
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     def _format_stage_timestamp(self, raw: Any) -> str:
         raw_text = str(raw or "").strip()
         if raw_text:
@@ -319,6 +326,79 @@ class TelegramStageStatus:
             except ValueError:
                 return self._truncate_text(raw_text, 32)
         return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+    def _extract_stats_payload(self, meta: dict[str, Any]) -> dict[str, Any]:
+        stats: dict[str, Any] = {}
+        for key in (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "prompt_tokens_per_second",
+            "completion_tokens_per_second",
+            "total_tokens_per_second",
+        ):
+            if key in meta:
+                stats[key] = meta.get(key)
+        nested_stats = self._extract_from_meta_json(meta, "stats")
+        if isinstance(nested_stats, dict):
+            for key in (
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "prompt_tokens_per_second",
+                "completion_tokens_per_second",
+                "total_tokens_per_second",
+            ):
+                if key not in stats and key in nested_stats:
+                    stats[key] = nested_stats.get(key)
+        return stats
+
+    def _stage_meta_summary_line(self, stage: str, meta: dict[str, Any]) -> str:
+        if not isinstance(meta, dict):
+            return ""
+
+        pieces: list[str] = []
+        selected_model = str(meta.get("selected_model") or meta.get("model") or "").strip()
+        if not selected_model:
+            routing_selected = self._extract_from_meta_json(meta, "routing", "selected_model")
+            if isinstance(routing_selected, str) and routing_selected.strip():
+                selected_model = routing_selected.strip()
+        if selected_model:
+            pieces.append(f"model={selected_model}")
+
+        requested = meta.get("requested_tool_calls")
+        executed = meta.get("executed_tool_calls")
+        tool_calls = meta.get("tool_calls")
+        if isinstance(requested, int) or isinstance(executed, int):
+            req_text = str(requested) if isinstance(requested, int) else "-"
+            exe_text = str(executed) if isinstance(executed, int) else "-"
+            pieces.append(f"tools={req_text}->{exe_text}")
+        elif isinstance(tool_calls, int):
+            pieces.append(f"tools={tool_calls}")
+
+        stats = self._extract_stats_payload(meta)
+        total_tps = self._coerce_float(stats.get("total_tokens_per_second"))
+        completion_tps = self._coerce_float(stats.get("completion_tokens_per_second"))
+        if total_tps and total_tps > 0:
+            pieces.append(f"tps={total_tps:.2f}")
+        elif completion_tps and completion_tps > 0:
+            pieces.append(f"tps={completion_tps:.2f}")
+
+        if self._detail_level == "debug":
+            prompt_tokens = stats.get("prompt_tokens")
+            completion_tokens = stats.get("completion_tokens")
+            total_tokens = stats.get("total_tokens")
+            if isinstance(prompt_tokens, int) or isinstance(completion_tokens, int):
+                pieces.append(
+                    f"tok={prompt_tokens if isinstance(prompt_tokens, int) else '-'}+"
+                    f"{completion_tokens if isinstance(completion_tokens, int) else '-'}"
+                )
+            elif isinstance(total_tokens, int):
+                pieces.append(f"tok={total_tokens}")
+
+        # Keep summaries short in stage stream updates.
+        summary = " | ".join(piece for piece in pieces if piece)
+        return self._truncate_text(summary, 160)
 
     def _human_readable_stage_message(self, stage: str, detail: str, meta: dict[str, Any]) -> str:
         snippet = str(meta.get("snippet") or "").strip()
@@ -351,6 +431,11 @@ class TelegramStageStatus:
 
         if stage == "analysis.complete":
             selected_model = str(meta.get("selected_model") or "").strip()
+            stats = self._extract_stats_payload(meta)
+            tps = self._coerce_float(stats.get("completion_tokens_per_second"))
+            completion_tokens = stats.get("completion_tokens")
+            if isinstance(completion_tokens, int) and tps and tps > 0:
+                return f"Analysis complete ({completion_tokens} tokens @ {tps:.2f} tok/s)."
             if selected_model:
                 return f"Analysis model: {selected_model}"
             return "Analysis complete."
@@ -362,6 +447,14 @@ class TelegramStageStatus:
             chars = meta.get("chars")
             if isinstance(chars, int):
                 return f"Drafting response ({chars} chars generated)."
+
+        if stage == "response.complete":
+            stats = self._extract_stats_payload(meta)
+            tps = self._coerce_float(stats.get("completion_tokens_per_second"))
+            completion_tokens = stats.get("completion_tokens")
+            if isinstance(completion_tokens, int) and tps and tps > 0:
+                return f"Final response generated ({completion_tokens} tokens @ {tps:.2f} tok/s)."
+            return "Final response generated."
 
         cleaned_detail = str(detail or "").strip()
         if cleaned_detail:
@@ -379,29 +472,42 @@ class TelegramStageStatus:
         label = _ORCHESTRATION_STAGE_LABELS.get(stage, stage if stage else "Processing")
 
         message = self._human_readable_stage_message(stage, detail, meta)
+        summary = self._stage_meta_summary_line(stage, meta)
         entry = f"<b>{html.escape(label)}</b>"
         if message:
             entry += f"\n<i>{html.escape(message)}</i>"
+        if summary and self._detail_level in {"normal", "debug"}:
+            entry += f"\n<code>{html.escape(summary)}</code>"
         entry += f"\n<code>{html.escape(self._format_stage_timestamp(timestamp))}</code>"
         return self._truncate_text(entry, self._message_char_limit)
 
     def _render(self) -> str:
         if not self._lines:
             return "Processing your request..."
-        rendered = self._lines[-1]
+        if self._detail_level == "minimal":
+            return self._lines[-1]
+
+        lines = self._lines[-self._history_limit :]
+        rendered = "\n\n".join(lines)
+        while len(lines) > 1 and len(rendered) > self._message_char_limit:
+            lines = lines[1:]
+            rendered = "\n\n".join(lines)
         if len(rendered) <= self._message_char_limit:
             return rendered
-        return self._truncate_text(rendered, self._message_char_limit)
+        return lines[-1]
 
-    def _render_json_block(self, payload) -> str:
+    def _render_json_block(self, payload, *, max_chars: int | None = None) -> str:
+        if max_chars is None:
+            max_chars = self._json_char_limit
         try:
             json_text = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
         except TypeError:
             json_text = json.dumps(str(payload), ensure_ascii=False)
-        if len(json_text) > self._json_char_limit:
+        if len(json_text) > max_chars:
             suffix = "\n... (truncated)"
-            json_text = json_text[: self._json_char_limit - len(suffix)].rstrip() + suffix
-        return f"```json\n{json_text}\n```"
+            keep = max(1, int(max_chars) - len(suffix))
+            json_text = json_text[:keep].rstrip() + suffix
+        return f"<pre>{html.escape(json_text)}</pre>"
 
     def _normalize_final_reply_text(self, text: str) -> str:
         normalized = str(text or "").strip()
@@ -477,11 +583,22 @@ class TelegramStageStatus:
 
         entry = self._build_stage_entry(stage=stage, detail=detail, meta=meta, timestamp=timestamp)
         if self._show_json_details and self._detail_level == "debug" and "json" in meta:
-            entry = f"{entry}\n{self._render_json_block(meta.get('json'))}"
+            json_payload = meta.get("json")
+            json_block = self._render_json_block(json_payload)
+            candidate = f"{entry}\n{json_block}"
+            if len(candidate) > self._message_char_limit:
+                available = max(180, self._message_char_limit - len(entry) - 24)
+                json_block = self._render_json_block(json_payload, max_chars=available)
+                candidate = f"{entry}\n{json_block}"
+            if len(candidate) > self._message_char_limit:
+                candidate = f"{entry}\n<code>json payload omitted (too large)</code>"
+            entry = candidate
 
         if self._lines and self._lines[-1] == entry:
             return
-        self._lines = [entry]
+        self._lines.append(entry)
+        if len(self._lines) > max(self._history_limit * 4, 24):
+            self._lines = self._lines[-max(self._history_limit * 4, 24) :]
         await self._safe_edit(self._render(), parse_html=True)
 
     async def finalize(self, final_text: str):
@@ -895,30 +1012,89 @@ async def setPrompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         systemPromptText = f"{baseSystemPrompt}\n\nAdditional user instruction:\n{userSystemPrompt}"
     else:
         systemPromptText = baseSystemPrompt
-    
-    generateClient = AsyncClient(host=config.inference["generate"]["url"])
-    
+
+    inferenceGenerate = config.inference.get("generate", {}) if isinstance(config.inference, dict) else {}
+    inferenceChat = config.inference.get("chat", {}) if isinstance(config.inference, dict) else {}
+    generateHost = str(inferenceGenerate.get("url") or inferenceChat.get("url") or "").strip()
+    generateModel = str(inferenceGenerate.get("model") or inferenceChat.get("model") or "").strip()
+    if not generateHost or not generateModel:
+        logger.error("Generate command cannot resolve model host/model from config.")
+        context.chat_data["generate_data"] = None
+        return ConversationHandler.END
+
+    generateClient = AsyncClient(host=generateHost)
+    statusMessage = None
+    responseParts: list[str] = []
+    lastEditMonotonic = 0.0
+    editIntervalSeconds = 0.75
+
     try:
-        output = await generateClient.generate(
-            model=config.inference["generate"]["model"], 
-            stream=False, 
-            system=systemPromptText, 
-            prompt=message.text
+        statusMessage = await context.bot.send_message(
+            chat_id=chat.id,
+            message_thread_id=topicID,
+            text="Generating response...",
         )
-        responseText = output["response"]
     except Exception as err:
-        logger.error(f"Exception while generating a response from Ollama:\n{err}")
+        logger.warning(f"Unable to send generate status message:\n{err}")
+        statusMessage = None
+
+    try:
+        stream = await generateClient.chat(
+            model=generateModel,
+            stream=True,
+            messages=[
+                {"role": "system", "content": systemPromptText},
+                {"role": "user", "content": message.text},
+            ],
+        )
+        chunk: Any
+        async for chunk in stream:
+            chunkText = str(getattr(getattr(chunk, "message", None), "content", "") or "")
+            if not chunkText:
+                continue
+            responseParts.append(chunkText)
+            if statusMessage is None:
+                continue
+            now = time.monotonic()
+            if (now - lastEditMonotonic) < editIntervalSeconds:
+                continue
+            previewText = "".join(responseParts).strip()
+            if not previewText:
+                continue
+            previewText = TelegramStageStatus._truncate_text(previewText, 3800)
+            try:
+                await statusMessage.edit_text(text=previewText)
+                lastEditMonotonic = now
+            except Exception as err:
+                logger.debug(f"Generate stream status update failed:\n{err}")
+    except Exception as err:
+        logger.error(f"Exception while generating a response from Ollama chat stream:\n{err}")
+        context.chat_data["generate_data"] = None
         return ConversationHandler.END
     finally:
         # Delete the generate data from telegram bot storage
         context.chat_data["generate_data"] = None
-    
+
+    responseText = "".join(responseParts).strip()
+    if not responseText:
+        responseText = _TELEGRAM_FALLBACK_FINAL_REPLY
+    if len(responseText) > _TELEGRAM_MAX_MESSAGE_CHARS:
+        suffix = "\n\n[truncated]"
+        keep = max(1, _TELEGRAM_MAX_MESSAGE_CHARS - len(suffix))
+        responseText = responseText[:keep].rstrip() + suffix
+
+    if statusMessage is not None:
+        try:
+            await statusMessage.delete()
+        except Exception:
+            pass
+
     try:
         await context.bot.send_message(
-            chat_id=chat.id, 
+            chat_id=chat.id,
             message_thread_id=topicID,
             reply_markup=ReplyKeyboardRemove(),
-            text=responseText
+            text=responseText,
         )
     except Exception as err:
         logger.error(f"Exception while sending a telegram message:\n{err}")

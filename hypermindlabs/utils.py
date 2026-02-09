@@ -1267,6 +1267,9 @@ class ChatHistoryManager:
     ) -> list:
         logger.info(f"Searching chat history records.")
         embedding = getEmbeddings(text)
+        if embedding is None:
+            logger.warning("Skipping chat history search because embeddings are unavailable.")
+            return list()
         if limit is None:
             limit = ConfigManager().runtimeInt("retrieval.chat_history_default_limit", 1)
         if timeInHours is None:
@@ -2134,6 +2137,9 @@ class KnowledgeManager:
     def searchKnowledge(self, text: str, limit: int | None = None) -> list:
         logger.info(f"Searching knowledge documents.")
         embedding = getEmbeddings(text)
+        if embedding is None:
+            logger.warning("Skipping knowledge search because embeddings are unavailable.")
+            return list()
         if limit is None:
             limit = ConfigManager().runtimeInt("retrieval.knowledge_search_default_limit", 1)
 
@@ -2355,6 +2361,9 @@ class SpamManager:
     def searchSpam(self, text: str, limit: int | None = None) -> list:
         logger.info(f"Searching spam messages.")
         embedding = getEmbeddings(text)
+        if embedding is None:
+            logger.warning("Skipping spam search because embeddings are unavailable.")
+            return list()
         if limit is None:
             limit = ConfigManager().runtimeInt("retrieval.spam_search_default_limit", 1)
 
@@ -2480,12 +2489,30 @@ class UsageManager:
 
 def getEmbeddings(text: str) -> list:
     logger.info("Getting embeddings.")
+    promptText = str(text or "").strip()
+    if promptText == "":
+        logger.debug("Skipping embeddings request because input text is empty.")
+        return None
+
     configManager = ConfigManager()
     embeddingConfig = configManager.inference.get("embedding", {})
     host = embeddingConfig.get("url") if embeddingConfig.get("url") else configManager.runtimeValue(
         "inference.default_ollama_host", "http://127.0.0.1:11434"
     )
-    host = host or "http://127.0.0.1:11434"
+    host = str(host or "http://127.0.0.1:11434").rstrip("/")
+
+    probeTimeout = configManager.runtimeFloat("inference.probe_timeout_seconds", 3.0)
+    embeddingTimeout = configManager.runtimeFloat("inference.embedding_timeout_seconds", max(3.0, probeTimeout))
+    if embeddingTimeout <= 0:
+        embeddingTimeout = max(3.0, probeTimeout)
+
+    maxInputChars = configManager.runtimeInt("inference.embedding_max_input_chars", 6000)
+    if maxInputChars > 0 and len(promptText) > maxInputChars:
+        logger.info(
+            f"Truncating embedding input from {len(promptText)} to {maxInputChars} chars."
+        )
+        promptText = promptText[:maxInputChars]
+
     configuredModel = embeddingConfig.get("model")
     fallbackModel = configManager.runtimeValue("inference.default_embedding_model", "nomic-embed-text:latest")
     fallbackModel = fallbackModel or "nomic-embed-text:latest"
@@ -2502,20 +2529,37 @@ def getEmbeddings(text: str) -> list:
 
     lastError = None
     for index, model in enumerate(candidateModels):
+        started = time.monotonic()
         try:
-            results = Client(host=host).embeddings(
+            results = Client(host=host, timeout=float(embeddingTimeout)).embeddings(
                 model=model,
-                prompt=text
+                prompt=promptText,
             )
+            embeddingVector = getattr(results, "embedding", None)
+            if embeddingVector is None and isinstance(results, dict):
+                embeddingVector = results.get("embedding")
+            if not isinstance(embeddingVector, list) or len(embeddingVector) == 0:
+                raise ValueError("embedding response did not include a vector payload")
+
+            elapsed = time.monotonic() - started
             if index > 0:
-                logger.warning(f"Embedding model fallback succeeded with: {model}")
-            return results.embedding
+                logger.warning(f"Embedding model fallback succeeded with: {model} ({elapsed:.2f}s)")
+            else:
+                logger.debug(f"Embedding model '{model}' completed in {elapsed:.2f}s")
+            return embeddingVector
         except Exception as error:  # noqa: BLE001
+            elapsed = time.monotonic() - started
             lastError = error
             if index < (len(candidateModels) - 1):
-                logger.warning(f"Embedding model '{model}' failed; trying fallback model.")
+                logger.warning(
+                    f"Embedding model '{model}' failed after {elapsed:.2f}s "
+                    f"(timeout={embeddingTimeout:.1f}s); trying fallback model."
+                )
                 continue
-            logger.error(f"Exception while getting embeddings from Ollama:\n{error}")
+            logger.error(
+                f"Exception while getting embeddings from Ollama after {elapsed:.2f}s "
+                f"(timeout={embeddingTimeout:.1f}s):\n{error}"
+            )
 
     if lastError is not None:
         logger.debug(f"Last embedding model error: {lastError}")
