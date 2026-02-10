@@ -133,6 +133,7 @@
       "minimum_community_score_other_group": 20,
       "minimum_community_score_link": 20,
       "minimum_community_score_forward": 20,
+      "public_group_disclaimer_enabled": false,
       "admin_claim_enabled": true,
       "admin_claim_accept_raw_message": true,
       "admin_config_commands_enabled": true,

@@ -1894,6 +1894,15 @@ ROUTE_CONFIG_SPECS: dict[str, RouteConfigSpec] = {
                         default_runtime_path="telegram.group_storage_prefix",
                         env_override_keys=("RYO_TELEGRAM_GROUP_STORAGE_PREFIX",),
                     ),
+                    RouteSettingSpec(
+                        id="public_group_disclaimer_enabled",
+                        label="Public Group Disclaimer",
+                        path="runtime.telegram.public_group_disclaimer_enabled",
+                        value_type="bool",
+                        description="Append a disclaimer footer to bot replies in public/group chats.",
+                        default_runtime_path="telegram.public_group_disclaimer_enabled",
+                        env_override_keys=("RYO_TELEGRAM_PUBLIC_GROUP_DISCLAIMER_ENABLED",),
+                    ),
                 ),
             ),
             RouteCategorySpec(

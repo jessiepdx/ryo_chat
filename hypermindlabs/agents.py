@@ -109,6 +109,7 @@ _CONTROL_PLANE_MANAGER_CACHE: dict[str, dict[str, Any]] = {}
 _CONTROL_PLANE_POLICY_CACHE: dict[str, dict[str, Any]] = {}
 _CONTROL_PLANE_PROMPT_CACHE: dict[str, dict[str, Any]] = {}
 _TOOL_CAPABILITY_CACHE: dict[str, dict[str, Any]] = {}
+_PARENT_AWARENESS_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def _runtime_int(path: str, default: int) -> int:
@@ -290,6 +291,7 @@ _ALLOWED_TOOL_HINTS = {
     "chatHistorySearch",
     "knowledgeSearch",
     "skipTools",
+    "knownGroupsList",
     "knownUsersList",
     "messageKnownUser",
     "upsertProcessWorkspace",
@@ -671,6 +673,7 @@ def _known_context_stage_preview(tool_results: dict[str, Any] | None) -> dict[st
             "small_talk_turn": _coerce_dict(payload.get("memory_circuit")).get("small_talk_turn"),
             "routing_note": _coerce_dict(payload.get("memory_circuit")).get("routing_note"),
         },
+        "parent_awareness": _parent_awareness_stage_preview(payload.get("parent_awareness")),
         "workspace_context": _workspace_context_stage_preview(payload.get("workspace_context")),
         "personality_context": _personality_context_stage_preview(payload.get("personality_context")),
     }
@@ -787,6 +790,187 @@ def _workspace_context_stage_preview(workspace_context: dict[str, Any] | None) -
         "active_processes": active_preview,
         "recent_outbox": outbox_preview,
     }
+
+
+def _parent_awareness_stage_preview(parent_awareness: dict[str, Any] | None) -> dict[str, Any]:
+    payload = _coerce_dict(parent_awareness)
+    known_groups_raw = payload.get("known_groups")
+    known_groups = known_groups_raw if isinstance(known_groups_raw, list) else []
+    digest_raw = payload.get("public_group_digest")
+    digest_items = digest_raw if isinstance(digest_raw, list) else []
+    contacts_raw = payload.get("member_contact_recency")
+    contacts = contacts_raw if isinstance(contacts_raw, list) else []
+
+    known_groups_preview: list[dict[str, Any]] = []
+    for group in known_groups[:8]:
+        group_map = _coerce_dict(group)
+        known_groups_preview.append(
+            {
+                "community_id": group_map.get("community_id"),
+                "community_name": _truncate_for_prompt(
+                    group_map.get("community_name") or group_map.get("chat_title"),
+                    80,
+                ),
+                "chat_id": group_map.get("chat_id"),
+                "last_activity_at": group_map.get("last_activity_at"),
+                "activity_24h_count": _safe_int(group_map.get("activity_24h_count"), 0),
+            }
+        )
+
+    digest_preview: list[dict[str, Any]] = []
+    for digest_item in digest_items[:6]:
+        digest_map = _coerce_dict(digest_item)
+        digest_preview.append(
+            {
+                "community_id": digest_map.get("community_id"),
+                "community_name": _truncate_for_prompt(
+                    digest_map.get("community_name") or digest_map.get("chat_title"),
+                    80,
+                ),
+                "last_assistant_at": digest_map.get("last_assistant_at"),
+                "last_assistant_excerpt": _truncate_for_prompt(
+                    digest_map.get("last_assistant_excerpt"),
+                    160,
+                ),
+            }
+        )
+
+    contacts_preview: list[dict[str, Any]] = []
+    for contact in contacts[:10]:
+        contact_map = _coerce_dict(contact)
+        contacts_preview.append(
+            {
+                "member_id": contact_map.get("member_id"),
+                "username": _as_text(contact_map.get("username")),
+                "first_name": _as_text(contact_map.get("first_name")),
+                "last_contact_at": contact_map.get("last_contact_at"),
+            }
+        )
+
+    return {
+        "schema": _as_text(payload.get("schema"), "ryo.parent_awareness.v1"),
+        "enabled": _as_bool(payload.get("enabled"), True),
+        "chat_type": _as_text(payload.get("chat_type"), "member"),
+        "known_groups_count": _safe_int(payload.get("known_groups_count"), len(known_groups_preview)),
+        "public_group_digest_count": _safe_int(
+            payload.get("public_group_digest_count"),
+            len(digest_preview),
+        ),
+        "member_contact_count": _safe_int(payload.get("member_contact_count"), len(contacts_preview)),
+        "current_group_id": payload.get("current_group_id"),
+        "privacy_boundary": _truncate_for_prompt(payload.get("privacy_boundary"), 180),
+        "known_groups": known_groups_preview,
+        "public_group_digest": digest_preview,
+        "member_contact_recency": contacts_preview,
+    }
+
+
+def _parent_awareness_context_for_session(
+    *,
+    member_id: Any,
+    chat_type: Any,
+    community_id: Any,
+) -> dict[str, Any]:
+    if not _runtime_bool("orchestrator.parent_awareness_enabled", True):
+        return {
+            "schema": "ryo.parent_awareness.v1",
+            "enabled": False,
+            "chat_type": _as_text(chat_type, "member"),
+            "known_groups_count": 0,
+            "known_groups": [],
+            "public_group_digest_count": 0,
+            "public_group_digest": [],
+            "member_contact_count": 0,
+            "member_contact_recency": [],
+            "current_group_id": _safe_int(community_id, 0) or None,
+            "privacy_boundary": (
+                "Parent awareness disabled by runtime. Group chats never receive private-message content."
+            ),
+        }
+
+    chat_type_normalized = _as_text(chat_type, "member").lower()
+    member_id_int = _safe_int(member_id, 0)
+    community_id_int = _safe_int(community_id, 0)
+    groups_limit = max(1, min(20, _runtime_int("orchestrator.parent_awareness_group_limit", 8)))
+    contacts_limit = max(1, min(40, _runtime_int("orchestrator.parent_awareness_contact_limit", 12)))
+    digest_limit = max(1, min(groups_limit, _runtime_int("orchestrator.parent_awareness_digest_limit", 5)))
+
+    cache_ttl_seconds = max(5.0, _runtime_float("orchestrator.parent_awareness_cache_ttl_seconds", 45.0))
+    cache_key = f"{chat_type_normalized}|{member_id_int}|{community_id_int}|{groups_limit}|{contacts_limit}|{digest_limit}"
+    cached_entry = _PARENT_AWARENESS_CACHE.get(cache_key)
+    if isinstance(cached_entry, dict):
+        cached_at = float(cached_entry.get("cached_at") or 0.0)
+        if (time.monotonic() - cached_at) <= cache_ttl_seconds:
+            cached_payload = _coerce_dict(cached_entry.get("payload"))
+            if cached_payload:
+                return copy.deepcopy(cached_payload)
+
+    known_groups = collaboration.listKnownGroups(count=groups_limit)
+    groups_preview: list[dict[str, Any]] = []
+    for record in known_groups:
+        row = _coerce_dict(record)
+        groups_preview.append(
+            {
+                "community_id": row.get("community_id"),
+                "community_name": _as_text(row.get("community_name")),
+                "chat_title": _as_text(row.get("chat_title")),
+                "chat_id": row.get("chat_id"),
+                "last_activity_at": row.get("last_activity_at"),
+                "activity_24h_count": _safe_int(row.get("activity_24h_count"), 0),
+                "last_assistant_at": row.get("last_assistant_at"),
+                "last_assistant_excerpt": _truncate_for_prompt(row.get("last_assistant_excerpt"), 180),
+            }
+        )
+
+    public_group_digest: list[dict[str, Any]] = []
+    if chat_type_normalized == "member":
+        for group in groups_preview[:digest_limit]:
+            public_group_digest.append(
+                {
+                    "community_id": group.get("community_id"),
+                    "community_name": group.get("community_name") or group.get("chat_title"),
+                    "chat_id": group.get("chat_id"),
+                    "last_assistant_at": group.get("last_assistant_at"),
+                    "last_assistant_excerpt": group.get("last_assistant_excerpt"),
+                }
+            )
+
+    member_contact_recency: list[dict[str, Any]] = []
+    if chat_type_normalized == "community":
+        contact_rows = collaboration.listKnownUsers(count=contacts_limit)
+        for contact in contact_rows:
+            row = _coerce_dict(contact)
+            member_contact_recency.append(
+                {
+                    "member_id": row.get("member_id"),
+                    "username": _as_text(row.get("username")),
+                    "first_name": _as_text(row.get("first_name")),
+                    "last_name": _as_text(row.get("last_name")),
+                    "last_contact_at": row.get("last_contact_at"),
+                }
+            )
+
+    payload = {
+        "schema": "ryo.parent_awareness.v1",
+        "enabled": True,
+        "chat_type": chat_type_normalized,
+        "known_groups_count": len(groups_preview),
+        "known_groups": groups_preview,
+        "public_group_digest_count": len(public_group_digest),
+        "public_group_digest": public_group_digest,
+        "member_contact_count": len(member_contact_recency),
+        "member_contact_recency": member_contact_recency,
+        "current_group_id": community_id_int if community_id_int > 0 else None,
+        "privacy_boundary": (
+            "Community sessions are restricted from private-message content. "
+            "Only user directory metadata and last-contact timestamps are exposed in group scope."
+        ),
+    }
+    _PARENT_AWARENESS_CACHE[cache_key] = {
+        "cached_at": time.monotonic(),
+        "payload": copy.deepcopy(payload),
+    }
+    return payload
 
 
 def _personality_runtime_config() -> PersonalityRuntimeConfig:
@@ -1862,6 +2046,13 @@ def _normalize_analysis_payload(
         "list_users": "list_users",
         "users": "list_users",
         "known_users": "list_users",
+        "list_groups": "list_groups",
+        "groups": "list_groups",
+        "known_groups": "list_groups",
+        "group_list": "list_groups",
+        "group_activity": "group_activity",
+        "community_activity": "group_activity",
+        "group_summary": "group_activity",
         "send_message": "send_message",
         "message_user": "send_message",
         "direct_message": "send_message",
@@ -1909,6 +2100,8 @@ def _normalize_analysis_payload(
         process_directive["step_status"] = "completed"
     process_action_hints = {
         "list_users": ["knownUsersList"],
+        "list_groups": ["knownGroupsList"],
+        "group_activity": ["knownGroupsList"],
         "send_message": ["knownUsersList", "messageKnownUser"],
         "start_process": ["upsertProcessWorkspace"],
         "resume_process": ["listProcessWorkspace"],
@@ -2211,6 +2404,8 @@ def _tool_suggestion_plan(
 
     process_action_map = {
         "list_users": [("knownUsersList", "Resolve known users before inter-user actions.")],
+        "list_groups": [("knownGroupsList", "List known public groups and their latest activity context.")],
+        "group_activity": [("knownGroupsList", "Retrieve recent public-group communication summaries.")],
         "send_message": [
             ("knownUsersList", "Resolve recipient identity before sending."),
             ("messageKnownUser", "Deliver or queue the inter-user message."),
@@ -2288,6 +2483,8 @@ def _tool_suggestion_plan(
             add_suggestion("knowledgeSearch", "Retrieve project-specific indexed knowledge context.", idx)
         elif hint == "knownUsersList":
             add_suggestion("knownUsersList", "Resolve users for communication workflows.", idx)
+        elif hint == "knownGroupsList":
+            add_suggestion("knownGroupsList", "Retrieve known public-group metadata and recent assistant activity.", idx)
         elif hint == "listProcessWorkspace":
             add_suggestion("listProcessWorkspace", "Load current process state before continuing steps.", idx)
         elif hint == "updateProcessWorkspaceStep":
@@ -2612,6 +2809,12 @@ class ConversationOrchestrator:
         workspaceContext = _workspace_context_for_member(
             self._memberID if not self._transientSession else None
         )
+        parentAwarenessContext = _parent_awareness_context_for_session(
+            member_id=self._memberID if not self._transientSession else None,
+            chat_type=self._chatType,
+            community_id=self._communityID,
+        )
+        parentAwarenessPreview = _parent_awareness_stage_preview(parentAwarenessContext)
         workspaceContextPreview = _workspace_context_stage_preview(workspaceContext)
         if _as_bool(topicTransition.get("switched"), False):
             await self._emit_stage(
@@ -2628,6 +2831,15 @@ class ConversationOrchestrator:
                 active_process_count=workspaceContextPreview.get("active_process_count", 0),
                 pending_outbox_count=workspaceContextPreview.get("pending_outbox_count", 0),
                 json=workspaceContextPreview,
+            )
+        if _as_bool(parentAwarenessContext.get("enabled"), False):
+            await self._emit_stage(
+                "context.parent_awareness",
+                "Loaded parent awareness for groups/users with privacy-boundary guards.",
+                known_groups_count=parentAwarenessPreview.get("known_groups_count", 0),
+                public_group_digest_count=parentAwarenessPreview.get("public_group_digest_count", 0),
+                member_contact_count=parentAwarenessPreview.get("member_contact_count", 0),
+                json=parentAwarenessPreview,
             )
 
         if personalityEnabled:
@@ -2719,6 +2931,7 @@ class ConversationOrchestrator:
                 "temporal_context": temporalContext,
                 "topic_transition": topicTransition,
                 "memory_circuit": memoryCircuit,
+                "parent_awareness": parentAwarenessContext,
                 "workspace_context": workspaceContext,
                 "image_context": _coerce_dict(self._imageContext),
                 "personality_context": personalityStagePreview,
@@ -3221,9 +3434,11 @@ class ConversationOrchestrator:
                     "chat_type": self._chatType,
                     "platform": self._platform,
                     "topic_id": self._topicID,
+                    "community_id": self._communityID,
                     "member_id": self._memberID,
                     "topic_transition": _coerce_dict(knownContextResults.get("topic_transition")),
                     "memory_circuit": _coerce_dict(knownContextResults.get("memory_circuit")),
+                    "parent_awareness": _coerce_dict(knownContextResults.get("parent_awareness")),
                     "workspace_context": _coerce_dict(knownContextResults.get("workspace_context")),
                     "history_search_allowed": _as_bool(
                         _coerce_dict(knownContextResults.get("memory_circuit")).get("history_search_allowed"),

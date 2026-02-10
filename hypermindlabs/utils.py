@@ -1206,10 +1206,18 @@ class CollaborationWorkspaceManager:
                 where_sql = "WHERE " + " AND ".join(where_parts)
 
             cursor.execute(
-                f"""SELECT mem.member_id, mem.first_name, mem.last_name, mem.community_score, mem.roles, tg.username, tg.user_id
+                f"""SELECT mem.member_id, mem.first_name, mem.last_name, mem.community_score, mem.roles, tg.username, tg.user_id,
+                contact.last_contact_at
                 FROM member_data AS mem
                 LEFT JOIN member_telegram AS tg
                 ON mem.member_id = tg.member_id
+                LEFT JOIN (
+                    SELECT chat_host_id AS member_id, MAX(message_timestamp) AS last_contact_at
+                    FROM chat_history
+                    WHERE chat_type = 'member'
+                    GROUP BY chat_host_id
+                ) AS contact
+                ON mem.member_id = contact.member_id
                 {where_sql}
                 ORDER BY LOWER(COALESCE(tg.username, '')), mem.member_id
                 LIMIT %s;""",
@@ -1228,11 +1236,122 @@ class CollaborationWorkspaceManager:
                         "community_score": row_map.get("community_score"),
                         "roles": row_map.get("roles") if isinstance(row_map.get("roles"), list) else [],
                         "has_telegram_user_id": row_map.get("user_id") is not None,
+                        "last_contact_at": self._timestamp_iso(row_map.get("last_contact_at")),
                     }
                 )
             cursor.close()
         except psycopg.Error as error:
             logger.error(f"Exception while listing known users:\n{error}")
+        finally:
+            if connection:
+                connection.close()
+        return response
+
+    def listKnownGroups(
+        self,
+        queryString: str | None = None,
+        count: int = 12,
+    ) -> list[dict[str, Any]]:
+        limit = min(64, max(1, self._as_int(count, 12) or 12))
+        query = self._as_text(queryString).lower()
+
+        connection = None
+        response: list[dict[str, Any]] = []
+        try:
+            connection = self._connect()
+            cursor = connection.cursor()
+
+            where_parts = []
+            values: list[Any] = []
+            if query:
+                like = f"%{query}%"
+                where_parts.append(
+                    "("
+                    "LOWER(COALESCE(cd.community_name, '')) LIKE %s "
+                    "OR LOWER(COALESCE(tg.chat_title, '')) LIKE %s "
+                    "OR LOWER(COALESCE(cd.community_link, '')) LIKE %s "
+                    "OR CAST(cd.community_id AS TEXT) = %s "
+                    "OR CAST(COALESCE(tg.chat_id, 0) AS TEXT) = %s"
+                    ")"
+                )
+                values.extend([like, like, like, query, query])
+
+            where_sql = ""
+            if where_parts:
+                where_sql = "WHERE " + " AND ".join(where_parts)
+
+            cursor.execute(
+                f"""SELECT
+                    cd.community_id,
+                    cd.community_name,
+                    cd.community_link,
+                    cd.roles,
+                    tg.chat_id,
+                    tg.chat_title,
+                    tg.has_topics,
+                    last_msg.message_timestamp AS last_activity_at,
+                    assistant_msg.message_timestamp AS last_assistant_at,
+                    assistant_msg.message_text AS last_assistant_message,
+                    activity.activity_24h_count
+                FROM community_data AS cd
+                LEFT JOIN community_telegram AS tg
+                ON cd.community_id = tg.community_id
+                LEFT JOIN LATERAL (
+                    SELECT ch.message_timestamp, ch.message_text
+                    FROM chat_history AS ch
+                    WHERE ch.community_id = cd.community_id
+                    AND ch.chat_type = 'community'
+                    ORDER BY ch.message_timestamp DESC
+                    LIMIT 1
+                ) AS last_msg
+                ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT ch.message_timestamp, ch.message_text
+                    FROM chat_history AS ch
+                    WHERE ch.community_id = cd.community_id
+                    AND ch.chat_type = 'community'
+                    AND ch.member_id IS NULL
+                    ORDER BY ch.message_timestamp DESC
+                    LIMIT 1
+                ) AS assistant_msg
+                ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT COUNT(*)::INT AS activity_24h_count
+                    FROM chat_history AS ch
+                    WHERE ch.community_id = cd.community_id
+                    AND ch.chat_type = 'community'
+                    AND ch.message_timestamp > (NOW() - INTERVAL '24 HOURS')
+                ) AS activity
+                ON TRUE
+                {where_sql}
+                ORDER BY COALESCE(last_msg.message_timestamp, cd.register_date) DESC, cd.community_id
+                LIMIT %s;""",
+                (*values, limit),
+            )
+            rows = cursor.fetchall() or []
+            cursor.close()
+            for row in rows:
+                row_map = self._coerce_dict(row)
+                assistant_excerpt = self._as_text(row_map.get("last_assistant_message"))
+                if len(assistant_excerpt) > 220:
+                    assistant_excerpt = assistant_excerpt[:217].rstrip() + "..."
+                response.append(
+                    {
+                        "community_id": row_map.get("community_id"),
+                        "community_name": self._as_text(row_map.get("community_name")),
+                        "community_link": self._as_text(row_map.get("community_link")),
+                        "chat_id": row_map.get("chat_id"),
+                        "chat_title": self._as_text(row_map.get("chat_title")),
+                        "has_topics": bool(row_map.get("has_topics")),
+                        "roles": row_map.get("roles") if isinstance(row_map.get("roles"), list) else [],
+                        "activity_24h_count": self._as_int(row_map.get("activity_24h_count"), 0) or 0,
+                        "last_activity_at": self._timestamp_iso(row_map.get("last_activity_at")),
+                        "last_assistant_at": self._timestamp_iso(row_map.get("last_assistant_at")),
+                        "last_assistant_excerpt": assistant_excerpt,
+                    }
+                )
+        except psycopg.Error as error:
+            logger.error(f"Exception while listing known groups:\n{error}")
         finally:
             if connection:
                 connection.close()

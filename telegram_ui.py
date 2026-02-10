@@ -614,6 +614,9 @@ _ORCHESTRATION_STAGE_LABELS = {
 _TELEGRAM_STAGE_DETAIL_LEVELS = {"minimal", "normal", "debug"}
 _TELEGRAM_MAX_MESSAGE_CHARS = 4096
 _TELEGRAM_FALLBACK_FINAL_REPLY = "I could not generate a complete reply this turn. Please try again."
+_PUBLIC_GROUP_DISCLAIMER_TEXT = (
+    "Disclaimer: Test chatbots are prone to hallucination. Responses may or may not be factually correct."
+)
 _MINIMAL_VISIBLE_STAGES = {
     "orchestrator.start",
     "orchestrator.fast_path",
@@ -684,6 +687,19 @@ def _stage_event_snapshot(event: dict[str, Any] | None) -> dict[str, Any]:
         "meta": _inspector_json_safe(payload.get("meta") if isinstance(payload.get("meta"), dict) else {}),
     }
     return snapshot
+
+
+def _public_group_disclaimer_enabled() -> bool:
+    return _runtime_bool("telegram.public_group_disclaimer_enabled", False)
+
+
+def _with_public_group_disclaimer(text: str) -> str:
+    base = str(text or "").strip()
+    if not _public_group_disclaimer_enabled():
+        return base
+    if _PUBLIC_GROUP_DISCLAIMER_TEXT in base:
+        return base
+    return f"{base}\n\n{_PUBLIC_GROUP_DISCLAIMER_TEXT}"
 
 
 def _append_stage_event(stage_events: list[dict[str, Any]], event: dict[str, Any] | None) -> None:
@@ -3892,10 +3908,7 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         # Send the conversational agent response
-        finalText = (
-            f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. "
-            "Responses may or may not be factually correct."
-        )
+        finalText = _with_public_group_disclaimer(str(response))
         responseMessage = await stageStatus.finalize(finalText)
         await _attach_run_inspector_controls(
             response_message=responseMessage,
@@ -4309,7 +4322,7 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finalText = (
             str(response)
             if chat.type == "private"
-            else f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. Responses may or may not be factually correct."
+            else _with_public_group_disclaimer(str(response))
         )
         responseMessage = await stageStatus.finalize(finalText)
         await _attach_run_inspector_controls(
@@ -4546,10 +4559,7 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Send the conversational agent response
     try:
-        finalText = (
-            f"{response}\n\n*Disclaimer*:  Test chatbots are prone to hallucination. "
-            "Responses may or may not be factually correct."
-        )
+        finalText = _with_public_group_disclaimer(str(response))
         responseMessage = await stageStatus.finalize(finalText)
         await _attach_run_inspector_controls(
             response_message=responseMessage,
