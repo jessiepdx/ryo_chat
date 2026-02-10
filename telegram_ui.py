@@ -317,6 +317,16 @@ def _member_has_admin_access(member: dict | None) -> bool:
     return any(role in {"admin", "owner"} for role in roles)
 
 
+def _controller_user_id() -> int:
+    config_payload = getattr(config, "config_json", {})
+    if not isinstance(config_payload, dict):
+        return 0
+    auth_section = config_payload.get(TELEGRAM_ADMIN_AUTH_SECTION)
+    if not isinstance(auth_section, dict):
+        return 0
+    return max(0, _safe_admin_int(auth_section.get("controller_user_id"), 0))
+
+
 def _set_nested_path(payload: dict[str, Any], path: str, value: Any) -> None:
     parts = [part for part in str(path or "").split(".") if part]
     if not parts:
@@ -397,6 +407,52 @@ def _admin_commands_overview() -> str:
         "/config set <path> <value> - update a config value\n"
         "/config reload - reload config from disk"
     )
+
+
+def _community_isolation_context(community: dict | None, chatID: int | None) -> dict[str, Any]:
+    if not isinstance(community, dict):
+        return {
+            "enabled": False,
+            "context_isolation_enabled": False,
+            "community_id": None,
+            "chat_id": chatID,
+            "storage_mode": None,
+            "storage_key": None,
+            "storage_schema": None,
+            "storage_database": None,
+        }
+
+    communityID = community.get("community_id")
+    storageMode = community.get("storage_mode")
+    storageKey = community.get("storage_key")
+    storageSchema = community.get("storage_schema")
+    storageDatabase = community.get("storage_database")
+    isolationEnabled = community.get("context_isolation_enabled")
+    if isolationEnabled is None:
+        isolationEnabled = _runtime_bool("telegram.group_context_isolation_enabled", True)
+    if (storageKey is None or storageMode is None) and communityID is not None and chatID is not None:
+        ensured = communities.ensureCommunityIsolation(
+            communityID=communityID,
+            chatID=chatID,
+            platform="telegram",
+        )
+        if isinstance(ensured, dict):
+            storageMode = ensured.get("storage_mode")
+            storageKey = ensured.get("storage_key")
+            storageSchema = ensured.get("storage_schema")
+            storageDatabase = ensured.get("storage_database")
+            isolationEnabled = ensured.get("context_isolation_enabled", isolationEnabled)
+
+    return {
+        "enabled": True,
+        "context_isolation_enabled": bool(isolationEnabled),
+        "community_id": communityID,
+        "chat_id": chatID,
+        "storage_mode": storageMode,
+        "storage_key": storageKey,
+        "storage_schema": storageSchema,
+        "storage_database": storageDatabase,
+    }
 
 
 def _utc_now() -> datetime:
@@ -3779,12 +3835,14 @@ async def directChatGroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # User has reach rate limit, exit function
                 return
 
+    isolationContext = _community_isolation_context(community, chat.id)
     messageContext = {
         "community_id": community.get("community_id"),
         "chat_host_id": community.get("community_id"),
         "chat_type": "community",
         "platform": "telegram",
         "topic_id" : topicID,
+        "community_isolation": isolationContext,
         **_message_temporal_context(message),
     }
     
@@ -4094,6 +4152,7 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Get account information
     communityID = None
+    community = None
     chatHostID = memberID
     chatType = "member"
     threadID = None
@@ -4184,6 +4243,7 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "height": getattr(bestPhoto, "height", None),
     }
 
+    isolationContext = _community_isolation_context(community, chat.id)
     messageData = {
         "community_id": communityID,
         "chat_host_id": chatHostID,
@@ -4194,6 +4254,7 @@ async def handleImage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "message_id": message.message_id,
         "message_text": imagePrompt,
         "image_context": imageContext,
+        "community_isolation": isolationContext,
         **_message_temporal_context(message),
     }
 
@@ -4426,6 +4487,7 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # User has reach rate limit, exit function
                 return
 
+    isolationContext = _community_isolation_context(community, chat.id)
     messageData = {
         "community_id": communityID,
         "chat_host_id": communityID,
@@ -4435,6 +4497,7 @@ async def replyToBot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "topic_id" : topicID,
         "message_id": message.message_id,
         "message_text": message.text,
+        "community_isolation": isolationContext,
         **_message_temporal_context(message),
     }
     
@@ -4530,80 +4593,133 @@ async def botStatusChanged(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat = update.effective_chat
     fromUser = update.my_chat_member.from_user
     newStatus = update.my_chat_member.new_chat_member
+    if chat is None or fromUser is None or newStatus is None:
+        return
+    if chat.type not in {"group", "supergroup"}:
+        return
 
     # Get the group account information
     community = communities.getCommunityByTelegramID(chat.id)
-    
-    # Check if status change is being added to a group and if the group is not registered with the chatbot
-    if newStatus.status == constants.ChatMemberStatus.MEMBER and community is None:
-        logger.info(f"Chatbot has been added to a new group chat.")
-        # Get the account for the user adding the chatbot to the group
-        member = members.getMemberByTelegramID(fromUser.id)
 
-        # Set the allowed roles
-        allowedRoles = ["admin", "owner"]
-        rolesAvailable = member.get("roles") if member else []
-
-        if (not any(role in rolesAvailable for role in allowedRoles)):
-            # User does not have permission to add the bot to the chat
-            # Check if user exist
-            if member is None:
-                logger.warning(f"A non-registered user {fromUser.name} ({fromUser.id}) attempted to add the chatbot to the {chat.title} group chat.")
-                responseText="Non registered user's are not authorized to add the chatbot to group chats. To register, start a private conversation with the chatbot."
-            else:
-                logger.warning(f"A non-authorized user {fromUser.name} ({fromUser.id}) attempted to add the chatbot to the {chat.title} group chat.")
-                responseText = "You are not authorized to add the chatbot to group chats."
-                
-            try:
-                # Send response
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text=responseText
-                )
-                # Exit the group chat
-                await context.bot.leave_chat(chat.id)
-            except Exception as err:
-                logger.error(f"Exception while removing chatbot from an unauthorized group:\n{err}")
-            finally:
-                # Exit the function
-                return
-
-        # Chat isn't registered and user is authorized
-        logger.info(f"User {fromUser.name} ({fromUser.id}) is authorized to add chatbot to group chats.")
-
-        newCommunityData = {
-            "community_name": chat.title,
-            "community_link": None,
-            "roles": ["user"],
-            "created_by": member.get("member_id"),
-            "chat_id": chat.id,
-            "chat_title": chat.title,
-            "has_topics": True if (chat.type) == "supergroup" else False,
-            "register_date": datetime.now()
-        }
-
-        # Add new individual account via accounts manager
-        communities.addCommunityFromTelegram(newCommunityData)
-        try:
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=f"Hello, I am the {config.botName} chatbot. Use the /help command for more information."
-            )
-        except Exception as err:
-            logger.error(f"Exception while sending a telegram message:\n{err}")
-        finally:
-            # Exit the function
-            return
-        
-    elif newStatus.status != constants.ChatMemberStatus.MEMBER:
+    # We only register when the bot is actively present in the chat.
+    if newStatus.status not in {
+        constants.ChatMemberStatus.MEMBER,
+        constants.ChatMemberStatus.ADMINISTRATOR,
+    }:
         logger.info(f"The chatbot's status change is:  {newStatus.status}.")
         return
-        
-    elif community is not None:
-        logger.info(f"The chatbot has already been registered for this group.")
+
+    # Existing group: refresh metadata + isolation and continue.
+    if community is not None:
+        communityID = community.get("community_id")
+        if communityID is not None:
+            communities.updateCommunityTelegramMetadata(
+                communityID=communityID,
+                chatID=chat.id,
+                chatTitle=chat.title,
+                hasTopics=bool(chat.type == "supergroup"),
+            )
+            communities.ensureCommunityIsolation(
+                communityID=communityID,
+                chatID=chat.id,
+                platform="telegram",
+            )
+        logger.info(f"The chatbot is already registered for this group.")
         return
-    else:
-        return
+
+    logger.info(f"Chatbot has been added to a new group chat.")
+    # Get the account for the user adding the chatbot to the group.
+    member = members.getMemberByTelegramID(fromUser.id)
+    controllerUserID = _controller_user_id()
+    authorizedByController = int(fromUser.id) == int(controllerUserID) and controllerUserID > 0
+    allowedRoles = ["admin", "owner"]
+    rolesAvailable = member.get("roles") if isinstance(member, dict) else []
+    authorizedByRole = any(role in rolesAvailable for role in allowedRoles)
+
+    if authorizedByController and member is None:
+        member = await _ensure_member_record(fromUser)
+        if member is not None and not _member_has_admin_access(member):
+            promotedRoles = list(member.get("roles") or [])
+            if "admin" not in promotedRoles:
+                promotedRoles.append("admin")
+                members.updateMemberRoles(member.get("member_id"), promotedRoles)
+                member = members.getMemberByTelegramID(fromUser.id) or member
+        rolesAvailable = member.get("roles") if isinstance(member, dict) else rolesAvailable
+        authorizedByRole = any(role in rolesAvailable for role in allowedRoles)
+
+    if not (authorizedByController or authorizedByRole):
+        if member is None:
+            logger.warning(
+                f"A non-registered user {fromUser.name} ({fromUser.id}) attempted to add the chatbot to the {chat.title} group chat."
+            )
+            responseText = (
+                "Non-registered users are not authorized to add the chatbot to group chats. "
+                "To register, start a private conversation with the chatbot first."
+            )
+        else:
+            logger.warning(
+                f"A non-authorized user {fromUser.name} ({fromUser.id}) attempted to add the chatbot to the {chat.title} group chat."
+            )
+            responseText = "You are not authorized to add the chatbot to group chats."
+
+        try:
+            await context.bot.send_message(chat_id=chat.id, text=responseText)
+            await context.bot.leave_chat(chat.id)
+        except Exception as err:
+            logger.error(f"Exception while removing chatbot from an unauthorized group:\n{err}")
+        finally:
+            return
+
+    logger.info(
+        "User %s (%s) is authorized to add chatbot to group chats (controller=%s, role_based=%s).",
+        fromUser.name,
+        fromUser.id,
+        authorizedByController,
+        authorizedByRole,
+    )
+
+    newCommunityData = {
+        "community_name": chat.title,
+        "community_link": None,
+        "roles": ["user"],
+        "created_by": None if member is None else member.get("member_id"),
+        "chat_id": chat.id,
+        "chat_title": chat.title,
+        "has_topics": bool(chat.type == "supergroup"),
+        "register_date": datetime.now(),
+    }
+
+    createdCommunity = communities.addCommunityFromTelegram(newCommunityData)
+    isolationKey = None
+    if isinstance(createdCommunity, dict):
+        isolationKey = createdCommunity.get("storage_key")
+    if not isolationKey and isinstance(createdCommunity, dict):
+        communityID = createdCommunity.get("community_id")
+        if communityID is not None:
+            isolation = communities.ensureCommunityIsolation(
+                communityID=communityID,
+                chatID=chat.id,
+                platform="telegram",
+            )
+            if isinstance(isolation, dict):
+                isolationKey = isolation.get("storage_key")
+
+    try:
+        suffix = (
+            f"\n\nIsolation key: {isolationKey}"
+            if isolationKey
+            else ""
+        )
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                f"Hello, I am the {config.botName} chatbot. "
+                "Use the /help command for more information."
+                f"{suffix}"
+            ),
+        )
+    except Exception as err:
+        logger.error(f"Exception while sending a telegram message:\n{err}")
 
 
 async def newChatUser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

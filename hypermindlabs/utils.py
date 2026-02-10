@@ -126,6 +126,7 @@ STARTUP_CORE_MIGRATIONS: tuple[str, ...] = (
     "086_member_personality_profile.sql",
     "087_member_narrative_chunks.sql",
     "088_member_personality_events.sql",
+    "089_community_isolation.sql",
 )
 STARTUP_VECTOR_MIGRATIONS: tuple[str, ...] = (
     "011_create_vector_extension.sql",
@@ -2516,6 +2517,9 @@ class CommunityManager:
                 
                 # Create the community telegram table if it doesn't exist
                 execute_migration(cursor, "021_community_telegram.sql")
+
+                # Create per-community isolation metadata table.
+                execute_migration(cursor, "089_community_isolation.sql")
                 connection.commit()
                 # Close the cursor
                 cursor.close()
@@ -2528,6 +2532,31 @@ class CommunityManager:
         
         return cls._instance
 
+    @staticmethod
+    def _default_group_storage_mode() -> str:
+        mode = str(
+            ConfigManager().runtimeValue("telegram.group_storage_mode", "shared_pg")
+            or "shared_pg"
+        ).strip().lower()
+        if mode not in {"shared_pg", "dedicated_pg"}:
+            mode = "shared_pg"
+        return mode
+
+    @staticmethod
+    def _default_group_storage_prefix() -> str:
+        prefix = str(
+            ConfigManager().runtimeValue("telegram.group_storage_prefix", "community")
+            or "community"
+        ).strip().lower()
+        if prefix == "":
+            prefix = "community"
+        return re.sub(r"[^a-z0-9_]+", "_", prefix)
+
+    @staticmethod
+    def _build_storage_key(communityID: int, chatID: int) -> str:
+        prefix = CommunityManager._default_group_storage_prefix()
+        return f"{prefix}:{int(communityID)}:{int(chatID)}"
+
     def getCommunityByID(self, communityID: int) -> dict:
         logger.info(f"Getting community account data for ID:  {communityID}")
 
@@ -2538,10 +2567,13 @@ class CommunityManager:
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
 
-            getCommunityQuery_sql = """SELECT cd.community_id, cd.community_name, cd.community_link, cd.roles, cd.created_by, cd.register_date, tg.chat_id, tg.chat_title, tg.has_topics
+            getCommunityQuery_sql = """SELECT cd.community_id, cd.community_name, cd.community_link, cd.roles, cd.created_by, cd.register_date, tg.chat_id, tg.chat_title, tg.has_topics,
+            iso.storage_mode, iso.storage_key, iso.storage_schema, iso.storage_database, iso.context_isolation_enabled
             FROM community_data AS cd
             LEFT JOIN community_telegram AS tg
             ON cd.community_id = tg.community_id
+            LEFT JOIN community_isolation AS iso
+            ON cd.community_id = iso.community_id
             WHERE cd.community_id = %s
             LIMIT 1;"""
             
@@ -2571,10 +2603,13 @@ class CommunityManager:
             cursor = connection.cursor()
             logger.debug(f"PostgreSQL connection established.")
 
-            getCommunityQuery_sql = """SELECT cd.community_id, cd.community_name, cd.community_link, cd.roles, cd.created_by, cd.register_date, tg.chat_id, tg.chat_title, tg.has_topics
+            getCommunityQuery_sql = """SELECT cd.community_id, cd.community_name, cd.community_link, cd.roles, cd.created_by, cd.register_date, tg.chat_id, tg.chat_title, tg.has_topics,
+            iso.storage_mode, iso.storage_key, iso.storage_schema, iso.storage_database, iso.context_isolation_enabled
             FROM community_data AS cd
             JOIN community_telegram AS tg
             ON cd.community_id = tg.community_id
+            LEFT JOIN community_isolation AS iso
+            ON cd.community_id = iso.community_id
             WHERE tg.chat_id = %s
             LIMIT 1;"""
             
@@ -2594,10 +2629,11 @@ class CommunityManager:
             
             return response
 
-    def addCommunityFromTelegram(self, communityData: dict):
+    def addCommunityFromTelegram(self, communityData: dict) -> dict | None:
         logger.info(f"Adding a community from telegram.")
         
         connection = None
+        response = None
         try:
             connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
             cursor = connection.cursor()
@@ -2610,7 +2646,6 @@ class CommunityManager:
             cursor.execute(insertMember_sql, communityData)
             result = cursor.fetchone()
             communityID = result.get("community_id")
-            print(communityID)
 
             communityTelegramData = {
                 "community_id": communityID,
@@ -2622,7 +2657,39 @@ class CommunityManager:
             VALUES (%(community_id)s, %(chat_id)s, %(chat_title)s, %(has_topics)s);"""
 
             cursor.execute(insertMemberTelegram_sql, communityTelegramData)
+            storageMode = self._default_group_storage_mode()
+            isolationEnabled = bool(
+                ConfigManager().runtimeBool("telegram.group_context_isolation_enabled", True)
+            )
+            storageKey = self._build_storage_key(communityID, communityData.get("chat_id"))
+            storageSchema = f"community_{communityID}" if storageMode == "dedicated_pg" else "public"
+            isolationUpsert_sql = """INSERT INTO community_isolation
+            (community_id, platform, chat_id, storage_mode, storage_key, storage_schema, storage_database, context_isolation_enabled, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            ON CONFLICT (community_id)
+            DO UPDATE SET
+                chat_id = EXCLUDED.chat_id,
+                storage_mode = EXCLUDED.storage_mode,
+                storage_key = EXCLUDED.storage_key,
+                storage_schema = EXCLUDED.storage_schema,
+                storage_database = EXCLUDED.storage_database,
+                context_isolation_enabled = EXCLUDED.context_isolation_enabled,
+                updated_at = NOW();"""
+            cursor.execute(
+                isolationUpsert_sql,
+                (
+                    communityID,
+                    "telegram",
+                    communityData.get("chat_id"),
+                    storageMode,
+                    storageKey,
+                    storageSchema,
+                    None,
+                    isolationEnabled,
+                ),
+            )
             connection.commit()
+            response = self.getCommunityByID(communityID)
             
             cursor.close()
         except psycopg.Error as error:
@@ -2631,6 +2698,115 @@ class CommunityManager:
             if (connection):
                 connection.close()
                 logger.debug(f"PostgreSQL connection is closed.")
+        return response
+
+    def ensureCommunityIsolation(
+        self,
+        communityID: int,
+        chatID: int,
+        *,
+        platform: str = "telegram",
+    ) -> dict | None:
+        logger.info(f"Ensuring isolation metadata for community ID: {communityID}")
+        if int(communityID) <= 0:
+            return None
+
+        connection = None
+        response = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+
+            storageMode = self._default_group_storage_mode()
+            isolationEnabled = bool(
+                ConfigManager().runtimeBool("telegram.group_context_isolation_enabled", True)
+            )
+            storageKey = self._build_storage_key(int(communityID), int(chatID))
+            storageSchema = f"community_{int(communityID)}" if storageMode == "dedicated_pg" else "public"
+
+            upsert_sql = """INSERT INTO community_isolation
+            (community_id, platform, chat_id, storage_mode, storage_key, storage_schema, storage_database, context_isolation_enabled, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            ON CONFLICT (community_id)
+            DO UPDATE SET
+                platform = EXCLUDED.platform,
+                chat_id = EXCLUDED.chat_id,
+                storage_mode = EXCLUDED.storage_mode,
+                storage_key = EXCLUDED.storage_key,
+                storage_schema = EXCLUDED.storage_schema,
+                storage_database = EXCLUDED.storage_database,
+                context_isolation_enabled = EXCLUDED.context_isolation_enabled,
+                updated_at = NOW()
+            RETURNING *;"""
+            cursor.execute(
+                upsert_sql,
+                (
+                    int(communityID),
+                    str(platform or "telegram"),
+                    int(chatID),
+                    storageMode,
+                    storageKey,
+                    storageSchema,
+                    None,
+                    isolationEnabled,
+                ),
+            )
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except psycopg.Error as error:
+            logger.error(f"Exception while ensuring community isolation metadata:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+
+        return response
+
+    def updateCommunityTelegramMetadata(
+        self,
+        communityID: int,
+        chatID: int,
+        chatTitle: str | None,
+        hasTopics: bool,
+    ) -> bool:
+        logger.info(f"Updating telegram metadata for community ID: {communityID}")
+        if int(communityID) <= 0:
+            return False
+
+        connection = None
+        success = False
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            upsert_sql = """INSERT INTO community_telegram (community_id, chat_id, chat_title, has_topics)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (community_id)
+            DO UPDATE SET
+                chat_id = EXCLUDED.chat_id,
+                chat_title = EXCLUDED.chat_title,
+                has_topics = EXCLUDED.has_topics;"""
+            cursor.execute(
+                upsert_sql,
+                (
+                    int(communityID),
+                    int(chatID),
+                    str(chatTitle or "").strip()[:96] or None,
+                    bool(hasTopics),
+                ),
+            )
+            connection.commit()
+            cursor.close()
+            success = True
+        except psycopg.Error as error:
+            logger.error(f"Exception while updating community telegram metadata:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+        return success
 
     def updateCommunityRoles(self, communityID: int, roles: list):
             logger.info("Update community roles")
