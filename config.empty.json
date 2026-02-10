@@ -9,6 +9,12 @@
     "user_id": 12345,
     "username": "telegram_username"
   },
+  "telegram_admin_auth": {
+    "controller_user_id": 0,
+    "claim_key": "",
+    "claim_key_generated_at": null,
+    "claim_key_consumed_at": null
+  },
   "database": {
     "db_name": "ryo_chat",
     "user": "postgres_user",
@@ -127,6 +133,9 @@
       "minimum_community_score_other_group": 20,
       "minimum_community_score_link": 20,
       "minimum_community_score_forward": 20,
+      "admin_claim_enabled": true,
+      "admin_claim_accept_raw_message": true,
+      "admin_config_commands_enabled": true,
       "get_updates_write_timeout": 500,
       "show_stage_progress": true,
       "show_stage_json_details": false,

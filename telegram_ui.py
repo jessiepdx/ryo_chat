@@ -24,6 +24,7 @@ import html
 import httpx
 import json
 import logging
+import secrets
 import time
 from typing import Any
 from ollama import AsyncClient
@@ -139,6 +140,7 @@ _TELEGRAM_INSPECTOR_LOCK = asyncio.Lock()
 _TELEGRAM_RUN_INSPECTOR_CACHE: dict[str, dict[str, Any]] = {}
 _TELEGRAM_RUN_INSPECTOR_TTL_SECONDS = 6 * 60 * 60
 _TELEGRAM_RUN_INSPECTOR_MAX_RECORDS = 512
+_CONFIG_LAST_MTIME_NS: int | None = None
 
 
 def _runtime_int(path: str, default: int) -> int:
@@ -157,6 +159,244 @@ def _runtime_str(path: str, default: str) -> str:
     value = config.runtimeValue(path, default)
     text = default if value is None else str(value).strip()
     return text if text else default
+
+
+TELEGRAM_ADMIN_AUTH_SECTION = "telegram_admin_auth"
+TELEGRAM_ADMIN_CLAIM_BYTES = 18
+COMMUNITY_SCORE_RUNTIME_PATHS: dict[str, str] = {
+    "private_chat": "minimum_community_score_private_chat",
+    "private_image": "minimum_community_score_private_image",
+    "group_image": "minimum_community_score_group_image",
+    "other_group": "minimum_community_score_other_group",
+    "link_sharing": "minimum_community_score_link",
+    "message_forwarding": "minimum_community_score_forward",
+}
+ADMIN_CONFIG_ALLOWED_PREFIXES: tuple[str, ...] = (
+    "bot_name",
+    "bot_id",
+    "web_ui_url",
+    "policy_models.",
+    "runtime.telegram.",
+    "runtime.orchestrator.",
+    "runtime.personality.",
+    "runtime.topic_shift.",
+    "runtime.temporal.",
+    "runtime.inference.",
+    "inference.",
+    "community_score_requirements.",
+    "telegram_admin_auth.controller_user_id",
+    "telegram_admin_auth.claim_key",
+)
+ADMIN_CONFIG_BLOCKED_PREFIXES: tuple[str, ...] = (
+    "database.",
+    "database_fallback.",
+    "api_keys.",
+    "twitter_keys.",
+    "owner_info.",
+    "bot_token",
+)
+
+
+def _now_iso_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _config_file_path() -> str:
+    raw = str(getattr(config, "config_path", "config.json") or "config.json").strip()
+    return raw if raw else "config.json"
+
+
+def _config_file_mtime_ns() -> int | None:
+    try:
+        return os.stat(_config_file_path()).st_mtime_ns
+    except OSError:
+        return None
+
+
+def _maybe_reload_config_if_changed() -> bool:
+    global _CONFIG_LAST_MTIME_NS
+    current = _config_file_mtime_ns()
+    if current is None:
+        return False
+    if _CONFIG_LAST_MTIME_NS is None:
+        _CONFIG_LAST_MTIME_NS = current
+        return False
+    if current == _CONFIG_LAST_MTIME_NS:
+        return False
+    refreshed = config.reloadFromDisk()
+    if refreshed:
+        logger.info("Detected config.json change on disk; reloaded Telegram runtime config.")
+    _CONFIG_LAST_MTIME_NS = current
+    return refreshed
+
+
+def _read_config_json() -> dict[str, Any]:
+    path = _config_file_path()
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_config_json_atomic(payload: dict[str, Any]) -> None:
+    path = _config_file_path()
+    temp_path = f"{path}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    os.replace(temp_path, path)
+
+
+def _safe_admin_int(value: Any, default: int = 0) -> int:
+    try:
+        parsed = int(str(value).strip())
+        return parsed
+    except (TypeError, ValueError):
+        return default
+
+
+def _generate_admin_claim_key() -> str:
+    return f"RYO-ADMIN-{secrets.token_urlsafe(TELEGRAM_ADMIN_CLAIM_BYTES)}"
+
+
+def _telegram_admin_auth_state_from_config(config_payload: dict[str, Any]) -> dict[str, Any]:
+    section = config_payload.get(TELEGRAM_ADMIN_AUTH_SECTION)
+    if not isinstance(section, dict):
+        section = {}
+        config_payload[TELEGRAM_ADMIN_AUTH_SECTION] = section
+
+    controller_user_id = _safe_admin_int(section.get("controller_user_id"), 0)
+    claim_key = str(section.get("claim_key") or "").strip()
+    generated_at = section.get("claim_key_generated_at")
+    consumed_at = section.get("claim_key_consumed_at")
+    return {
+        "section": section,
+        "controller_user_id": max(0, controller_user_id),
+        "claim_key": claim_key,
+        "claim_key_generated_at": generated_at,
+        "claim_key_consumed_at": consumed_at,
+    }
+
+
+def _ensure_admin_claim_state(
+    *,
+    force_rotate_key: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    payload = _read_config_json()
+    state = _telegram_admin_auth_state_from_config(payload)
+    section = state["section"]
+    changed = False
+
+    controller_user_id = int(state["controller_user_id"])
+    if section.get("controller_user_id") != controller_user_id:
+        section["controller_user_id"] = controller_user_id
+        changed = True
+
+    claim_key = str(state.get("claim_key") or "").strip()
+    if controller_user_id > 0:
+        if claim_key:
+            section["claim_key"] = ""
+            changed = True
+    else:
+        if force_rotate_key or not claim_key:
+            section["claim_key"] = _generate_admin_claim_key()
+            section["claim_key_generated_at"] = _now_iso_utc()
+            section["claim_key_consumed_at"] = None
+            changed = True
+
+    if changed:
+        _write_config_json_atomic(payload)
+        config.reloadFromDisk()
+        payload = _read_config_json()
+    return _telegram_admin_auth_state_from_config(payload), changed
+
+
+def _member_has_admin_access(member: dict | None) -> bool:
+    roles = []
+    if isinstance(member, dict):
+        roles = list(member.get("roles") or [])
+    return any(role in {"admin", "owner"} for role in roles)
+
+
+def _set_nested_path(payload: dict[str, Any], path: str, value: Any) -> None:
+    parts = [part for part in str(path or "").split(".") if part]
+    if not parts:
+        return
+    cursor: dict[str, Any] = payload
+    for part in parts[:-1]:
+        next_value = cursor.get(part)
+        if not isinstance(next_value, dict):
+            next_value = {}
+            cursor[part] = next_value
+        cursor = next_value
+    cursor[parts[-1]] = value
+
+
+def _get_nested_path(payload: dict[str, Any], path: str, default: Any = None) -> Any:
+    cursor: Any = payload
+    for part in [part for part in str(path or "").split(".") if part]:
+        if not isinstance(cursor, dict) or part not in cursor:
+            return default
+        cursor = cursor.get(part)
+    return cursor
+
+
+def _parse_config_value(raw: str) -> Any:
+    text = str(raw or "").strip()
+    if text == "":
+        return ""
+    lowered = text.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if lowered in {"null", "none"}:
+        return None
+    try:
+        if re.fullmatch(r"-?\d+", text):
+            return int(text)
+        if re.fullmatch(r"-?\d+\.\d+", text):
+            return float(text)
+    except ValueError:
+        pass
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _sync_community_score_mirrors(config_payload: dict[str, Any], changed_path: str) -> None:
+    section = config_payload.get("community_score_requirements")
+    if not isinstance(section, dict):
+        return
+    runtime = config_payload.setdefault("runtime", {})
+    if not isinstance(runtime, dict):
+        runtime = {}
+        config_payload["runtime"] = runtime
+    telegram_runtime = runtime.setdefault("telegram", {})
+    if not isinstance(telegram_runtime, dict):
+        telegram_runtime = {}
+        runtime["telegram"] = telegram_runtime
+
+    if changed_path.startswith("community_score_requirements."):
+        key = changed_path.split(".", 1)[1]
+        runtime_key = COMMUNITY_SCORE_RUNTIME_PATHS.get(key)
+        if runtime_key:
+            telegram_runtime[runtime_key] = _safe_admin_int(section.get(key), 0)
+        return
+
+    if changed_path.startswith("runtime.telegram.minimum_community_score_"):
+        for visible_key, runtime_key in COMMUNITY_SCORE_RUNTIME_PATHS.items():
+            if changed_path == f"runtime.telegram.{runtime_key}":
+                section[visible_key] = _safe_admin_int(telegram_runtime.get(runtime_key), 0)
+                return
+
+
+def _admin_commands_overview() -> str:
+    return (
+        "/admin - show admin command help\n"
+        "/config list - list editable config paths\n"
+        "/config get <path> - read a config value\n"
+        "/config set <path> <value> - update a config value\n"
+        "/config reload - reload config from disk"
+    )
 
 
 def _utc_now() -> datetime:
@@ -254,6 +494,7 @@ async def _release_message_processing(chat_id: int, message_id: int) -> None:
 
 def _guard_message_handler(handler):
     async def _wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        _maybe_reload_config_if_changed()
         message = update.effective_message
         chat = update.effective_chat
         message_id = getattr(message, "message_id", None)
@@ -1285,6 +1526,8 @@ async def startBot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     logger.info(f"Start command issued by {user.name} (user_id: {user.id}).")
 
+    await _ensure_controller_admin_role(user)
+
     # Check if the user is already registered
     member = members.getMemberByTelegramID(user.id)
 
@@ -1384,6 +1627,7 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 /botid to display the chatbot Telegram ID
 /userid to display your Telegram user ID
+/claim <key> to claim administrator access when bootstrap is pending
 """
 
     if chat.type == "private":
@@ -1393,6 +1637,14 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             helpMsg = helpMsg + """/info to display your user account info
 -------------------------------
 Send a message to begin chatting with the chatbot."""
+            if _member_has_admin_access(member):
+                helpMsg = (
+                    helpMsg
+                    + "\n\nAdmin commands:\n"
+                    + "/admin to view administrator controls\n"
+                    + "/config to inspect/update runtime config\n"
+                    + "/claim <key> to consume an admin claim key"
+                )
         elif _database_unavailable():
             helpMsg = helpMsg + _database_unavailable_message() + "\n"
         else:
@@ -1511,6 +1763,307 @@ async def userID(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(text=f"User ID: {user.id}")
     except Exception as err:
         logger.error(f"Exception while replying to a telegram message:\n{err}")
+
+
+async def _ensure_member_record(user) -> dict | None:
+    member = members.getMemberByTelegramID(user.id)
+    if member is not None:
+        return member
+
+    newAccount = {
+        "username": user.username,
+        "user_id": user.id,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "email": None,
+        "roles": ["user"],
+        "register_date": datetime.now(),
+    }
+    createdMemberID = members.addMemberFromTelegram(newAccount)
+    if createdMemberID is None:
+        return None
+    return members.getMemberByTelegramID(user.id)
+
+
+def _is_admin_config_path_allowed(path: str) -> bool:
+    normalized = str(path or "").strip()
+    if normalized == "":
+        return False
+    for blocked in ADMIN_CONFIG_BLOCKED_PREFIXES:
+        if normalized == blocked or normalized.startswith(f"{blocked}."):
+            return False
+        if blocked.endswith(".") and normalized.startswith(blocked):
+            return False
+    for prefix in ADMIN_CONFIG_ALLOWED_PREFIXES:
+        if prefix.endswith("."):
+            if normalized.startswith(prefix):
+                return True
+        elif normalized == prefix or normalized.startswith(f"{prefix}."):
+            return True
+    return False
+
+
+def _format_admin_config_value(value: Any, *, max_chars: int = 500) -> str:
+    try:
+        if isinstance(value, (dict, list)):
+            rendered = json.dumps(value, ensure_ascii=False)
+        else:
+            rendered = str(value)
+    except Exception:  # noqa: BLE001
+        rendered = str(value)
+    if len(rendered) <= max_chars:
+        return rendered
+    return rendered[: max_chars - 3] + "..."
+
+
+def _admin_config_list_payload(config_payload: dict[str, Any]) -> list[str]:
+    keys = [
+        "runtime.telegram.show_stage_progress",
+        "runtime.telegram.show_stage_json_details",
+        "runtime.telegram.stage_detail_level",
+        "runtime.telegram.stage_update_min_interval_seconds",
+        "runtime.telegram.admin_claim_enabled",
+        "runtime.telegram.admin_config_commands_enabled",
+        "runtime.orchestrator.fast_path_small_talk_enabled",
+        "runtime.orchestrator.analysis_bypass_small_talk_enabled",
+        "runtime.orchestrator.auto_expand_tool_stage_enabled",
+        "inference.chat.model",
+        "inference.tool.model",
+        "inference.embedding.model",
+        "runtime.inference.default_chat_model",
+        "runtime.inference.default_tool_model",
+        "community_score_requirements.private_chat",
+        "community_score_requirements.private_image",
+        "community_score_requirements.group_image",
+        "community_score_requirements.link_sharing",
+        "community_score_requirements.message_forwarding",
+        "telegram_admin_auth.controller_user_id",
+    ]
+    lines: list[str] = []
+    for key in keys:
+        value = _get_nested_path(config_payload, key, "<missing>")
+        lines.append(f"- `{key}` = `{_format_admin_config_value(value, max_chars=120)}`")
+    return lines
+
+
+async def _attempt_admin_claim(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    provided_key: str,
+    *,
+    explicit_command: bool,
+) -> bool:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return False
+
+    claim_enabled = _runtime_bool("telegram.admin_claim_enabled", True)
+    if not claim_enabled:
+        if explicit_command:
+            await message.reply_text("Admin claim flow is disabled in runtime settings.")
+            return True
+        return False
+
+    state, _ = _ensure_admin_claim_state()
+    controller_user_id = int(state.get("controller_user_id") or 0)
+    expected_key = str(state.get("claim_key") or "").strip()
+
+    if controller_user_id > 0:
+        if explicit_command:
+            if user.id == controller_user_id:
+                await message.reply_text(
+                    "Controller account already set to your Telegram user id.\n\n"
+                    f"Available admin commands:\n{_admin_commands_overview()}"
+                )
+            else:
+                await message.reply_text(
+                    "Admin bootstrap has already been claimed by another user id. "
+                    "Use app.py dashboard to rotate/reset controller settings."
+                )
+            return True
+        return False
+
+    if expected_key == "":
+        state, _ = _ensure_admin_claim_state(force_rotate_key=True)
+        expected_key = str(state.get("claim_key") or "").strip()
+
+    candidate = str(provided_key or "").strip()
+    if candidate == "":
+        if explicit_command:
+            await message.reply_text("Usage: /claim <key>")
+            return True
+        return False
+
+    if not expected_key or not secrets.compare_digest(candidate, expected_key):
+        if explicit_command:
+            await message.reply_text("Invalid claim key.")
+            return True
+        return False
+
+    member = await _ensure_member_record(user)
+    if member is None:
+        await message.reply_text(_database_unavailable_message())
+        return True
+
+    member_roles = list(member.get("roles") or [])
+    if "admin" not in member_roles and "owner" not in member_roles:
+        member_roles.append("admin")
+        updated = members.updateMemberRoles(member.get("member_id"), member_roles)
+        if not updated:
+            await message.reply_text(
+                "Claim key validated, but role promotion failed because account persistence is unavailable."
+            )
+            return True
+
+    payload = _read_config_json()
+    state_payload = _telegram_admin_auth_state_from_config(payload)
+    section = state_payload["section"]
+    section["controller_user_id"] = int(user.id)
+    section["claim_key"] = ""
+    section["claim_key_consumed_at"] = _now_iso_utc()
+    owner = payload.get("owner_info")
+    if not isinstance(owner, dict):
+        owner = {}
+        payload["owner_info"] = owner
+    owner["user_id"] = int(user.id)
+    owner["username"] = str(user.username or owner.get("username") or "").lstrip("@")
+    owner["first_name"] = str(user.first_name or owner.get("first_name") or "").strip()
+    owner["last_name"] = str(user.last_name or owner.get("last_name") or "").strip()
+    _write_config_json_atomic(payload)
+    config.reloadFromDisk()
+
+    await message.reply_text(
+        "You are now the administrator.\n\n"
+        "Here are the commands available:\n"
+        f"{_admin_commands_overview()}"
+    )
+    return True
+
+
+async def _ensure_controller_admin_role(user) -> bool:
+    if user is None:
+        return False
+    payload = _read_config_json()
+    state = _telegram_admin_auth_state_from_config(payload)
+    controller_user_id = int(state.get("controller_user_id") or 0)
+    if controller_user_id <= 0 or int(user.id) != controller_user_id:
+        return False
+
+    member = await _ensure_member_record(user)
+    if member is None:
+        return False
+    roles = list(member.get("roles") or [])
+    if "admin" in roles or "owner" in roles:
+        return True
+    roles.append("admin")
+    return bool(members.updateMemberRoles(member.get("member_id"), roles))
+
+
+async def claimAdmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _maybe_reload_config_if_changed()
+    message = update.effective_message
+    if message is None:
+        return
+    key_arg = context.args[0] if len(context.args) >= 1 else ""
+    await _attempt_admin_claim(update, context, key_arg, explicit_command=True)
+
+
+async def adminManager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _maybe_reload_config_if_changed()
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+
+    await _ensure_controller_admin_role(user)
+    member = members.getMemberByTelegramID(user.id)
+    if not _member_has_admin_access(member):
+        await message.reply_text("Only admins are authorized to use /admin.")
+        return
+
+    state, _ = _ensure_admin_claim_state()
+    controller_user_id = int(state.get("controller_user_id") or 0)
+    claim_key_state = "consumed" if controller_user_id > 0 else "pending"
+    await message.reply_text(
+        "Administrator controls are active.\n"
+        f"Controller user id: {controller_user_id or 'not set'}\n"
+        f"Claim state: {claim_key_state}\n\n"
+        f"{_admin_commands_overview()}"
+    )
+
+
+async def configManager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _maybe_reload_config_if_changed()
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+
+    await _ensure_controller_admin_role(user)
+    member = members.getMemberByTelegramID(user.id)
+    if not _member_has_admin_access(member):
+        await message.reply_text("Only admins are authorized to use /config.")
+        return
+
+    if not _runtime_bool("telegram.admin_config_commands_enabled", True):
+        await message.reply_text("Admin config commands are disabled in runtime settings.")
+        return
+
+    if len(context.args) == 0:
+        await message.reply_text(
+            "Usage:\n"
+            "/config list\n"
+            "/config get <path>\n"
+            "/config set <path> <value>\n"
+            "/config reload"
+        )
+        return
+
+    action = str(context.args[0]).strip().lower()
+    if action == "reload":
+        refreshed = config.reloadFromDisk()
+        await message.reply_text("Config reloaded." if refreshed else "Config reload failed.")
+        return
+
+    payload = _read_config_json()
+    if action == "list":
+        lines = _admin_config_list_payload(payload)
+        await message.reply_text("Editable config paths:\n" + "\n".join(lines[:40]))
+        return
+
+    if action == "get":
+        if len(context.args) < 2:
+            await message.reply_text("Usage: /config get <path>")
+            return
+        path = str(context.args[1]).strip()
+        if not _is_admin_config_path_allowed(path):
+            await message.reply_text("That config path is not editable via Telegram.")
+            return
+        value = _get_nested_path(payload, path, "<missing>")
+        await message.reply_text(f"{path} = {_format_admin_config_value(value)}")
+        return
+
+    if action == "set":
+        if len(context.args) < 3:
+            await message.reply_text("Usage: /config set <path> <value>")
+            return
+        path = str(context.args[1]).strip()
+        if not _is_admin_config_path_allowed(path):
+            await message.reply_text("That config path is not editable via Telegram.")
+            return
+        raw_value = " ".join(context.args[2:])
+        parsed_value = _parse_config_value(raw_value)
+        _set_nested_path(payload, path, parsed_value)
+        _sync_community_score_mirrors(payload, path)
+        _write_config_json_atomic(payload)
+        config.reloadFromDisk()
+        _ensure_admin_claim_state()
+        value = _get_nested_path(payload, path, "<missing>")
+        await message.reply_text(f"Updated {path} to {_format_admin_config_value(value)}")
+        return
+
+    await message.reply_text("Unknown /config action. Use /config list, /config get, /config set, or /config reload.")
 
 
 
@@ -3331,6 +3884,22 @@ async def directChatPrivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     message = update.effective_message
     user = update.effective_user
+    if message is None or user is None:
+        return
+
+    if _runtime_bool("telegram.admin_claim_accept_raw_message", True):
+        raw_text = str(message.text or "").strip()
+        if raw_text.startswith("RYO-ADMIN-"):
+            claimed = await _attempt_admin_claim(
+                update,
+                context,
+                raw_text,
+                explicit_command=False,
+            )
+            if claimed:
+                return
+
+    await _ensure_controller_admin_role(user)
 
     minimumCommunityScore = _runtime_int("telegram.minimum_community_score_private_chat", 50)
 
@@ -4332,6 +4901,18 @@ def main() -> None:
         logger.error("Run setup wizard to fix Telegram config: python3 scripts/setup_wizard.py --telegram-only")
         return
 
+    try:
+        admin_state, changed = _ensure_admin_claim_state()
+        if changed:
+            logger.info("Telegram admin claim state normalized and persisted.")
+        controller_id = int(admin_state.get("controller_user_id") or 0)
+        if controller_id > 0:
+            logger.info("Telegram admin controller user id is configured: %s", controller_id)
+        else:
+            logger.info("Telegram admin claim key is active and awaiting first claim.")
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"Unable to normalize Telegram admin claim state: {error}")
+
     # Run the bot
     # Create the Application and pass it your bot's token.
     # .get_updates_write_timeout(100)
@@ -4459,6 +5040,9 @@ def main() -> None:
 
     # Add command handlers
     application.add_handler(CommandHandler("start", startBot, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("claim", claimAdmin, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("admin", adminManager, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("config", configManager, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("dashboard", dashboard, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("help", help))
     application.add_handler(CommandHandler("info", info))

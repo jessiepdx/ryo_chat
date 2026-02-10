@@ -3161,6 +3161,29 @@ class ConfigManager:
     def updateConfig(self, key, value):
         self.config[key] = value
         # Save new config changes to JSON file
+
+    def reloadFromDisk(self) -> bool:
+        """Reload config/runtime data while preserving existing object references."""
+        cls = self.__class__
+        current = self
+        previous_instance = cls._instance
+        try:
+            cls._instance = None
+            refreshed = cls()
+        except Exception as error:  # noqa: BLE001
+            logger.error(f"Failed to reload config from disk:\n{error}")
+            cls._instance = previous_instance if previous_instance is not None else current
+            return False
+
+        try:
+            current.__dict__.clear()
+            current.__dict__.update(refreshed.__dict__)
+            cls._instance = current
+            return True
+        except Exception as error:  # noqa: BLE001
+            logger.error(f"Failed to hydrate active config instance after reload:\n{error}")
+            cls._instance = refreshed
+            return False
     
     # Define getters
     @property

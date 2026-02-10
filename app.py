@@ -22,6 +22,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import select
 import shutil
@@ -124,6 +125,8 @@ CAPABILITY_TO_RUNTIME_MODEL_PATH: dict[str, str] = {
 LOCAL_DATABASE_HOSTS: set[str] = {"127.0.0.1", "localhost", "0.0.0.0", "::1", "::"}
 POLICY_MODELS_PATH_PREFIX = "policy_models."
 POLICY_MODELS_PATH_SUFFIX = ".allowed_models"
+TELEGRAM_ADMIN_AUTH_SECTION = "telegram_admin_auth"
+TELEGRAM_ADMIN_CLAIM_KEY_BYTES = 18
 
 
 def is_windows() -> bool:
@@ -2178,6 +2181,60 @@ ROUTE_CONFIG_SPECS: dict[str, RouteConfigSpec] = {
                 ),
             ),
             RouteCategorySpec(
+                id="admin_bootstrap",
+                label="Admin Bootstrap",
+                settings=(
+                    RouteSettingSpec(
+                        id="admin_controller_user_id",
+                        label="Controller User ID",
+                        path="telegram_admin_auth.controller_user_id",
+                        value_type="int",
+                        description="Telegram user id with admin control. Set 0 to require claim-key bootstrap.",
+                        min_value=0,
+                        restart_required=False,
+                    ),
+                    RouteSettingSpec(
+                        id="admin_claim_key",
+                        label="Admin Claim Key",
+                        path="telegram_admin_auth.claim_key",
+                        value_type="secret",
+                        description="One-time claim key for /claim bootstrap when controller user id is unset.",
+                        sensitive=True,
+                        restart_required=False,
+                    ),
+                    RouteSettingSpec(
+                        id="admin_claim_enabled",
+                        label="Enable Admin Claim",
+                        path="runtime.telegram.admin_claim_enabled",
+                        value_type="bool",
+                        description="Allow private /claim bootstrap workflow when controller user id is unset.",
+                        default_runtime_path="telegram.admin_claim_enabled",
+                        restart_required=False,
+                        env_override_keys=("RYO_TELEGRAM_ADMIN_CLAIM_ENABLED",),
+                    ),
+                    RouteSettingSpec(
+                        id="admin_claim_accept_raw_message",
+                        label="Claim Via Raw Message",
+                        path="runtime.telegram.admin_claim_accept_raw_message",
+                        value_type="bool",
+                        description="Allow claim key pasted directly in private chat (without /claim command).",
+                        default_runtime_path="telegram.admin_claim_accept_raw_message",
+                        restart_required=False,
+                        env_override_keys=("RYO_TELEGRAM_ADMIN_CLAIM_ACCEPT_RAW_MESSAGE",),
+                    ),
+                    RouteSettingSpec(
+                        id="admin_config_commands_enabled",
+                        label="Enable Admin Config Commands",
+                        path="runtime.telegram.admin_config_commands_enabled",
+                        value_type="bool",
+                        description="Allow Telegram admins to inspect/update selected config paths via /config.",
+                        default_runtime_path="telegram.admin_config_commands_enabled",
+                        restart_required=False,
+                        env_override_keys=("RYO_TELEGRAM_ADMIN_CONFIG_COMMANDS_ENABLED",),
+                    ),
+                ),
+            ),
+            RouteCategorySpec(
                 id="runtime",
                 label="Runtime",
                 settings=(
@@ -4050,6 +4107,52 @@ def _telegram_bot_link(config_data: dict[str, Any]) -> str | None:
     return f"https://t.me/{username}"
 
 
+def _utc_timestamp_text() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _generate_telegram_admin_claim_key() -> str:
+    token = secrets.token_urlsafe(TELEGRAM_ADMIN_CLAIM_KEY_BYTES)
+    return f"RYO-ADMIN-{token}"
+
+
+def _telegram_admin_auth_section(config_data: dict[str, Any]) -> dict[str, Any]:
+    section = config_data.get(TELEGRAM_ADMIN_AUTH_SECTION)
+    if not isinstance(section, dict):
+        section = {}
+        config_data[TELEGRAM_ADMIN_AUTH_SECTION] = section
+    return section
+
+
+def _telegram_admin_controller_user_id(config_data: dict[str, Any]) -> int:
+    section = _telegram_admin_auth_section(config_data)
+    return _coerce_nonnegative_int(section.get("controller_user_id"), 0)
+
+
+def ensure_telegram_admin_claim_key(config_data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    section = _telegram_admin_auth_section(config_data)
+    changed = False
+
+    controller_user_id = _coerce_nonnegative_int(section.get("controller_user_id"), 0)
+    if section.get("controller_user_id") != controller_user_id:
+        section["controller_user_id"] = controller_user_id
+        changed = True
+
+    existing_key = str(section.get("claim_key") or "").strip()
+    if controller_user_id > 0:
+        if existing_key:
+            section["claim_key"] = ""
+            changed = True
+        return config_data, changed
+
+    if not existing_key:
+        section["claim_key"] = _generate_telegram_admin_claim_key()
+        section["claim_key_generated_at"] = _utc_timestamp_text()
+        changed = True
+
+    return config_data, changed
+
+
 def _route_access_summary(
     route_key: str,
     config_data: dict[str, Any],
@@ -4066,11 +4169,22 @@ def _route_access_summary(
         return f"local web url: {local_url}"
     if route_key == "telegram":
         link = _telegram_bot_link(config_data)
-        return (
+        controller_user_id = _telegram_admin_controller_user_id(config_data)
+        section = _telegram_admin_auth_section(config_data)
+        claim_key = str(section.get("claim_key") or "").strip()
+        if controller_user_id > 0:
+            auth_text = f"admin controller user id: {controller_user_id}"
+        elif claim_key:
+            auth_text = f"admin claim key: {claim_key}"
+        else:
+            auth_text = "admin claim key missing (save route config to auto-generate)"
+
+        link_text = (
             f"telegram link: {link}"
             if link
             else "telegram link unavailable (set bot_token or bot_name in config.json)"
         )
+        return f"{link_text} | {auth_text}"
     if route_key == "cli":
         return "interactive terminal launch available (press r or start)"
     if route_key == "x":
@@ -4960,6 +5074,10 @@ def _curses_route_config_workspace(
                     ],
                 )
                 return f"save failed: {len(policy_failures)} policy profile(s)"
+
+        next_config, admin_auth_changed = ensure_telegram_admin_claim_key(next_config)
+        if admin_auth_changed:
+            changed_config_paths.append(TELEGRAM_ADMIN_AUTH_SECTION)
 
         backup = None
         if changed_config_paths:
@@ -5889,6 +6007,7 @@ def main() -> int:
             non_interactive=non_interactive,
             prompt_on_startup=prompt_community_requirements,
         )
+    config_data, _ = ensure_telegram_admin_claim_key(config_data)
     config_after = json.dumps(config_data, sort_keys=True)
     if config_before != config_after:
         backup = backup_file(CONFIG_FILE)
