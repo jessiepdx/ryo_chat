@@ -77,7 +77,6 @@ for handler in logging.root.handlers[:]:
 # Set the basic config to append logging data to a file
 logPath = "logs/"
 logFilename = "telegram_log_" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".txt"
-#print(logPath + logFilename)
 logging.basicConfig(
     filename=logPath+logFilename,
     filemode="a",
@@ -89,7 +88,7 @@ logging.basicConfig(
 console = logging.StreamHandler()
 console.setLevel(logging.INFO)
 console.setFormatter(CustomFormatter())
-# add the handler to the root logger
+# Add the handler to the root logger
 logging.getLogger().addHandler(console)
 
 # set higher logging level for httpx to avoid all GET and POST requests being logged
@@ -177,15 +176,19 @@ Use the /help command for more information."""
 # Launch the Miniapp Dashboard.
 async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message with a button that opens a the mini app."""
-    
+
+    message = update.effective_message
     user = update.effective_user
-    if config.webUIUrl is None:
-        # TODO message the user / owner account that the config for the dashboard is missing
-        #print("missing webUI URL from config")
-        return
-    
+
     logger.info(f"Dashboard command issued by {user.name} (user_id: {user.id}).")
-    #print(config.webUIUrl + "miniapp/dashboard")
+
+    if config.webUIUrl is None:
+        try:
+            await message.reply_text(text="The dashboard webUI is not configured. Please contact the administrator.")
+        except Exception as err:
+            logger.error(f"Exception while replying to a telegram message:\n{err}")
+        finally:
+            return
     
     keyboard = [
         [
@@ -269,7 +272,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif chat.type == "group" or chat.type == "supergroup":
         community = communities.getCommunityByTelegramID(chat.id)
         
-        # temporary code to leave group chat if the group isn't registered. This is mainly used for development
+        # Temporary code to leave group chat if the group isn't registered. This is mainly used for development
         if community is None:
             try:
                 # Leave the group chat
@@ -2506,6 +2509,7 @@ async def linkHandler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 ####################
 
 def pairs(l):
+    """Helper function to split a list into pairs. Used for splitting inline buttons into rows of 2."""
     for i in range(0, len(l), 2):
         yield l[i:i + 2]
 
