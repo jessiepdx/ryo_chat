@@ -19,3 +19,7 @@ Work orders:
 8. `workorders/WO-008-automatic-telegram-key-ingress.md`
 9. `workorders/WO-009-prerequisite-explainer-and-doc-sync.md`
 10. `workorders/WO-010-pgvector-postgres-automation.md`
+
+Additional tracks:
+1. `workorders/frontend/README.md`
+2. `workorders/documents/README.md`
