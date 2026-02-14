@@ -7,11 +7,14 @@ from typing import Any
 
 from hypermindlabs.document_models import (
     DOCUMENT_SCHEMA_VERSION,
+    DOCUMENT_NODE_EDGE_TYPES,
+    DOCUMENT_NODE_TYPES,
     DOCUMENT_SCOPE_KEYS,
     DOCUMENT_SOURCE_STATES,
     CitationSpanContract,
     DocumentChunkContract,
     DocumentEmbeddingContract,
+    DocumentNodeEdgeContract,
     DocumentNodeContract,
     DocumentRetrievalEventContract,
     DocumentScope,
@@ -351,6 +354,11 @@ def validate_document_node_contract(
     node_type = _as_text(source.get("node_type"))
     if not node_type:
         raise DocumentContractValidationError("node_type is required.")
+    node_type = node_type.lower()
+    if node_type not in DOCUMENT_NODE_TYPES:
+        raise DocumentContractValidationError(
+            f"node_type must be one of: {', '.join(DOCUMENT_NODE_TYPES)}."
+        )
     parent_node_id = _optional_int(source.get("parent_node_id"), "parent_node_id")
     if parent_node_id is not None and parent_node_id <= 0:
         raise DocumentContractValidationError("parent_node_id must be greater than zero when provided.")
@@ -371,6 +379,36 @@ def validate_document_node_contract(
         char_end=_optional_int(source.get("char_end"), "char_end"),
         path=_as_text(source.get("path")),
         node_metadata=_coerce_dict(source.get("node_metadata")),
+    )
+
+
+def validate_document_node_edge_contract(
+    payload: dict[str, Any],
+    *,
+    authenticated_member_id: int | None = None,
+) -> DocumentNodeEdgeContract:
+    source = _coerce_dict(payload)
+    schema_version = validate_schema_version(source.get("schema_version"))
+    scope = validate_document_scope(source, authenticated_member_id=authenticated_member_id)
+    document_version_id = _positive_int(source.get("document_version_id"), "document_version_id")
+    source_node_id = _positive_int(source.get("source_node_id"), "source_node_id")
+    target_node_id = _positive_int(source.get("target_node_id"), "target_node_id")
+    edge_type = _as_text(source.get("edge_type")).lower()
+    if not edge_type:
+        raise DocumentContractValidationError("edge_type is required.")
+    if edge_type not in DOCUMENT_NODE_EDGE_TYPES:
+        raise DocumentContractValidationError(
+            f"edge_type must be one of: {', '.join(DOCUMENT_NODE_EDGE_TYPES)}."
+        )
+    return DocumentNodeEdgeContract(
+        schema_version=schema_version,
+        scope=scope,
+        document_version_id=document_version_id,
+        source_node_id=source_node_id,
+        target_node_id=target_node_id,
+        edge_type=edge_type,
+        ordinal=_non_negative_int(source.get("ordinal"), "ordinal", default=0),
+        edge_metadata=_coerce_dict(source.get("edge_metadata")),
     )
 
 

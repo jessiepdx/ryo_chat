@@ -1283,6 +1283,41 @@ def documentVersionsListAPI():
     return jsonify({"status": "ok", "scope": scope, "versions": rows})
 
 
+@app.get("/api/documents/tree-preview")
+def documentTreePreviewAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    try:
+        _, scope = _document_scope_from_request(member)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    version_id = _optional_int(request.args.get("document_version_id"))
+    if version_id is None or version_id <= 0:
+        return jsonify({"status": "error", "message": "document_version_id must be a positive integer."}), 400
+
+    node_limit = _optional_int(request.args.get("node_limit"))
+    edge_limit = _optional_int(request.args.get("edge_limit"))
+
+    try:
+        tree = DocumentManager().getDocumentTreePreview(
+            {"scope": scope},
+            document_version_id=version_id,
+            actor_member_id=memberID,
+            actor_roles=roles,
+            node_limit=node_limit,
+            edge_limit=edge_limit,
+        )
+    except (DocumentScopeValidationError, PermissionError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+
+    return jsonify({"status": "ok", "scope": scope, "tree": tree})
+
+
 @app.get("/api/documents/retrieval-events")
 def documentRetrievalEventsListAPI():
     member = _require_member_api()

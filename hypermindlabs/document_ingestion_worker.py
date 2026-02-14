@@ -18,6 +18,10 @@ from hypermindlabs.document_parser.router import (
     DocumentParserRouter,
     DocumentParserRoutingError,
 )
+from hypermindlabs.document_tree_builder import (
+    build_canonical_document_tree,
+    build_tree_artifact_summary,
+)
 
 
 IngestionJobProcessor = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any] | None]
@@ -124,7 +128,18 @@ class DocumentIngestionWorker:
                 "Parser router returned a failed canonical parse output.",
                 attempts=[{"status": "failed_canonical_output"}],
             )
+        version_id = self._safe_positive_int(job_record.get("document_version_id"), 0)
+        tree_payload = build_canonical_document_tree(
+            canonical_output,
+            document_version_id=version_id,
+        )
+        tree_summary = build_tree_artifact_summary(tree_payload)
         parse_artifact_patch = build_document_parse_artifact_patch(canonical_output)
+        artifact = parse_artifact_patch.get("artifact")
+        if not isinstance(artifact, dict):
+            artifact = {}
+            parse_artifact_patch["artifact"] = artifact
+        artifact["tree"] = tree_summary
         provenance = dict(canonical_output.get("provenance") or {})
         selected_adapter = str(provenance.get("selected_adapter") or "unknown-parser").strip() or "unknown-parser"
         selected_version = str(provenance.get("selected_adapter_version") or "").strip() or pipeline_version
@@ -139,15 +154,20 @@ class DocumentIngestionWorker:
             "confidence": provenance.get("confidence"),
             "cost": provenance.get("cost"),
             "duration_ms": provenance.get("duration_ms"),
+            "tree_node_count": tree_summary.get("node_count"),
+            "tree_edge_count": tree_summary.get("edge_count"),
+            "tree_repaired": bool(tree_summary.get("integrity", {}).get("was_repaired")),
         }
         return {
             "parser_name": selected_adapter,
             "parser_version": selected_version,
             "parse_artifact_patch": parse_artifact_patch,
+            "tree_payload": tree_payload,
             "job_metadata_patch": {
                 **metadata_common,
                 "route_debug": dict(provenance.get("route_debug") or {}),
                 "profile_summary": dict(provenance.get("profile_summary") or {}),
+                "tree": tree_summary,
             },
             "source_metadata_patch": {
                 "ingestion": {
@@ -165,7 +185,8 @@ class DocumentIngestionWorker:
                 "ingestion": {
                     **metadata_common,
                     "status": "parsed",
-                }
+                },
+                "tree": tree_summary,
             },
         }
 
@@ -540,6 +561,28 @@ class DocumentIngestionWorker:
                 "completed_at": _utc_now_iso(),
                 "pipeline_version": pipeline_version,
             }
+
+        tree_payload = self._dict_patch(processed_payload.get("tree_payload"))
+        if tree_payload:
+            tree_nodes = list(tree_payload.get("nodes") or [])
+            tree_edges = list(tree_payload.get("edges") or [])
+            tree_write = self._documents.replaceDocumentVersionTree(
+                version_id,
+                scope_payload=scope_payload,
+                nodes=tree_nodes,
+                edges=tree_edges,
+                actor_member_id=actor_member_id,
+                actor_roles=["owner"],
+            )
+            if not isinstance(tree_write, dict):
+                raise RuntimeError("Failed to persist document tree nodes and edges.")
+            tree_metadata = version_metadata_patch.get("tree")
+            if not isinstance(tree_metadata, dict):
+                tree_metadata = {}
+                version_metadata_patch["tree"] = tree_metadata
+            tree_metadata["node_count"] = int(tree_write.get("node_count", len(tree_nodes)) or 0)
+            tree_metadata["edge_count"] = int(tree_write.get("edge_count", len(tree_edges)) or 0)
+            tree_metadata["persisted_at"] = _utc_now_iso()
 
         self._documents.updateDocumentVersionParserStatus(
             version_id,

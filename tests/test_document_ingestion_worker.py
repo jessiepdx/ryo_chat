@@ -147,6 +147,7 @@ class _FakeDocumentManager:
         self.version_updates: list[dict[str, Any]] = []
         self.source_updates: list[dict[str, Any]] = []
         self.storage_updates: list[dict[str, Any]] = []
+        self.tree_replacements: list[dict[str, Any]] = []
         self.storage_rows: list[dict[str, Any]] = []
 
     def updateDocumentVersionParserStatus(
@@ -209,6 +210,26 @@ class _FakeDocumentManager:
             rows = [row for row in rows if int(row.get("document_source_id", 0)) == int(document_source_id)]
         return [dict(row) for row in rows]
 
+    def replaceDocumentVersionTree(
+        self,
+        document_version_id: int,
+        *,
+        scope_payload: dict[str, Any],
+        nodes: list[dict[str, Any]] | None,
+        edges: list[dict[str, Any]] | None = None,
+        **__: Any,
+    ) -> dict[str, Any]:
+        payload = {
+            "document_version_id": int(document_version_id),
+            "scope": dict(scope_payload.get("scope", {})),
+            "nodes": list(nodes or []),
+            "edges": list(edges or []),
+        }
+        payload["node_count"] = len(payload["nodes"])
+        payload["edge_count"] = len(payload["edges"])
+        self.tree_replacements.append(payload)
+        return payload
+
 
 class _FakeParserRouter:
     def __init__(self):
@@ -220,8 +241,31 @@ class _FakeParserRouter:
             "schema_version": 1,
             "canonical_schema": "document.parse.canonical.v1",
             "status": "parsed",
-            "content_text": "parsed text",
-            "sections": [{"section_id": "s1", "text": "parsed text"}],
+            "content_text": "Overview\n\nparsed text",
+            "sections": [
+                {
+                    "section_id": "s1",
+                    "title": "Overview",
+                    "level": 1,
+                    "text": "Overview",
+                    "start_char": 0,
+                    "end_char": 8,
+                    "page_start": 1,
+                    "page_end": 1,
+                    "metadata": {"element_type": "heading"},
+                },
+                {
+                    "section_id": "s2",
+                    "title": "",
+                    "level": 2,
+                    "text": "parsed text",
+                    "start_char": 10,
+                    "end_char": 21,
+                    "page_start": 1,
+                    "page_end": 1,
+                    "metadata": {"element_type": "paragraph"},
+                },
+            ],
             "metadata": {"router": "fake"},
             "warnings": [],
             "errors": [],
@@ -345,6 +389,9 @@ class DocumentIngestionWorkerTests(unittest.TestCase):
             self.assertEqual(len(parser_router.calls), 1)
             self.assertEqual(documents.version_updates[-1]["parser_status"], "parsed")
             self.assertEqual(documents.version_updates[-1]["extra"]["parser_name"], "fake-adapter")
+            self.assertEqual(len(documents.tree_replacements), 1)
+            self.assertGreaterEqual(documents.tree_replacements[0]["node_count"], 2)
+            self.assertGreaterEqual(documents.tree_replacements[0]["edge_count"], 1)
 
 
 if __name__ == "__main__":

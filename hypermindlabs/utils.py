@@ -42,6 +42,8 @@ from hypermindlabs.document_access_policy import (
     DocumentScopeAccessError,
 )
 from hypermindlabs.document_contracts import (
+    validate_document_node_contract,
+    validate_document_node_edge_contract,
     validate_document_retrieval_event_contract,
     validate_document_source_contract,
     validate_document_version_contract,
@@ -151,6 +153,7 @@ STARTUP_CORE_MIGRATIONS: tuple[str, ...] = (
     "096_document_storage_objects.sql",
     "097_document_ingestion_jobs.sql",
     "098_document_ingestion_attempts.sql",
+    "099_document_node_edges.sql",
 )
 STARTUP_VECTOR_MIGRATIONS: tuple[str, ...] = (
     "011_create_vector_extension.sql",
@@ -3728,6 +3731,7 @@ class DocumentManager:
                 execute_migration(cursor, "096_document_storage_objects.sql")
                 execute_migration(cursor, "097_document_ingestion_jobs.sql")
                 execute_migration(cursor, "098_document_ingestion_attempts.sql")
+                execute_migration(cursor, "099_document_node_edges.sql")
 
                 connection.commit()
                 cursor.close()
@@ -5270,6 +5274,443 @@ class DocumentManager:
                 connection.close()
                 logger.debug(f"PostgreSQL connection is closed.")
             return response
+
+    def replaceDocumentVersionTree(
+        self,
+        document_version_id: int,
+        *,
+        scope_payload: dict[str, Any],
+        nodes: list[dict[str, Any]] | None,
+        edges: list[dict[str, Any]] | None = None,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any] | None:
+        try:
+            version_id = int(document_version_id)
+        except (TypeError, ValueError):
+            version_id = 0
+        if version_id <= 0:
+            raise ValueError("document_version_id must be greater than zero.")
+
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        scope_dict = scope.to_dict()
+
+        prepared_nodes: list[dict[str, Any]] = []
+        parent_node_key_by_key: dict[str, str | None] = {}
+        seen_node_keys: set[str] = set()
+        for raw in list(nodes or []):
+            source = dict(raw) if isinstance(raw, dict) else {}
+            parent_node_key = str(source.get("parent_node_key") or "").strip() or None
+            payload = dict(source)
+            payload["schema_version"] = int(payload.get("schema_version", 1) or 1)
+            payload["scope"] = scope_dict
+            payload["document_version_id"] = version_id
+            payload["parent_node_id"] = None
+            payload["path"] = str(payload.get("path") or payload.get("node_path") or "").strip()
+            payload["node_metadata"] = self._optional_dict(payload.get("node_metadata"))
+            contract = validate_document_node_contract(payload)
+            if contract.node_key in seen_node_keys:
+                raise ValueError(f"duplicate node_key in tree payload: {contract.node_key}")
+            seen_node_keys.add(contract.node_key)
+            parent_node_key_by_key[contract.node_key] = parent_node_key
+            prepared_nodes.append(
+                {
+                    "contract": contract,
+                    "parent_node_key": parent_node_key,
+                }
+            )
+
+        prepared_edges: list[dict[str, Any]] = []
+        for raw in list(edges or []):
+            source = dict(raw) if isinstance(raw, dict) else {}
+            source_node_key = str(source.get("source_node_key") or "").strip()
+            target_node_key = str(source.get("target_node_key") or "").strip()
+            edge_type = str(source.get("edge_type") or "").strip().lower()
+            if not source_node_key or not target_node_key or not edge_type:
+                continue
+            prepared_edges.append(
+                {
+                    "source_node_key": source_node_key,
+                    "target_node_key": target_node_key,
+                    "edge_type": edge_type,
+                    "ordinal": int(source.get("ordinal", 0) or 0),
+                    "edge_metadata": self._optional_dict(source.get("edge_metadata")),
+                }
+            )
+
+        response: dict[str, Any] = {
+            "document_version_id": version_id,
+            "node_count": 0,
+            "edge_count": 0,
+            "nodes": [],
+            "edges": [],
+        }
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            self._assert_scoped_version_exists(cursor, version_id, scope)
+
+            cursor.execute("DELETE FROM document_node_edges WHERE document_version_id = %s", (version_id,))
+            cursor.execute("DELETE FROM document_nodes WHERE document_version_id = %s", (version_id,))
+
+            if not prepared_nodes:
+                connection.commit()
+                cursor.close()
+                return response
+
+            node_id_by_key: dict[str, int] = {}
+            insert_node_sql = """INSERT INTO document_nodes (
+                document_version_id, parent_node_id, schema_version, owner_member_id, chat_host_id, chat_type,
+                community_id, topic_id, platform, node_key, node_type, node_title, ordinal, token_count,
+                page_start, page_end, char_start, char_end, node_path, node_metadata
+            ) VALUES (%s, NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING document_node_id, node_key;"""
+            for item in prepared_nodes:
+                contract = item["contract"]
+                cursor.execute(
+                    insert_node_sql,
+                    (
+                        version_id,
+                        contract.schema_version,
+                        scope.owner_member_id,
+                        scope.chat_host_id,
+                        scope.chat_type,
+                        scope.community_id,
+                        scope.topic_id,
+                        scope.platform,
+                        contract.node_key,
+                        contract.node_type,
+                        contract.node_title or None,
+                        contract.ordinal,
+                        contract.token_count,
+                        contract.page_start,
+                        contract.page_end,
+                        contract.char_start,
+                        contract.char_end,
+                        contract.path or None,
+                        json.dumps(contract.node_metadata),
+                    ),
+                )
+                node_row = cursor.fetchone()
+                if isinstance(node_row, dict):
+                    node_id = int(node_row.get("document_node_id", 0) or 0)
+                    if node_id > 0:
+                        node_id_by_key[str(node_row.get("node_key") or contract.node_key)] = node_id
+
+            update_parent_sql = """UPDATE document_nodes
+            SET parent_node_id = %s
+            WHERE document_node_id = %s;"""
+            for item in prepared_nodes:
+                contract = item["contract"]
+                parent_key = str(item.get("parent_node_key") or "").strip()
+                if not parent_key:
+                    continue
+                parent_id = int(node_id_by_key.get(parent_key, 0) or 0)
+                child_id = int(node_id_by_key.get(contract.node_key, 0) or 0)
+                if parent_id <= 0 or child_id <= 0:
+                    continue
+                cursor.execute(update_parent_sql, (parent_id, child_id))
+
+            select_nodes_sql = """SELECT document_node_id, document_version_id, parent_node_id, schema_version,
+                owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform, node_key, node_type,
+                node_title, ordinal, token_count, page_start, page_end, char_start, char_end, node_path AS path,
+                node_metadata, created_at
+            FROM document_nodes
+            WHERE document_version_id = %s
+            ORDER BY created_at ASC, document_node_id ASC;"""
+            cursor.execute(select_nodes_sql, (version_id,))
+            node_rows = cursor.fetchall()
+            response["nodes"] = list(node_rows or [])
+            response["node_count"] = len(response["nodes"])
+
+            node_key_by_id: dict[int, str] = {}
+            for row in response["nodes"]:
+                if not isinstance(row, dict):
+                    continue
+                node_id = int(row.get("document_node_id", 0) or 0)
+                node_key = str(row.get("node_key") or "").strip()
+                if node_id > 0 and node_key:
+                    node_key_by_id[node_id] = node_key
+                    node_id_by_key[node_key] = node_id
+
+            if not prepared_edges:
+                children_by_parent: dict[int, list[dict[str, Any]]] = {}
+                for row in response["nodes"]:
+                    if not isinstance(row, dict):
+                        continue
+                    parent_id = row.get("parent_node_id")
+                    if parent_id is None:
+                        continue
+                    try:
+                        normalized_parent = int(parent_id)
+                    except (TypeError, ValueError):
+                        continue
+                    children_by_parent.setdefault(normalized_parent, []).append(dict(row))
+
+                for parent_id, children in children_by_parent.items():
+                    sorted_children = sorted(
+                        children,
+                        key=lambda item: (
+                            int(item.get("ordinal", 0) or 0),
+                            int(item.get("document_node_id", 0) or 0),
+                        ),
+                    )
+                    parent_key = node_key_by_id.get(parent_id, "")
+                    if not parent_key:
+                        continue
+                    for child_index, child in enumerate(sorted_children):
+                        child_key = str(child.get("node_key") or "").strip()
+                        if not child_key:
+                            continue
+                        prepared_edges.append(
+                            {
+                                "source_node_key": parent_key,
+                                "target_node_key": child_key,
+                                "edge_type": "parent_child",
+                                "ordinal": int(child.get("ordinal", child_index) or child_index),
+                                "edge_metadata": {},
+                            }
+                        )
+                    for sibling_index in range(1, len(sorted_children)):
+                        prev_key = str(sorted_children[sibling_index - 1].get("node_key") or "").strip()
+                        curr_key = str(sorted_children[sibling_index].get("node_key") or "").strip()
+                        if not prev_key or not curr_key:
+                            continue
+                        prepared_edges.append(
+                            {
+                                "source_node_key": prev_key,
+                                "target_node_key": curr_key,
+                                "edge_type": "next_sibling",
+                                "ordinal": sibling_index,
+                                "edge_metadata": {},
+                            }
+                        )
+
+            insert_edge_sql = """INSERT INTO document_node_edges (
+                document_version_id, source_node_id, target_node_id, schema_version, owner_member_id, chat_host_id,
+                chat_type, community_id, topic_id, platform, edge_type, ordinal, edge_metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (document_version_id, source_node_id, target_node_id, edge_type)
+            DO UPDATE SET
+                ordinal = EXCLUDED.ordinal,
+                edge_metadata = EXCLUDED.edge_metadata
+            RETURNING document_node_edge_id, document_version_id, source_node_id, target_node_id, schema_version,
+                owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform, edge_type, ordinal,
+                edge_metadata, created_at;"""
+            seen_edge_keys: set[tuple[int, int, str]] = set()
+            edge_rows: list[dict[str, Any]] = []
+            for edge in prepared_edges:
+                source_key = str(edge.get("source_node_key") or "").strip()
+                target_key = str(edge.get("target_node_key") or "").strip()
+                source_id = int(node_id_by_key.get(source_key, 0) or 0)
+                target_id = int(node_id_by_key.get(target_key, 0) or 0)
+                if source_id <= 0 or target_id <= 0:
+                    continue
+                edge_payload = {
+                    "schema_version": int(edge.get("schema_version", 1) or 1),
+                    "scope": scope_dict,
+                    "document_version_id": version_id,
+                    "source_node_id": source_id,
+                    "target_node_id": target_id,
+                    "edge_type": str(edge.get("edge_type") or "").strip().lower(),
+                    "ordinal": int(edge.get("ordinal", 0) or 0),
+                    "edge_metadata": self._optional_dict(edge.get("edge_metadata")),
+                }
+                contract = validate_document_node_edge_contract(edge_payload)
+                dedupe_key = (contract.source_node_id, contract.target_node_id, contract.edge_type)
+                if dedupe_key in seen_edge_keys:
+                    continue
+                seen_edge_keys.add(dedupe_key)
+                cursor.execute(
+                    insert_edge_sql,
+                    (
+                        version_id,
+                        contract.source_node_id,
+                        contract.target_node_id,
+                        contract.schema_version,
+                        scope.owner_member_id,
+                        scope.chat_host_id,
+                        scope.chat_type,
+                        scope.community_id,
+                        scope.topic_id,
+                        scope.platform,
+                        contract.edge_type,
+                        contract.ordinal,
+                        json.dumps(contract.edge_metadata),
+                    ),
+                )
+                edge_row = cursor.fetchone()
+                if isinstance(edge_row, dict):
+                    source_edge_id = int(edge_row.get("source_node_id", 0) or 0)
+                    target_edge_id = int(edge_row.get("target_node_id", 0) or 0)
+                    edge_row["source_node_key"] = node_key_by_id.get(source_edge_id)
+                    edge_row["target_node_key"] = node_key_by_id.get(target_edge_id)
+                    edge_rows.append(edge_row)
+
+            response["edges"] = edge_rows
+            response["edge_count"] = len(edge_rows)
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+            response = None
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def getDocumentNodes(
+        self,
+        scope_payload: dict[str, Any],
+        *,
+        document_version_id: int,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+        limit: int | None = None,
+    ) -> list:
+        try:
+            version_id = int(document_version_id)
+        except (TypeError, ValueError):
+            version_id = 0
+        if version_id <= 0:
+            return list()
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        query_limit = self._safe_limit(limit, default=500, max_limit=5000)
+        response: list = list()
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            where_sql, where_params = build_scope_where_clause(scope)
+            query_sql = (
+                "SELECT document_node_id, document_version_id, parent_node_id, schema_version, owner_member_id, "
+                "chat_host_id, chat_type, community_id, topic_id, platform, node_key, node_type, node_title, "
+                "ordinal, token_count, page_start, page_end, char_start, char_end, node_path AS path, "
+                "node_metadata, created_at "
+                "FROM document_nodes WHERE document_version_id = %s AND "
+                + where_sql
+                + " ORDER BY created_at ASC, document_node_id ASC LIMIT %s"
+            )
+            cursor.execute(query_sql, (version_id, *where_params, query_limit))
+            results = cursor.fetchall()
+            response = self._accessPolicy.filter_records(results, scope=scope)
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def getDocumentNodeEdges(
+        self,
+        scope_payload: dict[str, Any],
+        *,
+        document_version_id: int,
+        edge_types: list[str] | tuple[str, ...] | None = None,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+        limit: int | None = None,
+    ) -> list:
+        try:
+            version_id = int(document_version_id)
+        except (TypeError, ValueError):
+            version_id = 0
+        if version_id <= 0:
+            return list()
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        query_limit = self._safe_limit(limit, default=1000, max_limit=10000)
+        response: list = list()
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            where_sql, where_params = build_scope_where_clause(scope, table_alias="e")
+            query_sql = (
+                "SELECT e.document_node_edge_id, e.document_version_id, e.source_node_id, src.node_key AS source_node_key, "
+                "e.target_node_id, tgt.node_key AS target_node_key, e.schema_version, e.owner_member_id, e.chat_host_id, "
+                "e.chat_type, e.community_id, e.topic_id, e.platform, e.edge_type, e.ordinal, e.edge_metadata, e.created_at "
+                "FROM document_node_edges e "
+                "LEFT JOIN document_nodes src ON src.document_node_id = e.source_node_id "
+                "LEFT JOIN document_nodes tgt ON tgt.document_node_id = e.target_node_id "
+                "WHERE e.document_version_id = %s AND "
+                + where_sql
+            )
+            params: list[Any] = [version_id, *where_params]
+            normalized_edge_types = [str(item).strip().lower() for item in list(edge_types or []) if str(item).strip()]
+            if normalized_edge_types:
+                query_sql += " AND e.edge_type = ANY(%s)"
+                params.append(normalized_edge_types)
+            query_sql += " ORDER BY e.created_at ASC, e.document_node_edge_id ASC LIMIT %s"
+            params.append(query_limit)
+            cursor.execute(query_sql, tuple(params))
+            results = cursor.fetchall()
+            response = self._accessPolicy.filter_records(results, scope=scope)
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def getDocumentTreePreview(
+        self,
+        scope_payload: dict[str, Any],
+        *,
+        document_version_id: int,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+        node_limit: int | None = None,
+        edge_limit: int | None = None,
+    ) -> dict[str, Any]:
+        nodes = self.getDocumentNodes(
+            scope_payload,
+            document_version_id=document_version_id,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+            limit=node_limit,
+        )
+        edges = self.getDocumentNodeEdges(
+            scope_payload,
+            document_version_id=document_version_id,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+            limit=edge_limit,
+        )
+        try:
+            version_id = int(document_version_id)
+        except (TypeError, ValueError):
+            version_id = 0
+        return {
+            "document_version_id": version_id,
+            "nodes": nodes,
+            "edges": edges,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+        }
 
     def getDocumentStorageObjects(
         self,

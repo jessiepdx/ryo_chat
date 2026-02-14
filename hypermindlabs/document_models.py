@@ -22,6 +22,22 @@ DOCUMENT_SOURCE_STATES: tuple[str, ...] = (
     "archived",
     "deleted",
 )
+DOCUMENT_NODE_TYPES: tuple[str, ...] = (
+    "document",
+    "section",
+    "subsection",
+    "paragraph",
+    "list",
+    "table",
+    "code",
+    "figure",
+    "footnote",
+)
+DOCUMENT_NODE_EDGE_TYPES: tuple[str, ...] = (
+    "parent_child",
+    "next_sibling",
+    "reference",
+)
 
 
 def _deep_copy_dict(value: dict[str, Any]) -> dict[str, Any]:
@@ -172,6 +188,31 @@ class DocumentNodeContract:
             "char_end": self.char_end,
             "path": str(self.path),
             "node_metadata": _deep_copy_dict(self.node_metadata),
+        }
+        return payload
+
+
+@dataclass(frozen=True)
+class DocumentNodeEdgeContract:
+    schema_version: int
+    scope: DocumentScope
+    document_version_id: int
+    source_node_id: int
+    target_node_id: int
+    edge_type: str
+    ordinal: int = 0
+    edge_metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            "schema_version": int(self.schema_version),
+            "scope": self.scope.to_dict(),
+            "document_version_id": int(self.document_version_id),
+            "source_node_id": int(self.source_node_id),
+            "target_node_id": int(self.target_node_id),
+            "edge_type": str(self.edge_type),
+            "ordinal": int(self.ordinal),
+            "edge_metadata": _deep_copy_dict(self.edge_metadata),
         }
         return payload
 
