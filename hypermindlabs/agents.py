@@ -66,6 +66,7 @@ from hypermindlabs.utils import (
     CollaborationWorkspaceManager,
     ConfigManager, 
     ConsoleColors, 
+    DocumentManager,
     KnowledgeManager, 
     UsageManager, 
     MemberManager
@@ -4418,7 +4419,7 @@ def chatHistorySearch(queryString: str, count: int = 2, runtime_context: dict | 
     return convertedResults
 
 
-def knowledgeSearch(queryString: str, count: int = 2) -> list:
+def knowledgeSearch(queryString: str, count: int = 2, runtime_context: dict | None = None) -> list:
     """
     Search the knowledge database for a vector match on text. 
     Knowledge database contains information specific to the following topics: 
@@ -4427,6 +4428,7 @@ def knowledgeSearch(queryString: str, count: int = 2) -> list:
     Args:
         queryString (str): The search query to look up related documents
         count (int): (Optional) The number of search results to return. Defaults to 2
+        runtime_context (dict): (Optional) Active chat scope used for scoped retrieval-event logging.
 
     Returns:
         list: A list of search results. Each search result is a JSON structure
@@ -4440,6 +4442,25 @@ def knowledgeSearch(queryString: str, count: int = 2) -> list:
             knowledgeRecord[key] = value.strftime("%Y-%m-%d %H:%M:%S") if key == "record_timestamp" else value
 
         convertedResults.append(knowledgeRecord)
+
+    scope = _runtime_document_scope(runtime_context)
+    if isinstance(scope, dict):
+        try:
+            DocumentManager().addDocumentRetrievalEvent(
+                {
+                    "schema_version": 1,
+                    "scope": scope,
+                    "query_text": queryString,
+                    "result_count": len(convertedResults),
+                    "retrieval_metadata": {
+                        "tool_name": "knowledgeSearch",
+                        "source": "legacy_knowledge",
+                    },
+                },
+                actor_member_id=_runtime_member_id(runtime_context),
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.debug(f"Unable to persist scoped document retrieval event from knowledgeSearch: {error}")
     
     return convertedResults
 
@@ -4460,6 +4481,26 @@ def _runtime_member_id(runtime_context: dict | None) -> int | None:
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
+
+
+def _runtime_document_scope(runtime_context: dict | None) -> dict[str, Any] | None:
+    context = _coerce_dict(runtime_context)
+    owner_member_id = _runtime_member_id(context)
+    chat_host_id = context.get("chat_host_id")
+    chat_type = _as_text(context.get("chat_type"))
+    platform = _as_text(context.get("platform"))
+    if owner_member_id is None or chat_host_id is None or not chat_type or not platform:
+        return None
+
+    scope: dict[str, Any] = {
+        "owner_member_id": owner_member_id,
+        "chat_host_id": chat_host_id,
+        "chat_type": chat_type,
+        "community_id": context.get("community_id"),
+        "topic_id": context.get("topic_id"),
+        "platform": platform,
+    }
+    return scope
 
 
 def knownUsersList(queryString: str = "", count: int = 20, runtime_context: dict | None = None) -> dict:

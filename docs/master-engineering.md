@@ -29,6 +29,11 @@ This document covers:
 9. WO-009 Prerequisite explainer and doc sync: Implemented.
 10. WO-010 pgvector + PostgreSQL automation: Implemented.
 11. Frontend agent-playground modernization: Not implemented yet (discovery complete, work-order set defined in `workorders/frontend/`).
+12. Document RAG foundation (`workorders/documents/WO-DOC-001-document-data-contracts-scope.md`): In progress (contracts, schema migrations, and API validation scaffolding implemented on February 14, 2026).
+13. Document scope isolation and RLS (`workorders/documents/WO-DOC-002-storage-tenancy-rls.md`): In progress (scope resolution/policy modules, SQL RLS policies, scope-aware document manager queries, and API scope guards implemented on February 14, 2026).
+14. Document file ingress and object lifecycle (`workorders/documents/WO-DOC-003-file-ingress-object-lifecycle.md`): In progress (streaming upload storage backend, digest/mime/dedupe workflow, storage object schema, lifecycle endpoints, and soft-delete/restore APIs implemented on February 14, 2026).
+15. Document ingestion queue/workers/idempotency (`workorders/documents/WO-DOC-004-ingestion-queue-workers-idempotency.md`): In progress (persistent ingestion jobs/attempt tables, idempotent enqueue wiring, worker lease/heartbeat/retry loop, and ingestion job operator APIs implemented on February 14, 2026).
+16. Document parser adapter framework and fallback routing (`workorders/documents/WO-DOC-005-parser-adapter-framework.md`): In progress (adapter interface, canonical parse contracts, deterministic router/fallback chain, worker parser invocation, and parser routing tests implemented on February 14, 2026).
 
 ### 2.2 Frontend Discovery Snapshot (February 8, 2026)
 

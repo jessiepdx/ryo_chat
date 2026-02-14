@@ -42,6 +42,17 @@ from flask import (
     stream_with_context,
     url_for,
 )
+from hypermindlabs.document_contracts import (
+    DocumentContractValidationError,
+    normalize_document_ingest_request,
+    normalize_document_retrieval_request,
+)
+from hypermindlabs.document_ingestion_worker import ensure_document_ingestion_worker_started
+from hypermindlabs.document_ingress import DocumentIngressError, DocumentIngressService
+from hypermindlabs.document_scope import (
+    DocumentScopeValidationError,
+    resolve_document_scope,
+)
 from hypermindlabs.approval_manager import ApprovalManager, ApprovalValidationError
 from hypermindlabs.agent_definitions import (
     AgentDefinitionStore,
@@ -72,7 +83,13 @@ from hypermindlabs.tool_test_harness import (
     compare_contract_snapshots,
     compare_golden_outputs,
 )
-from hypermindlabs.utils import ConfigManager, CustomFormatter, MemberManager, KnowledgeManager
+from hypermindlabs.utils import (
+    ConfigManager,
+    CustomFormatter,
+    DocumentManager,
+    KnowledgeManager,
+    MemberManager,
+)
 from urllib.parse import parse_qs
 
 
@@ -139,6 +156,7 @@ toolRegistry = ToolRegistryStore()
 toolSandboxPolicies = ToolSandboxPolicyStore()
 toolApprovals = ApprovalManager()
 toolHarness = ToolTestHarnessStore()
+documentIngress = DocumentIngressService()
 
 logger.info(f"Database route status: {config.databaseRoute}")
 miniappConfigIssues = config.getTelegramConfigIssues(require_owner=False, require_web_ui_url=False)
@@ -322,6 +340,39 @@ def _request_json_dict() -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _document_scope_from_request(
+    member: dict[str, Any],
+    payload: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    member_id = int(member.get("member_id", 0))
+    source = dict(payload) if isinstance(payload, dict) else {}
+    scope_payload = source.get("scope")
+    scope_seed = dict(scope_payload) if isinstance(scope_payload, dict) else {}
+
+    for key in ("owner_member_id", "chat_host_id", "chat_type", "community_id", "topic_id", "platform"):
+        if key in source and key not in scope_seed:
+            scope_seed[key] = source.get(key)
+        arg_value = request.args.get(key)
+        if arg_value is not None and key not in scope_seed:
+            scope_seed[key] = arg_value
+
+    scope_seed.setdefault("owner_member_id", member_id)
+    scope_seed.setdefault("chat_host_id", member_id)
+    scope_seed.setdefault("chat_type", "member")
+    scope_seed.setdefault("platform", "web")
+
+    # Admin/owner routes can intentionally inspect cross-owner scopes.
+    auth_member_id = None if _member_can_write_playground_registry(member) else member_id
+    resolved_scope = resolve_document_scope(
+        {"scope": scope_seed},
+        authenticated_member_id=auth_member_id,
+    )
+
+    source["scope"] = resolved_scope.to_dict()
+    source["owner_member_id"] = resolved_scope.owner_member_id
+    return source, resolved_scope.to_dict()
+
+
 def _payload_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -333,6 +384,45 @@ def _payload_bool(value: Any, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return bool(default)
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _request_payload_from_form() -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key in (
+        "owner_member_id",
+        "chat_host_id",
+        "chat_type",
+        "community_id",
+        "topic_id",
+        "platform",
+        "source_external_id",
+    ):
+        value = request.form.get(key)
+        if value is not None and str(value).strip() != "":
+            payload[key] = value
+
+    metadata_raw = request.form.get("source_metadata")
+    if metadata_raw is not None and str(metadata_raw).strip():
+        try:
+            parsed = json.loads(str(metadata_raw))
+            if isinstance(parsed, dict):
+                payload["source_metadata"] = parsed
+        except json.JSONDecodeError:
+            payload["source_metadata_parse_error"] = True
+
+    return payload
 
 
 def _tool_sandbox_items() -> list[dict[str, Any]]:
@@ -953,6 +1043,626 @@ def miniappLogin():
         session["member_id"] = memberID
 
     return redirect(url_for("index"))
+
+
+@app.post("/api/documents/upload")
+def documentUploadAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    upload = request.files.get("file")
+    if upload is None:
+        return jsonify({"status": "error", "message": "file upload is required."}), 400
+    filename = str(getattr(upload, "filename", "") or "").strip()
+    if not filename:
+        return jsonify({"status": "error", "message": "Uploaded file must include a filename."}), 400
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    form_payload = _request_payload_from_form()
+    if form_payload.get("source_metadata_parse_error"):
+        return jsonify({"status": "error", "message": "source_metadata must be valid JSON object."}), 400
+    try:
+        scoped_payload, scope = _document_scope_from_request(member, form_payload)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    metadata = scoped_payload.get("source_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    try:
+        result = documentIngress.ingest_upload(
+            stream=getattr(upload, "stream", upload),
+            filename=filename,
+            scope_payload={"scope": scope},
+            actor_member_id=memberID,
+            actor_roles=roles,
+            source_external_id=str(scoped_payload.get("source_external_id") or "").strip(),
+            source_metadata=metadata,
+            mime_hint=str(getattr(upload, "mimetype", "") or "").strip() or None,
+        )
+    except PermissionError as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+    except (
+        DocumentIngressError,
+        DocumentContractValidationError,
+        DocumentScopeValidationError,
+        ValueError,
+    ) as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    return jsonify(result), 201
+
+
+@app.post("/api/documents/ingest")
+def documentIngestAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    try:
+        payload, _ = _document_scope_from_request(member, _request_json_dict())
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    auth_member_id = None if _member_can_write_playground_registry(member) else memberID
+    try:
+        normalized = normalize_document_ingest_request(
+            payload,
+            authenticated_member_id=auth_member_id,
+        )
+    except DocumentContractValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    documents = DocumentManager()
+    try:
+        sourceRecord = documents.createDocumentSource(
+            normalized.get("source", {}),
+            actor_member_id=memberID,
+            actor_roles=roles,
+        )
+    except (DocumentContractValidationError, DocumentScopeValidationError, PermissionError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+    if sourceRecord is None:
+        return jsonify({"status": "error", "message": "Failed to persist document source."}), 500
+
+    versionRecord = None
+    versionSeed = normalized.get("version")
+    if isinstance(versionSeed, dict):
+        versionPayload = dict(versionSeed)
+        sourceID = int(sourceRecord.get("document_source_id", 0) or 0)
+        if sourceID <= 0:
+            return jsonify({"status": "error", "message": "Document source persisted without an id."}), 500
+        versionPayload["document_source_id"] = sourceID
+        try:
+            versionRecord = documents.createDocumentVersion(
+                versionPayload,
+                actor_member_id=memberID,
+                actor_roles=roles,
+            )
+        except (DocumentContractValidationError, DocumentScopeValidationError, PermissionError) as error:
+            return jsonify({"status": "error", "message": str(error)}), 400
+        if versionRecord is None:
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "message": "Document source persisted but document version insert failed.",
+                        "source": sourceRecord,
+                    }
+                ),
+                500,
+            )
+
+    return jsonify(
+        {
+            "status": "ok",
+            "source": sourceRecord,
+            "version": versionRecord,
+            "contract": normalized,
+        }
+    ), 201
+
+
+@app.post("/api/documents/retrieval")
+@app.post("/api/documents/retrieval-events")
+def documentRetrievalEventAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    try:
+        payload, _ = _document_scope_from_request(member, _request_json_dict())
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    auth_member_id = None if _member_can_write_playground_registry(member) else memberID
+    try:
+        normalized = normalize_document_retrieval_request(
+            payload,
+            authenticated_member_id=auth_member_id,
+        )
+    except DocumentContractValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    documents = DocumentManager()
+    try:
+        eventRecord = documents.addDocumentRetrievalEvent(
+            normalized.get("event", {}),
+            actor_member_id=memberID,
+            actor_roles=roles,
+        )
+    except (DocumentContractValidationError, DocumentScopeValidationError, PermissionError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+    if eventRecord is None:
+        return jsonify({"status": "error", "message": "Failed to persist retrieval event."}), 500
+
+    return jsonify(
+        {
+            "status": "ok",
+            "event": eventRecord,
+            "contract": normalized,
+        }
+    ), 201
+
+
+@app.get("/api/documents/sources")
+def documentSourcesListAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    try:
+        _, scope = _document_scope_from_request(member)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    try:
+        limit = int(request.args.get("limit", "25"))
+    except ValueError:
+        limit = 25
+
+    try:
+        rows = DocumentManager().getDocumentSources(
+            {"scope": scope},
+            actor_member_id=memberID,
+            actor_roles=roles,
+            limit=limit,
+        )
+    except (DocumentScopeValidationError, PermissionError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+
+    return jsonify({"status": "ok", "scope": scope, "sources": rows})
+
+
+@app.get("/api/documents/versions")
+def documentVersionsListAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    try:
+        _, scope = _document_scope_from_request(member)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    try:
+        limit = int(request.args.get("limit", "25"))
+    except ValueError:
+        limit = 25
+
+    source_id_value = request.args.get("document_source_id")
+    source_id: int | None = None
+    if source_id_value not in {None, ""}:
+        try:
+            source_id = int(str(source_id_value).strip())
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "document_source_id must be an integer."}), 400
+
+    try:
+        rows = DocumentManager().getDocumentVersions(
+            {"scope": scope},
+            document_source_id=source_id,
+            actor_member_id=memberID,
+            actor_roles=roles,
+            limit=limit,
+        )
+    except (DocumentScopeValidationError, PermissionError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+
+    return jsonify({"status": "ok", "scope": scope, "versions": rows})
+
+
+@app.get("/api/documents/retrieval-events")
+def documentRetrievalEventsListAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    try:
+        _, scope = _document_scope_from_request(member)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    try:
+        limit = int(request.args.get("limit", "50"))
+    except ValueError:
+        limit = 50
+
+    try:
+        rows = DocumentManager().getDocumentRetrievalEvents(
+            {"scope": scope},
+            actor_member_id=memberID,
+            actor_roles=roles,
+            limit=limit,
+        )
+    except (DocumentScopeValidationError, PermissionError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+
+    return jsonify({"status": "ok", "scope": scope, "events": rows})
+
+
+@app.get("/api/documents/storage-objects")
+def documentStorageObjectsListAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    try:
+        _, scope = _document_scope_from_request(member)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    try:
+        limit = int(request.args.get("limit", "25"))
+    except ValueError:
+        limit = 25
+
+    source_id = _optional_int(request.args.get("document_source_id"))
+    if request.args.get("document_source_id") not in {None, ""} and source_id is None:
+        return jsonify({"status": "error", "message": "document_source_id must be an integer."}), 400
+
+    try:
+        rows = DocumentManager().getDocumentStorageObjects(
+            {"scope": scope},
+            document_source_id=source_id,
+            actor_member_id=memberID,
+            actor_roles=roles,
+            limit=limit,
+        )
+    except (DocumentScopeValidationError, PermissionError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+
+    return jsonify({"status": "ok", "scope": scope, "storage_objects": rows})
+
+
+@app.get("/api/documents/ingestion-jobs")
+def documentIngestionJobsListAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    try:
+        _, scope = _document_scope_from_request(member)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    try:
+        limit = int(request.args.get("limit", "50"))
+    except ValueError:
+        limit = 50
+
+    source_id = _optional_int(request.args.get("document_source_id"))
+    if request.args.get("document_source_id") not in {None, ""} and source_id is None:
+        return jsonify({"status": "error", "message": "document_source_id must be an integer."}), 400
+
+    raw_statuses = request.args.getlist("status")
+    if not raw_statuses:
+        csv_statuses = request.args.get("statuses")
+        if csv_statuses is not None:
+            raw_statuses = [csv_statuses]
+    statuses: list[str] = []
+    for item in raw_statuses:
+        for part in str(item).split(","):
+            value = part.strip().lower()
+            if value:
+                statuses.append(value)
+
+    try:
+        rows = documentIngress.list_ingestion_jobs(
+            {"scope": scope},
+            statuses=statuses or None,
+            document_source_id=source_id,
+            actor_member_id=memberID,
+            actor_roles=roles,
+            limit=limit,
+        )
+    except PermissionError as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+    except (DocumentIngressError, DocumentScopeValidationError, ValueError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    return jsonify({"status": "ok", "scope": scope, "jobs": rows})
+
+
+@app.get("/api/documents/ingestion-jobs/<int:ingestion_job_id>")
+def documentIngestionJobByIDAPI(ingestion_job_id: int):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    try:
+        _, scope = _document_scope_from_request(member)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    try:
+        row = documentIngress.get_ingestion_job(
+            ingestion_job_id,
+            {"scope": scope},
+            actor_member_id=memberID,
+            actor_roles=roles,
+        )
+    except PermissionError as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+    except (DocumentIngressError, DocumentScopeValidationError, ValueError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    if not isinstance(row, dict):
+        return jsonify({"status": "error", "message": "Ingestion job not found or out of scope."}), 404
+    return jsonify({"status": "ok", "scope": scope, "job": row})
+
+
+@app.get("/api/documents/ingestion-jobs/<int:ingestion_job_id>/attempts")
+def documentIngestionJobAttemptsAPI(ingestion_job_id: int):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    try:
+        _, scope = _document_scope_from_request(member)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    try:
+        limit = int(request.args.get("limit", "25"))
+    except ValueError:
+        limit = 25
+
+    try:
+        rows = documentIngress.list_ingestion_attempts(
+            ingestion_job_id,
+            {"scope": scope},
+            actor_member_id=memberID,
+            actor_roles=roles,
+            limit=limit,
+        )
+    except PermissionError as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+    except (DocumentIngressError, DocumentScopeValidationError, ValueError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    return jsonify({"status": "ok", "scope": scope, "attempts": rows})
+
+
+@app.post("/api/documents/ingestion-jobs/<int:ingestion_job_id>/cancel")
+def documentIngestionJobCancelAPI(ingestion_job_id: int):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    payload = _request_json_dict()
+    try:
+        _, scope = _document_scope_from_request(member, payload)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    reason = str(payload.get("reason") or "").strip()
+    try:
+        row = documentIngress.cancel_ingestion_job(
+            ingestion_job_id,
+            {"scope": scope},
+            actor_member_id=memberID,
+            actor_roles=roles,
+            reason=reason,
+        )
+    except PermissionError as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+    except (DocumentIngressError, DocumentScopeValidationError, ValueError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    if not isinstance(row, dict):
+        return jsonify({"status": "error", "message": "Ingestion job not found or out of scope."}), 404
+    return jsonify({"status": "ok", "scope": scope, "job": row})
+
+
+@app.post("/api/documents/ingestion-jobs/<int:ingestion_job_id>/requeue")
+def documentIngestionJobRequeueAPI(ingestion_job_id: int):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    payload = _request_json_dict()
+    try:
+        _, scope = _document_scope_from_request(member, payload)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    try:
+        row = documentIngress.requeue_ingestion_job(
+            ingestion_job_id,
+            {"scope": scope},
+            actor_member_id=memberID,
+            actor_roles=roles,
+        )
+    except PermissionError as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+    except (DocumentIngressError, DocumentScopeValidationError, ValueError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    if not isinstance(row, dict):
+        return jsonify({"status": "error", "message": "Ingestion job not found or out of scope."}), 404
+    return jsonify({"status": "ok", "scope": scope, "job": row})
+
+
+@app.post("/api/documents/sources/<int:document_source_id>/state")
+def documentSourceStateUpdateAPI(document_source_id: int):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    payload = _request_json_dict()
+    try:
+        _, scope = _document_scope_from_request(member, payload)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    state = str(payload.get("state") or "").strip().lower()
+    if not state:
+        return jsonify({"status": "error", "message": "state is required."}), 400
+
+    try:
+        source = documentIngress.set_source_state(
+            document_source_id,
+            state,
+            {"scope": scope},
+            actor_member_id=memberID,
+            actor_roles=roles,
+            reason=str(payload.get("reason") or "").strip(),
+        )
+    except PermissionError as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+    except (DocumentIngressError, DocumentScopeValidationError, ValueError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    if not isinstance(source, dict):
+        return jsonify({"status": "error", "message": "Document source not found or out of scope."}), 404
+    return jsonify({"status": "ok", "scope": scope, "source": source})
+
+
+@app.post("/api/documents/storage-objects/<int:storage_object_id>/state")
+def documentStorageObjectStateUpdateAPI(storage_object_id: int):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    payload = _request_json_dict()
+    try:
+        _, scope = _document_scope_from_request(member, payload)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    state = str(payload.get("state") or "").strip().lower()
+    if not state:
+        return jsonify({"status": "error", "message": "state is required."}), 400
+
+    try:
+        record = DocumentManager().updateDocumentStorageObjectState(
+            storage_object_id,
+            state,
+            {"scope": scope},
+            actor_member_id=memberID,
+            actor_roles=roles,
+        )
+    except PermissionError as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+    except (DocumentScopeValidationError, ValueError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    if not isinstance(record, dict):
+        return jsonify({"status": "error", "message": "Storage object not found or out of scope."}), 404
+    return jsonify({"status": "ok", "scope": scope, "storage_object": record})
+
+
+@app.post("/api/documents/sources/<int:document_source_id>/soft-delete")
+def documentSourceSoftDeleteAPI(document_source_id: int):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    payload = _request_json_dict()
+    try:
+        _, scope = _document_scope_from_request(member, payload)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    try:
+        source = documentIngress.soft_delete_source(
+            document_source_id,
+            {"scope": scope},
+            actor_member_id=memberID,
+            actor_roles=roles,
+            reason=str(payload.get("reason") or "").strip(),
+        )
+    except PermissionError as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+    except (DocumentIngressError, DocumentScopeValidationError, ValueError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    if not isinstance(source, dict):
+        return jsonify({"status": "error", "message": "Document source not found or out of scope."}), 404
+    return jsonify({"status": "ok", "scope": scope, "source": source})
+
+
+@app.post("/api/documents/sources/<int:document_source_id>/restore")
+def documentSourceRestoreAPI(document_source_id: int):
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    payload = _request_json_dict()
+    try:
+        _, scope = _document_scope_from_request(member, payload)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    try:
+        source = documentIngress.restore_soft_deleted_source(
+            document_source_id,
+            {"scope": scope},
+            actor_member_id=memberID,
+            actor_roles=roles,
+        )
+    except PermissionError as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+    except (DocumentIngressError, DocumentScopeValidationError, ValueError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    if not isinstance(source, dict):
+        return jsonify({"status": "error", "message": "Document source not found or out of scope."}), 404
+    return jsonify({"status": "ok", "scope": scope, "source": source})
 
 
 @app.get("/api/agent-playground/bootstrap")
@@ -2044,6 +2754,15 @@ if __name__ == "__main__":
         debugMode,
         useReloader,
     )
+
+    if _runtime_bool("documents.ingestion_worker_enabled", False):
+        should_start_worker = not useReloader or os.getenv("WERKZEUG_RUN_MAIN") == "true"
+        if should_start_worker:
+            try:
+                worker = ensure_document_ingestion_worker_started()
+                logger.info("Document ingestion worker enabled with worker_id=%s.", worker.worker_id)
+            except Exception as error:  # noqa: BLE001
+                logger.error("Failed to start document ingestion worker: %s", error)
 
     app.run(
         host=bindHost,

@@ -21,6 +21,14 @@ EVENT_TYPES: tuple[str, ...] = (
     "run.failed",
     "run.replay.requested",
     "run.replayed",
+    "ingestion.job.queued",
+    "ingestion.job.leased",
+    "ingestion.job.running",
+    "ingestion.job.retry",
+    "ingestion.job.completed",
+    "ingestion.job.failed",
+    "ingestion.job.dead_letter",
+    "ingestion.job.cancelled",
 )
 
 TERMINAL_STATUSES: set[str] = {"completed", "failed", "cancelled"}

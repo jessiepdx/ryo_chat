@@ -37,6 +37,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from hypermindlabs.database_router import DatabaseRouter
+from hypermindlabs.document_access_policy import (
+    DocumentAccessPolicy,
+    DocumentScopeAccessError,
+)
+from hypermindlabs.document_contracts import (
+    validate_document_retrieval_event_contract,
+    validate_document_source_contract,
+    validate_document_version_contract,
+)
+from hypermindlabs.document_models import DOCUMENT_SOURCE_STATES
+from hypermindlabs.document_scope import (
+    apply_pg_scope_settings,
+    build_scope_where_clause,
+    resolve_document_scope,
+)
 from hypermindlabs.runtime_settings import (
     build_runtime_settings,
     get_runtime_setting,
@@ -127,6 +142,15 @@ STARTUP_CORE_MIGRATIONS: tuple[str, ...] = (
     "087_member_narrative_chunks.sql",
     "088_member_personality_events.sql",
     "089_community_isolation.sql",
+    "090_document_sources.sql",
+    "091_document_versions.sql",
+    "092_document_nodes.sql",
+    "093_document_chunks.sql",
+    "094_document_retrieval_events.sql",
+    "095_document_rls_policies.sql",
+    "096_document_storage_objects.sql",
+    "097_document_ingestion_jobs.sql",
+    "098_document_ingestion_attempts.sql",
 )
 STARTUP_VECTOR_MIGRATIONS: tuple[str, ...] = (
     "011_create_vector_extension.sql",
@@ -143,6 +167,23 @@ VECTOR_DIMENSION_MIGRATIONS: set[str] = {
 _EMBEDDING_WRITE_QUEUE: queue.Queue[dict[str, Any]] | None = None
 _EMBEDDING_WORKER_THREAD: threading.Thread | None = None
 _EMBEDDING_WORKER_LOCK = threading.Lock()
+DOCUMENT_INGESTION_JOB_STATES: tuple[str, ...] = (
+    "queued",
+    "leased",
+    "running",
+    "retry_wait",
+    "completed",
+    "cancelled",
+    "failed",
+    "dead_letter",
+)
+DOCUMENT_INGESTION_ATTEMPT_STATES: tuple[str, ...] = (
+    "leased",
+    "running",
+    "succeeded",
+    "failed",
+    "cancelled",
+)
 
 
 def _render_migration_sql(sql_text: str, context: dict[str, Any] | None = None) -> str:
@@ -3661,6 +3702,1670 @@ class KnowledgeManager:
                 connection.close()
                 logger.debug(f"PostgreSQL connection is closed.")
             
+            return response
+
+
+class DocumentManager:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(DocumentManager, cls).__new__(cls)
+            cls._instance._accessPolicy = DocumentAccessPolicy()
+
+            connection = None
+            try:
+                connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo)
+                cursor = connection.cursor()
+                logger.debug(f"PostgreSQL connection established.")
+
+                execute_migration(cursor, "090_document_sources.sql")
+                execute_migration(cursor, "091_document_versions.sql")
+                execute_migration(cursor, "092_document_nodes.sql")
+                execute_migration(cursor, "093_document_chunks.sql")
+                execute_migration(cursor, "094_document_retrieval_events.sql")
+                execute_migration(cursor, "095_document_rls_policies.sql")
+                execute_migration(cursor, "096_document_storage_objects.sql")
+                execute_migration(cursor, "097_document_ingestion_jobs.sql")
+                execute_migration(cursor, "098_document_ingestion_attempts.sql")
+
+                connection.commit()
+                cursor.close()
+            except (Exception, psycopg.DatabaseError) as error:
+                logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+            finally:
+                if connection is not None:
+                    connection.close()
+                    logger.debug(f"PostgreSQL connection is closed.")
+
+        return cls._instance
+
+    def _safe_limit(self, value: int | None, default: int = 25, max_limit: int = 200) -> int:
+        if value is None:
+            return max(1, int(default))
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = int(default)
+        if parsed <= 0:
+            parsed = int(default)
+        return max(1, min(parsed, max_limit))
+
+    def _resolved_scope(
+        self,
+        payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+    ):
+        scope = resolve_document_scope(payload)
+        try:
+            actor_id = int(actor_member_id) if actor_member_id is not None else int(scope.owner_member_id)
+        except (TypeError, ValueError):
+            actor_id = int(scope.owner_member_id)
+        self._accessPolicy.assert_scope_access(
+            actor_member_id=actor_id,
+            scope=scope,
+            actor_roles=actor_roles,
+        )
+        return scope
+
+    def _assert_scoped_source_exists(self, cursor: Any, document_source_id: int, scope: Any) -> None:
+        where_sql, where_params = build_scope_where_clause(scope)
+        query_sql = (
+            "SELECT document_source_id "
+            "FROM document_sources "
+            "WHERE document_source_id = %s AND "
+            + where_sql
+            + " LIMIT 1"
+        )
+        cursor.execute(query_sql, (int(document_source_id), *where_params))
+        if cursor.fetchone() is None:
+            raise DocumentScopeAccessError("Document source is out of scope or does not exist.")
+
+    def _assert_scoped_version_exists(self, cursor: Any, document_version_id: int, scope: Any) -> None:
+        where_sql, where_params = build_scope_where_clause(scope)
+        query_sql = (
+            "SELECT document_version_id "
+            "FROM document_versions "
+            "WHERE document_version_id = %s AND "
+            + where_sql
+            + " LIMIT 1"
+        )
+        cursor.execute(query_sql, (int(document_version_id), *where_params))
+        if cursor.fetchone() is None:
+            raise DocumentScopeAccessError("Document version is out of scope or does not exist.")
+
+    def _assert_scoped_storage_object_exists(self, cursor: Any, storage_object_id: int, scope: Any) -> None:
+        where_sql, where_params = build_scope_where_clause(scope)
+        query_sql = (
+            "SELECT storage_object_id "
+            "FROM document_storage_objects "
+            "WHERE storage_object_id = %s AND "
+            + where_sql
+            + " LIMIT 1"
+        )
+        cursor.execute(query_sql, (int(storage_object_id), *where_params))
+        if cursor.fetchone() is None:
+            raise DocumentScopeAccessError("Document storage object is out of scope or does not exist.")
+
+    def _assert_scoped_ingestion_job_exists(self, cursor: Any, ingestion_job_id: int, scope: Any) -> None:
+        where_sql, where_params = build_scope_where_clause(scope)
+        query_sql = (
+            "SELECT ingestion_job_id "
+            "FROM document_ingestion_jobs "
+            "WHERE ingestion_job_id = %s AND "
+            + where_sql
+            + " LIMIT 1"
+        )
+        cursor.execute(query_sql, (int(ingestion_job_id), *where_params))
+        if cursor.fetchone() is None:
+            raise DocumentScopeAccessError("Document ingestion job is out of scope or does not exist.")
+
+    def _normalize_document_state(self, value: Any, default: str = "queued") -> str:
+        state = str(value if value is not None else "").strip().lower()
+        if not state:
+            state = str(default).strip().lower()
+        if state not in DOCUMENT_SOURCE_STATES:
+            raise ValueError(
+                f"Invalid document state '{state}'. Allowed states: {', '.join(DOCUMENT_SOURCE_STATES)}."
+            )
+        return state
+
+    def _normalize_ingestion_job_status(self, value: Any, default: str = "queued") -> str:
+        status = str(value if value is not None else "").strip().lower()
+        if not status:
+            status = str(default).strip().lower()
+        if status not in DOCUMENT_INGESTION_JOB_STATES:
+            raise ValueError(
+                f"Invalid ingestion job status '{status}'. Allowed: {', '.join(DOCUMENT_INGESTION_JOB_STATES)}."
+            )
+        return status
+
+    def _normalize_ingestion_attempt_status(self, value: Any, default: str = "running") -> str:
+        status = str(value if value is not None else "").strip().lower()
+        if not status:
+            status = str(default).strip().lower()
+        if status not in DOCUMENT_INGESTION_ATTEMPT_STATES:
+            raise ValueError(
+                f"Invalid ingestion attempt status '{status}'. Allowed: {', '.join(DOCUMENT_INGESTION_ATTEMPT_STATES)}."
+            )
+        return status
+
+    def _apply_scope_bypass_settings(self, cursor: Any) -> None:
+        cursor.execute("SELECT set_config(%s, %s, true);", ("app.scope_bypass", "1"))
+
+    def _safe_positive_int(self, value: Any, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = int(default)
+        if parsed <= 0:
+            parsed = int(default)
+        return max(1, parsed)
+
+    def _safe_non_negative_int(self, value: Any, default: int = 0) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = int(default)
+        if parsed < 0:
+            parsed = int(default)
+        return max(0, parsed)
+
+    def _optional_iso_timestamp(self, value: Any) -> datetime | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized)
+
+    def _optional_dict(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        return {}
+
+    def createDocumentSource(
+        self,
+        payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+    ) -> dict | None:
+        contract = validate_document_source_contract(payload)
+        scope = self._resolved_scope(
+            contract.to_dict(),
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        connection = None
+        response = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+
+            insert_sql = """INSERT INTO document_sources (
+                schema_version, owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform,
+                source_external_id, source_name, source_mime, source_sha256, source_size_bytes, source_uri,
+                source_state, source_metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING document_source_id, schema_version, owner_member_id, chat_host_id, chat_type, community_id, topic_id,
+                platform, source_external_id, source_name, source_mime, source_sha256, source_size_bytes, source_uri,
+                source_state, source_metadata, created_at, updated_at;"""
+            cursor.execute(
+                insert_sql,
+                (
+                    contract.schema_version,
+                    scope.owner_member_id,
+                    scope.chat_host_id,
+                    scope.chat_type,
+                    scope.community_id,
+                    scope.topic_id,
+                    scope.platform,
+                    contract.source_external_id or None,
+                    contract.source_name,
+                    contract.source_mime or None,
+                    contract.source_sha256 or None,
+                    contract.source_size_bytes,
+                    contract.source_uri or None,
+                    contract.source_state,
+                    json.dumps(contract.source_metadata),
+                ),
+            )
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            return response
+
+    def createDocumentVersion(
+        self,
+        payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+    ) -> dict | None:
+        contract = validate_document_version_contract(payload)
+        scope = self._resolved_scope(
+            contract.to_dict(),
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        connection = None
+        response = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            self._assert_scoped_source_exists(cursor, contract.document_source_id, scope)
+
+            insert_sql = """INSERT INTO document_versions (
+                document_source_id, schema_version, owner_member_id, chat_host_id, chat_type, community_id, topic_id,
+                platform, version_number, source_sha256, parser_name, parser_version, parser_status, parse_artifact, record_metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING document_version_id, document_source_id, schema_version, owner_member_id, chat_host_id, chat_type,
+                community_id, topic_id, platform, version_number, source_sha256, parser_name, parser_version, parser_status,
+                parse_artifact, record_metadata, created_at;"""
+            cursor.execute(
+                insert_sql,
+                (
+                    contract.document_source_id,
+                    contract.schema_version,
+                    scope.owner_member_id,
+                    scope.chat_host_id,
+                    scope.chat_type,
+                    scope.community_id,
+                    scope.topic_id,
+                    scope.platform,
+                    contract.version_number,
+                    contract.source_sha256 or None,
+                    contract.parser_name or None,
+                    contract.parser_version or None,
+                    contract.parser_status,
+                    json.dumps(contract.parse_artifact),
+                    json.dumps(contract.record_metadata),
+                ),
+            )
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            return response
+
+    def addDocumentRetrievalEvent(
+        self,
+        payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+    ) -> dict | None:
+        contract = validate_document_retrieval_event_contract(payload)
+        scope = self._resolved_scope(
+            contract.to_dict(),
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        connection = None
+        response = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            if contract.document_source_id is not None:
+                self._assert_scoped_source_exists(cursor, contract.document_source_id, scope)
+            if contract.document_version_id is not None:
+                self._assert_scoped_version_exists(cursor, contract.document_version_id, scope)
+
+            insert_sql = """INSERT INTO document_retrieval_events (
+                schema_version, owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform, request_id,
+                query_text, document_source_id, document_version_id, result_count, max_distance,
+                query_metadata, retrieval_metadata, citations
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING retrieval_event_id, schema_version, owner_member_id, chat_host_id, chat_type, community_id, topic_id,
+                platform, request_id, query_text, document_source_id, document_version_id, result_count,
+                max_distance, query_metadata, retrieval_metadata, citations, created_at;"""
+            cursor.execute(
+                insert_sql,
+                (
+                    contract.schema_version,
+                    scope.owner_member_id,
+                    scope.chat_host_id,
+                    scope.chat_type,
+                    scope.community_id,
+                    scope.topic_id,
+                    scope.platform,
+                    contract.request_id,
+                    contract.query_text,
+                    contract.document_source_id,
+                    contract.document_version_id,
+                    contract.result_count,
+                    contract.max_distance,
+                    json.dumps(contract.query_metadata),
+                    json.dumps(contract.retrieval_metadata),
+                    json.dumps(contract.citations),
+                ),
+            )
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            return response
+
+    def updateDocumentVersionParserStatus(
+        self,
+        document_version_id: int,
+        parser_status: str,
+        scope_payload: dict[str, Any],
+        *,
+        parser_name: str | None = None,
+        parser_version: str | None = None,
+        parse_artifact_patch: dict[str, Any] | None = None,
+        record_metadata_patch: dict[str, Any] | None = None,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+    ) -> dict | None:
+        version_id = int(document_version_id)
+        if version_id <= 0:
+            raise ValueError("document_version_id must be greater than zero.")
+        state = self._normalize_document_state(parser_status, "queued")
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        artifact_patch = self._optional_dict(parse_artifact_patch)
+        metadata_patch = self._optional_dict(record_metadata_patch)
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            self._assert_scoped_version_exists(cursor, version_id, scope)
+            update_sql = """UPDATE document_versions
+            SET parser_status = %s,
+                parser_name = COALESCE(%s, parser_name),
+                parser_version = COALESCE(%s, parser_version),
+                parse_artifact = COALESCE(parse_artifact, '{}'::jsonb) || %s::jsonb,
+                record_metadata = COALESCE(record_metadata, '{}'::jsonb) || %s::jsonb
+            WHERE document_version_id = %s
+            RETURNING document_version_id, document_source_id, schema_version, owner_member_id, chat_host_id, chat_type,
+                community_id, topic_id, platform, version_number, source_sha256, parser_name, parser_version, parser_status,
+                parse_artifact, record_metadata, created_at;"""
+            cursor.execute(
+                update_sql,
+                (
+                    state,
+                    str(parser_name).strip() if parser_name is not None else None,
+                    str(parser_version).strip() if parser_version is not None else None,
+                    json.dumps(artifact_patch),
+                    json.dumps(metadata_patch),
+                    version_id,
+                ),
+            )
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            return response
+
+    def findLatestDocumentSourceByDigest(
+        self,
+        scope_payload: dict[str, Any],
+        source_sha256: str,
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+        source_name: str | None = None,
+    ) -> dict | None:
+        digest = str(source_sha256 or "").strip().lower()
+        if not digest:
+            return None
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            where_sql, where_params = build_scope_where_clause(scope)
+            query_sql = (
+                "SELECT document_source_id, schema_version, owner_member_id, chat_host_id, chat_type, community_id, "
+                "topic_id, platform, source_external_id, source_name, source_mime, source_sha256, source_size_bytes, "
+                "source_uri, source_state, source_metadata, created_at, updated_at "
+                "FROM document_sources WHERE "
+                + where_sql
+                + " AND source_sha256 = %s AND source_state <> 'deleted'"
+            )
+            params: list[Any] = [*where_params, digest]
+            source_name_text = str(source_name or "").strip()
+            if source_name_text:
+                query_sql += " AND source_name = %s"
+                params.append(source_name_text)
+            query_sql += " ORDER BY created_at DESC LIMIT 1"
+            cursor.execute(query_sql, tuple(params))
+            response = cursor.fetchone()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            return response
+
+    def nextDocumentVersionNumber(
+        self,
+        document_source_id: int,
+        scope_payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+    ) -> int:
+        source_id = int(document_source_id)
+        if source_id <= 0:
+            raise ValueError("document_source_id must be greater than zero.")
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        next_version = 1
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            self._assert_scoped_source_exists(cursor, source_id, scope)
+            where_sql, where_params = build_scope_where_clause(scope)
+            query_sql = (
+                "SELECT COALESCE(MAX(version_number), 0) AS max_version "
+                "FROM document_versions "
+                "WHERE document_source_id = %s AND "
+                + where_sql
+            )
+            cursor.execute(query_sql, (source_id, *where_params))
+            row = cursor.fetchone()
+            if isinstance(row, dict):
+                next_version = int(row.get("max_version", 0) or 0) + 1
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            return max(1, int(next_version))
+
+    def createDocumentStorageObject(
+        self,
+        payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+    ) -> dict | None:
+        scope = self._resolved_scope(
+            payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        source_id = int(payload.get("document_source_id", 0) or 0)
+        if source_id <= 0:
+            raise ValueError("document_source_id is required.")
+        storage_backend = str(payload.get("storage_backend") or "local_fs").strip().lower()
+        storage_key = str(payload.get("storage_key") or "").strip()
+        if not storage_key:
+            raise ValueError("storage_key is required.")
+        file_name = str(payload.get("file_name") or "").strip()
+        if not file_name:
+            raise ValueError("file_name is required.")
+        file_sha256 = str(payload.get("file_sha256") or "").strip().lower()
+        if not file_sha256:
+            raise ValueError("file_sha256 is required.")
+        try:
+            file_size_bytes = int(payload.get("file_size_bytes", 0))
+        except (TypeError, ValueError):
+            file_size_bytes = -1
+        if file_size_bytes < 0:
+            raise ValueError("file_size_bytes must be zero or greater.")
+        try:
+            object_state = self._normalize_document_state(payload.get("object_state"), "received")
+        except ValueError as error:
+            raise ValueError(str(error)) from None
+
+        record_metadata = self._optional_dict(payload.get("record_metadata"))
+        retention_until = self._optional_iso_timestamp(payload.get("retention_until"))
+        deleted_at = self._optional_iso_timestamp(payload.get("deleted_at"))
+        schema_version = int(payload.get("schema_version", 1) or 1)
+
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            self._assert_scoped_source_exists(cursor, source_id, scope)
+            insert_sql = """INSERT INTO document_storage_objects (
+                document_source_id, schema_version, owner_member_id, chat_host_id, chat_type, community_id, topic_id,
+                platform, storage_backend, storage_key, storage_path, object_state, file_name, file_mime, file_sha256,
+                file_size_bytes, dedupe_status, retention_until, deleted_at, record_metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING storage_object_id, document_source_id, schema_version, owner_member_id, chat_host_id, chat_type,
+                community_id, topic_id, platform, storage_backend, storage_key, storage_path, object_state, file_name,
+                file_mime, file_sha256, file_size_bytes, dedupe_status, retention_until, deleted_at, record_metadata,
+                created_at, updated_at;"""
+            cursor.execute(
+                insert_sql,
+                (
+                    source_id,
+                    schema_version,
+                    scope.owner_member_id,
+                    scope.chat_host_id,
+                    scope.chat_type,
+                    scope.community_id,
+                    scope.topic_id,
+                    scope.platform,
+                    storage_backend,
+                    storage_key,
+                    str(payload.get("storage_path") or "").strip() or None,
+                    object_state,
+                    file_name,
+                    str(payload.get("file_mime") or "").strip().lower() or None,
+                    file_sha256,
+                    file_size_bytes,
+                    str(payload.get("dedupe_status") or "new").strip().lower(),
+                    retention_until,
+                    deleted_at,
+                    json.dumps(record_metadata),
+                ),
+            )
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            return response
+
+    def updateDocumentSourceState(
+        self,
+        document_source_id: int,
+        source_state: str,
+        scope_payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+        metadata_patch: dict[str, Any] | None = None,
+    ) -> dict | None:
+        source_id = int(document_source_id)
+        if source_id <= 0:
+            raise ValueError("document_source_id must be greater than zero.")
+        state = self._normalize_document_state(source_state, "queued")
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            self._assert_scoped_source_exists(cursor, source_id, scope)
+            patch = self._optional_dict(metadata_patch)
+            if patch:
+                update_sql = """UPDATE document_sources
+                SET source_state = %s,
+                    source_metadata = COALESCE(source_metadata, '{}'::jsonb) || %s::jsonb,
+                    updated_at = NOW()
+                WHERE document_source_id = %s
+                RETURNING document_source_id, schema_version, owner_member_id, chat_host_id, chat_type, community_id,
+                    topic_id, platform, source_external_id, source_name, source_mime, source_sha256, source_size_bytes,
+                    source_uri, source_state, source_metadata, created_at, updated_at;"""
+                cursor.execute(update_sql, (state, json.dumps(patch), source_id))
+            else:
+                update_sql = """UPDATE document_sources
+                SET source_state = %s, updated_at = NOW()
+                WHERE document_source_id = %s
+                RETURNING document_source_id, schema_version, owner_member_id, chat_host_id, chat_type, community_id,
+                    topic_id, platform, source_external_id, source_name, source_mime, source_sha256, source_size_bytes,
+                    source_uri, source_state, source_metadata, created_at, updated_at;"""
+                cursor.execute(update_sql, (state, source_id))
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            return response
+
+    def updateDocumentStorageObjectState(
+        self,
+        storage_object_id: int,
+        object_state: str,
+        scope_payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+    ) -> dict | None:
+        object_id = int(storage_object_id)
+        if object_id <= 0:
+            raise ValueError("storage_object_id must be greater than zero.")
+        state = self._normalize_document_state(object_state, "queued")
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            self._assert_scoped_storage_object_exists(cursor, object_id, scope)
+            deleted_at = datetime.now(timezone.utc) if state == "deleted" else None
+            update_sql = """UPDATE document_storage_objects
+            SET object_state = %s,
+                deleted_at = %s,
+                updated_at = NOW()
+            WHERE storage_object_id = %s
+            RETURNING storage_object_id, document_source_id, schema_version, owner_member_id, chat_host_id, chat_type,
+                community_id, topic_id, platform, storage_backend, storage_key, storage_path, object_state, file_name,
+                file_mime, file_sha256, file_size_bytes, dedupe_status, retention_until, deleted_at, record_metadata,
+                created_at, updated_at;"""
+            cursor.execute(update_sql, (state, deleted_at, object_id))
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            return response
+
+    def enqueueDocumentIngestionJob(
+        self,
+        payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+    ) -> dict | None:
+        scope = self._resolved_scope(
+            payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        source_id = self._safe_positive_int(payload.get("document_source_id"), 0)
+        version_id = self._safe_positive_int(payload.get("document_version_id"), 0)
+        if source_id <= 0 or version_id <= 0:
+            raise ValueError("document_source_id and document_version_id are required.")
+
+        storage_object_id_raw = payload.get("storage_object_id")
+        storage_object_id = None
+        if storage_object_id_raw is not None and str(storage_object_id_raw).strip() != "":
+            storage_object_id = self._safe_positive_int(storage_object_id_raw, 0)
+            if storage_object_id <= 0:
+                raise ValueError("storage_object_id must be greater than zero when provided.")
+
+        pipeline_version = str(payload.get("pipeline_version") or "v1").strip().lower() or "v1"
+        idempotency_key = str(payload.get("idempotency_key") or "").strip()
+        if not idempotency_key:
+            idempotency_key = f"{source_id}:{version_id}:{pipeline_version}"
+
+        job_status = self._normalize_ingestion_job_status(payload.get("job_status"), "queued")
+        priority = self._safe_non_negative_int(payload.get("priority"), 100)
+        max_attempts = self._safe_positive_int(payload.get("max_attempts"), 3)
+        schema_version = self._safe_positive_int(payload.get("schema_version"), 1)
+        available_at = self._optional_iso_timestamp(payload.get("available_at"))
+        scheduled_at = self._optional_iso_timestamp(payload.get("scheduled_at")) or datetime.now(timezone.utc)
+        metadata = self._optional_dict(payload.get("record_metadata"))
+
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            self._assert_scoped_source_exists(cursor, source_id, scope)
+            self._assert_scoped_version_exists(cursor, version_id, scope)
+            if storage_object_id is not None:
+                self._assert_scoped_storage_object_exists(cursor, storage_object_id, scope)
+
+            insert_sql = """INSERT INTO document_ingestion_jobs (
+                document_source_id, document_version_id, storage_object_id, schema_version,
+                owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform,
+                pipeline_version, idempotency_key, job_status, priority, max_attempts,
+                available_at, scheduled_at, record_metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (document_source_id, document_version_id, pipeline_version)
+            DO UPDATE SET
+                updated_at = NOW(),
+                record_metadata = COALESCE(document_ingestion_jobs.record_metadata, '{}'::jsonb) || EXCLUDED.record_metadata
+            RETURNING ingestion_job_id, document_source_id, document_version_id, storage_object_id, schema_version,
+                owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform, pipeline_version,
+                idempotency_key, job_status, priority, attempt_count, max_attempts, available_at, scheduled_at,
+                lease_owner, lease_expires_at, heartbeat_at, last_error, last_error_context, dead_letter_reason,
+                cancel_requested, cancelled_at, completed_at, record_metadata, created_at, updated_at;"""
+            cursor.execute(
+                insert_sql,
+                (
+                    source_id,
+                    version_id,
+                    storage_object_id,
+                    schema_version,
+                    scope.owner_member_id,
+                    scope.chat_host_id,
+                    scope.chat_type,
+                    scope.community_id,
+                    scope.topic_id,
+                    scope.platform,
+                    pipeline_version,
+                    idempotency_key,
+                    job_status,
+                    priority,
+                    max_attempts,
+                    available_at or datetime.now(timezone.utc),
+                    scheduled_at,
+                    json.dumps(metadata),
+                ),
+            )
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def getDocumentIngestionJobs(
+        self,
+        scope_payload: dict[str, Any],
+        *,
+        statuses: list[str] | tuple[str, ...] | None = None,
+        document_source_id: int | None = None,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+        limit: int | None = None,
+    ) -> list:
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        query_limit = self._safe_limit(limit, default=50)
+        response: list = list()
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            where_sql, where_params = build_scope_where_clause(scope)
+            query_sql = (
+                "SELECT ingestion_job_id, document_source_id, document_version_id, storage_object_id, schema_version, "
+                "owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform, pipeline_version, idempotency_key, "
+                "job_status, priority, attempt_count, max_attempts, available_at, scheduled_at, lease_owner, lease_expires_at, "
+                "heartbeat_at, last_error, last_error_context, dead_letter_reason, cancel_requested, cancelled_at, completed_at, "
+                "record_metadata, created_at, updated_at "
+                "FROM document_ingestion_jobs WHERE "
+                + where_sql
+            )
+            params: list[Any] = list(where_params)
+            status_values = [self._normalize_ingestion_job_status(item) for item in (statuses or []) if str(item).strip()]
+            if status_values:
+                query_sql += " AND job_status = ANY(%s)"
+                params.append(status_values)
+            if document_source_id is not None:
+                source_id = self._safe_positive_int(document_source_id, 0)
+                if source_id > 0:
+                    query_sql += " AND document_source_id = %s"
+                    params.append(source_id)
+            query_sql += " ORDER BY created_at DESC LIMIT %s"
+            params.append(query_limit)
+            cursor.execute(query_sql, tuple(params))
+            results = cursor.fetchall()
+            response = self._accessPolicy.filter_records(results, scope=scope)
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def getDocumentIngestionJobByID(
+        self,
+        ingestion_job_id: int,
+        scope_payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+    ) -> dict | None:
+        job_id = self._safe_positive_int(ingestion_job_id, 0)
+        if job_id <= 0:
+            return None
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            where_sql, where_params = build_scope_where_clause(scope)
+            query_sql = (
+                "SELECT ingestion_job_id, document_source_id, document_version_id, storage_object_id, schema_version, "
+                "owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform, pipeline_version, idempotency_key, "
+                "job_status, priority, attempt_count, max_attempts, available_at, scheduled_at, lease_owner, lease_expires_at, "
+                "heartbeat_at, last_error, last_error_context, dead_letter_reason, cancel_requested, cancelled_at, completed_at, "
+                "record_metadata, created_at, updated_at "
+                "FROM document_ingestion_jobs WHERE ingestion_job_id = %s AND "
+                + where_sql
+                + " LIMIT 1"
+            )
+            cursor.execute(query_sql, (job_id, *where_params))
+            response = cursor.fetchone()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def cancelDocumentIngestionJob(
+        self,
+        ingestion_job_id: int,
+        scope_payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+        reason: str = "",
+    ) -> dict | None:
+        job_id = self._safe_positive_int(ingestion_job_id, 0)
+        if job_id <= 0:
+            return None
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            self._assert_scoped_ingestion_job_exists(cursor, job_id, scope)
+            update_sql = """UPDATE document_ingestion_jobs
+            SET cancel_requested = TRUE,
+                job_status = CASE WHEN job_status = 'completed' THEN 'completed' ELSE 'cancelled' END,
+                cancelled_at = CASE WHEN cancelled_at IS NULL THEN NOW() ELSE cancelled_at END,
+                dead_letter_reason = CASE WHEN dead_letter_reason IS NULL OR dead_letter_reason = '' THEN %s ELSE dead_letter_reason END,
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                heartbeat_at = NULL,
+                updated_at = NOW()
+            WHERE ingestion_job_id = %s
+            RETURNING ingestion_job_id, document_source_id, document_version_id, storage_object_id, schema_version,
+                owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform, pipeline_version, idempotency_key,
+                job_status, priority, attempt_count, max_attempts, available_at, scheduled_at, lease_owner, lease_expires_at,
+                heartbeat_at, last_error, last_error_context, dead_letter_reason, cancel_requested, cancelled_at, completed_at,
+                record_metadata, created_at, updated_at;"""
+            cursor.execute(update_sql, (str(reason or "").strip() or "cancelled_by_operator", job_id))
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def requeueDocumentIngestionJob(
+        self,
+        ingestion_job_id: int,
+        scope_payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+    ) -> dict | None:
+        job_id = self._safe_positive_int(ingestion_job_id, 0)
+        if job_id <= 0:
+            return None
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            self._assert_scoped_ingestion_job_exists(cursor, job_id, scope)
+            update_sql = """UPDATE document_ingestion_jobs
+            SET job_status = 'queued',
+                available_at = NOW(),
+                cancel_requested = FALSE,
+                cancelled_at = NULL,
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                heartbeat_at = NULL,
+                dead_letter_reason = NULL,
+                last_error = NULL,
+                last_error_context = '{}'::jsonb,
+                updated_at = NOW()
+            WHERE ingestion_job_id = %s
+            RETURNING ingestion_job_id, document_source_id, document_version_id, storage_object_id, schema_version,
+                owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform, pipeline_version, idempotency_key,
+                job_status, priority, attempt_count, max_attempts, available_at, scheduled_at, lease_owner, lease_expires_at,
+                heartbeat_at, last_error, last_error_context, dead_letter_reason, cancel_requested, cancelled_at, completed_at,
+                record_metadata, created_at, updated_at;"""
+            cursor.execute(update_sql, (job_id,))
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def leaseNextDocumentIngestionJob(
+        self,
+        *,
+        worker_id: str,
+        lease_seconds: int = 45,
+    ) -> dict | None:
+        worker = str(worker_id or "").strip() or "worker"
+        lease = max(5, int(lease_seconds))
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            self._apply_scope_bypass_settings(cursor)
+            lease_sql = """WITH candidate AS (
+                SELECT ingestion_job_id
+                FROM document_ingestion_jobs
+                WHERE job_status IN ('queued', 'retry_wait')
+                    AND cancel_requested = FALSE
+                    AND available_at <= NOW()
+                    AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+                ORDER BY priority ASC, available_at ASC, ingestion_job_id ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE document_ingestion_jobs AS job
+            SET job_status = 'leased',
+                lease_owner = %s,
+                lease_expires_at = NOW() + (%s * INTERVAL '1 second'),
+                heartbeat_at = NOW(),
+                updated_at = NOW()
+            FROM candidate
+            WHERE job.ingestion_job_id = candidate.ingestion_job_id
+            RETURNING job.ingestion_job_id, job.document_source_id, job.document_version_id, job.storage_object_id,
+                job.schema_version, job.owner_member_id, job.chat_host_id, job.chat_type, job.community_id, job.topic_id,
+                job.platform, job.pipeline_version, job.idempotency_key, job.job_status, job.priority, job.attempt_count,
+                job.max_attempts, job.available_at, job.scheduled_at, job.lease_owner, job.lease_expires_at,
+                job.heartbeat_at, job.last_error, job.last_error_context, job.dead_letter_reason, job.cancel_requested,
+                job.cancelled_at, job.completed_at, job.record_metadata, job.created_at, job.updated_at;"""
+            cursor.execute(lease_sql, (worker, lease))
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def heartbeatDocumentIngestionJob(
+        self,
+        ingestion_job_id: int,
+        *,
+        worker_id: str,
+        lease_seconds: int = 45,
+    ) -> dict | None:
+        job_id = self._safe_positive_int(ingestion_job_id, 0)
+        if job_id <= 0:
+            return None
+        worker = str(worker_id or "").strip() or "worker"
+        lease = max(5, int(lease_seconds))
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            self._apply_scope_bypass_settings(cursor)
+            update_sql = """UPDATE document_ingestion_jobs
+            SET heartbeat_at = NOW(),
+                lease_expires_at = NOW() + (%s * INTERVAL '1 second'),
+                updated_at = NOW()
+            WHERE ingestion_job_id = %s
+                AND lease_owner = %s
+                AND job_status IN ('leased', 'running')
+            RETURNING ingestion_job_id, document_source_id, document_version_id, storage_object_id, schema_version,
+                owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform, pipeline_version, idempotency_key,
+                job_status, priority, attempt_count, max_attempts, available_at, scheduled_at, lease_owner, lease_expires_at,
+                heartbeat_at, last_error, last_error_context, dead_letter_reason, cancel_requested, cancelled_at, completed_at,
+                record_metadata, created_at, updated_at;"""
+            cursor.execute(update_sql, (lease, job_id, worker))
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def markDocumentIngestionJobRunning(
+        self,
+        ingestion_job_id: int,
+        *,
+        worker_id: str,
+    ) -> dict | None:
+        job_id = self._safe_positive_int(ingestion_job_id, 0)
+        if job_id <= 0:
+            return None
+        worker = str(worker_id or "").strip() or "worker"
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            self._apply_scope_bypass_settings(cursor)
+            update_sql = """UPDATE document_ingestion_jobs
+            SET job_status = 'running',
+                attempt_count = attempt_count + 1,
+                heartbeat_at = NOW(),
+                updated_at = NOW()
+            WHERE ingestion_job_id = %s
+                AND lease_owner = %s
+                AND job_status IN ('leased', 'retry_wait', 'queued')
+            RETURNING ingestion_job_id, document_source_id, document_version_id, storage_object_id, schema_version,
+                owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform, pipeline_version, idempotency_key,
+                job_status, priority, attempt_count, max_attempts, available_at, scheduled_at, lease_owner, lease_expires_at,
+                heartbeat_at, last_error, last_error_context, dead_letter_reason, cancel_requested, cancelled_at, completed_at,
+                record_metadata, created_at, updated_at;"""
+            cursor.execute(update_sql, (job_id, worker))
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def completeDocumentIngestionJob(
+        self,
+        ingestion_job_id: int,
+        *,
+        worker_id: str,
+        metadata_patch: dict[str, Any] | None = None,
+    ) -> dict | None:
+        job_id = self._safe_positive_int(ingestion_job_id, 0)
+        if job_id <= 0:
+            return None
+        worker = str(worker_id or "").strip() or "worker"
+        patch = self._optional_dict(metadata_patch)
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            self._apply_scope_bypass_settings(cursor)
+            update_sql = """UPDATE document_ingestion_jobs
+            SET job_status = 'completed',
+                completed_at = NOW(),
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                heartbeat_at = NULL,
+                dead_letter_reason = NULL,
+                cancel_requested = FALSE,
+                cancelled_at = NULL,
+                last_error = NULL,
+                last_error_context = '{}'::jsonb,
+                record_metadata = COALESCE(record_metadata, '{}'::jsonb) || %s::jsonb,
+                updated_at = NOW()
+            WHERE ingestion_job_id = %s
+                AND lease_owner = %s
+            RETURNING ingestion_job_id, document_source_id, document_version_id, storage_object_id, schema_version,
+                owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform, pipeline_version, idempotency_key,
+                job_status, priority, attempt_count, max_attempts, available_at, scheduled_at, lease_owner, lease_expires_at,
+                heartbeat_at, last_error, last_error_context, dead_letter_reason, cancel_requested, cancelled_at, completed_at,
+                record_metadata, created_at, updated_at;"""
+            cursor.execute(update_sql, (json.dumps(patch), job_id, worker))
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def failDocumentIngestionJob(
+        self,
+        ingestion_job_id: int,
+        *,
+        worker_id: str,
+        error_message: str,
+        error_context: dict[str, Any] | None = None,
+        retry_base_seconds: int = 5,
+        retry_max_seconds: int = 300,
+    ) -> dict | None:
+        job_id = self._safe_positive_int(ingestion_job_id, 0)
+        if job_id <= 0:
+            return None
+        worker = str(worker_id or "").strip() or "worker"
+        error_text = str(error_message or "").strip() or "ingestion_failure"
+        context_payload = self._optional_dict(error_context)
+        base = max(1, int(retry_base_seconds))
+        ceiling = max(base, int(retry_max_seconds))
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            self._apply_scope_bypass_settings(cursor)
+            cursor.execute(
+                """SELECT attempt_count, max_attempts
+                FROM document_ingestion_jobs
+                WHERE ingestion_job_id = %s
+                    AND lease_owner = %s
+                LIMIT 1""",
+                (job_id, worker),
+            )
+            current = cursor.fetchone()
+            if not isinstance(current, dict):
+                connection.rollback()
+                cursor.close()
+                return None
+            attempt_count = self._safe_non_negative_int(current.get("attempt_count"), 0)
+            max_attempts = self._safe_positive_int(current.get("max_attempts"), 3)
+            can_retry = attempt_count < max_attempts
+            backoff_seconds = min(ceiling, base * (2 ** max(0, attempt_count - 1)))
+            if can_retry:
+                update_sql = """UPDATE document_ingestion_jobs
+                SET job_status = 'retry_wait',
+                    available_at = NOW() + (%s * INTERVAL '1 second'),
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    heartbeat_at = NULL,
+                    last_error = %s,
+                    last_error_context = %s::jsonb,
+                    updated_at = NOW()
+                WHERE ingestion_job_id = %s
+                RETURNING ingestion_job_id, document_source_id, document_version_id, storage_object_id, schema_version,
+                    owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform, pipeline_version, idempotency_key,
+                    job_status, priority, attempt_count, max_attempts, available_at, scheduled_at, lease_owner, lease_expires_at,
+                    heartbeat_at, last_error, last_error_context, dead_letter_reason, cancel_requested, cancelled_at, completed_at,
+                    record_metadata, created_at, updated_at;"""
+                cursor.execute(update_sql, (backoff_seconds, error_text, json.dumps(context_payload), job_id))
+            else:
+                update_sql = """UPDATE document_ingestion_jobs
+                SET job_status = 'dead_letter',
+                    dead_letter_reason = %s,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    heartbeat_at = NULL,
+                    last_error = %s,
+                    last_error_context = %s::jsonb,
+                    updated_at = NOW()
+                WHERE ingestion_job_id = %s
+                RETURNING ingestion_job_id, document_source_id, document_version_id, storage_object_id, schema_version,
+                    owner_member_id, chat_host_id, chat_type, community_id, topic_id, platform, pipeline_version, idempotency_key,
+                    job_status, priority, attempt_count, max_attempts, available_at, scheduled_at, lease_owner, lease_expires_at,
+                    heartbeat_at, last_error, last_error_context, dead_letter_reason, cancel_requested, cancelled_at, completed_at,
+                    record_metadata, created_at, updated_at;"""
+                cursor.execute(
+                    update_sql,
+                    (f"max_attempts_exhausted:{error_text}", error_text, json.dumps(context_payload), job_id),
+                )
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def createDocumentIngestionAttempt(
+        self,
+        job_record: dict[str, Any],
+        *,
+        worker_id: str,
+        attempt_status: str = "running",
+    ) -> dict | None:
+        if not isinstance(job_record, dict):
+            return None
+        job_id = self._safe_positive_int(job_record.get("ingestion_job_id"), 0)
+        if job_id <= 0:
+            return None
+        attempt_number = self._safe_positive_int(job_record.get("attempt_count"), 1)
+        status = self._normalize_ingestion_attempt_status(attempt_status, "running")
+        worker = str(worker_id or "").strip() or "worker"
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            self._apply_scope_bypass_settings(cursor)
+            insert_sql = """INSERT INTO document_ingestion_attempts (
+                ingestion_job_id, schema_version, owner_member_id, chat_host_id, chat_type, community_id, topic_id,
+                platform, attempt_number, attempt_status, worker_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (ingestion_job_id, attempt_number)
+            DO UPDATE SET
+                attempt_status = EXCLUDED.attempt_status,
+                worker_id = EXCLUDED.worker_id
+            RETURNING ingestion_attempt_id, ingestion_job_id, schema_version, owner_member_id, chat_host_id, chat_type,
+                community_id, topic_id, platform, attempt_number, attempt_status, worker_id, started_at, finished_at,
+                duration_ms, error_message, error_context, stage_events, created_at;"""
+            cursor.execute(
+                insert_sql,
+                (
+                    job_id,
+                    self._safe_positive_int(job_record.get("schema_version"), 1),
+                    self._safe_positive_int(job_record.get("owner_member_id"), 1),
+                    self._safe_positive_int(job_record.get("chat_host_id"), 1),
+                    str(job_record.get("chat_type") or "member").strip().lower(),
+                    self._safe_non_negative_int(job_record.get("community_id"), 0) or None,
+                    self._safe_non_negative_int(job_record.get("topic_id"), 0) or None,
+                    str(job_record.get("platform") or "web").strip().lower(),
+                    attempt_number,
+                    status,
+                    worker,
+                ),
+            )
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def finishDocumentIngestionAttempt(
+        self,
+        ingestion_attempt_id: int,
+        *,
+        attempt_status: str,
+        error_message: str = "",
+        error_context: dict[str, Any] | None = None,
+        stage_events: list[dict[str, Any]] | None = None,
+        duration_ms: int | None = None,
+    ) -> dict | None:
+        attempt_id = self._safe_positive_int(ingestion_attempt_id, 0)
+        if attempt_id <= 0:
+            return None
+        status = self._normalize_ingestion_attempt_status(attempt_status, "failed")
+        response = None
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            self._apply_scope_bypass_settings(cursor)
+            update_sql = """UPDATE document_ingestion_attempts
+            SET attempt_status = %s,
+                finished_at = NOW(),
+                duration_ms = %s,
+                error_message = %s,
+                error_context = %s::jsonb,
+                stage_events = %s::jsonb
+            WHERE ingestion_attempt_id = %s
+            RETURNING ingestion_attempt_id, ingestion_job_id, schema_version, owner_member_id, chat_host_id, chat_type,
+                community_id, topic_id, platform, attempt_number, attempt_status, worker_id, started_at, finished_at,
+                duration_ms, error_message, error_context, stage_events, created_at;"""
+            cursor.execute(
+                update_sql,
+                (
+                    status,
+                    self._safe_non_negative_int(duration_ms, 0) if duration_ms is not None else None,
+                    str(error_message or "").strip() or None,
+                    json.dumps(self._optional_dict(error_context)),
+                    json.dumps(list(stage_events) if isinstance(stage_events, list) else []),
+                    attempt_id,
+                ),
+            )
+            response = cursor.fetchone()
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def getDocumentIngestionAttempts(
+        self,
+        scope_payload: dict[str, Any],
+        *,
+        ingestion_job_id: int,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+        limit: int | None = None,
+    ) -> list:
+        job_id = self._safe_positive_int(ingestion_job_id, 0)
+        if job_id <= 0:
+            return list()
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        query_limit = self._safe_limit(limit, default=20)
+        response: list = list()
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            where_sql, where_params = build_scope_where_clause(scope)
+            query_sql = (
+                "SELECT ingestion_attempt_id, ingestion_job_id, schema_version, owner_member_id, chat_host_id, chat_type, "
+                "community_id, topic_id, platform, attempt_number, attempt_status, worker_id, started_at, finished_at, "
+                "duration_ms, error_message, error_context, stage_events, created_at "
+                "FROM document_ingestion_attempts WHERE ingestion_job_id = %s AND "
+                + where_sql
+                + " ORDER BY attempt_number DESC LIMIT %s"
+            )
+            cursor.execute(query_sql, (job_id, *where_params, query_limit))
+            results = cursor.fetchall()
+            response = self._accessPolicy.filter_records(results, scope=scope)
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def getDocumentSources(
+        self,
+        scope_payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+        limit: int | None = None,
+    ) -> list:
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        query_limit = self._safe_limit(limit, default=25)
+        response: list = list()
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            where_sql, where_params = build_scope_where_clause(scope)
+            query_sql = (
+                "SELECT document_source_id, schema_version, owner_member_id, chat_host_id, chat_type, community_id, "
+                "topic_id, platform, source_external_id, source_name, source_mime, source_sha256, source_size_bytes, "
+                "source_uri, source_state, source_metadata, created_at, updated_at "
+                "FROM document_sources WHERE "
+                + where_sql
+                + " ORDER BY created_at DESC LIMIT %s"
+            )
+            cursor.execute(query_sql, (*where_params, query_limit))
+            results = cursor.fetchall()
+            response = self._accessPolicy.filter_records(results, scope=scope)
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            return response
+
+    def getDocumentVersions(
+        self,
+        scope_payload: dict[str, Any],
+        *,
+        document_source_id: int | None = None,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+        limit: int | None = None,
+    ) -> list:
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        query_limit = self._safe_limit(limit, default=25)
+        response: list = list()
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            where_sql, where_params = build_scope_where_clause(scope)
+            query_sql = (
+                "SELECT document_version_id, document_source_id, schema_version, owner_member_id, chat_host_id, chat_type, "
+                "community_id, topic_id, platform, version_number, source_sha256, parser_name, parser_version, parser_status, "
+                "parse_artifact, record_metadata, created_at "
+                "FROM document_versions WHERE "
+                + where_sql
+            )
+            params: list[Any] = list(where_params)
+            if document_source_id is not None:
+                try:
+                    source_id = int(document_source_id)
+                except (TypeError, ValueError):
+                    source_id = 0
+                if source_id <= 0:
+                    return list()
+                query_sql += " AND document_source_id = %s"
+                params.append(source_id)
+            query_sql += " ORDER BY created_at DESC LIMIT %s"
+            params.append(query_limit)
+            cursor.execute(query_sql, tuple(params))
+            results = cursor.fetchall()
+            response = self._accessPolicy.filter_records(results, scope=scope)
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            return response
+
+    def getDocumentStorageObjects(
+        self,
+        scope_payload: dict[str, Any],
+        *,
+        document_source_id: int | None = None,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+        limit: int | None = None,
+    ) -> list:
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        query_limit = self._safe_limit(limit, default=25)
+        response: list = list()
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            where_sql, where_params = build_scope_where_clause(scope)
+            query_sql = (
+                "SELECT storage_object_id, document_source_id, schema_version, owner_member_id, chat_host_id, chat_type, "
+                "community_id, topic_id, platform, storage_backend, storage_key, storage_path, object_state, file_name, "
+                "file_mime, file_sha256, file_size_bytes, dedupe_status, retention_until, deleted_at, record_metadata, "
+                "created_at, updated_at "
+                "FROM document_storage_objects WHERE "
+                + where_sql
+            )
+            params: list[Any] = list(where_params)
+            if document_source_id is not None:
+                try:
+                    source_id = int(document_source_id)
+                except (TypeError, ValueError):
+                    source_id = 0
+                if source_id <= 0:
+                    return list()
+                query_sql += " AND document_source_id = %s"
+                params.append(source_id)
+            query_sql += " ORDER BY created_at DESC LIMIT %s"
+            params.append(query_limit)
+            cursor.execute(query_sql, tuple(params))
+            results = cursor.fetchall()
+            response = self._accessPolicy.filter_records(results, scope=scope)
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
+            return response
+
+    def getDocumentRetrievalEvents(
+        self,
+        scope_payload: dict[str, Any],
+        *,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+        limit: int | None = None,
+    ) -> list:
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        query_limit = self._safe_limit(limit, default=50)
+        response: list = list()
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug(f"PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            where_sql, where_params = build_scope_where_clause(scope)
+            query_sql = (
+                "SELECT retrieval_event_id, schema_version, owner_member_id, chat_host_id, chat_type, community_id, "
+                "topic_id, platform, request_id, query_text, document_source_id, document_version_id, result_count, "
+                "max_distance, query_metadata, retrieval_metadata, citations, created_at "
+                "FROM document_retrieval_events WHERE "
+                + where_sql
+                + " ORDER BY created_at DESC LIMIT %s"
+            )
+            cursor.execute(query_sql, (*where_params, query_limit))
+            results = cursor.fetchall()
+            response = self._accessPolicy.filter_records(results, scope=scope)
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug(f"PostgreSQL connection is closed.")
             return response
 
 
