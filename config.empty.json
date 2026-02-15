@@ -266,6 +266,13 @@
       "chunk_list_items_per_chunk": 12,
       "chunk_table_rows_per_chunk": 20,
       "chunk_code_lines_per_chunk": 20,
+      "taxonomy_enabled": true,
+      "taxonomy_topic_limit": 8,
+      "taxonomy_topic_min_confidence": 0.2,
+      "taxonomy_domain_min_confidence": 0.2,
+      "taxonomy_format_min_confidence": 0.2,
+      "taxonomy_synonym_expansion": true,
+      "taxonomy_max_labels_per_record": 6,
       "structured_csv_max_rows": 2000,
       "structured_csv_max_cols": 32,
       "structured_csv_low_signal_headers": [

@@ -398,6 +398,22 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
+def _optional_str_list(*param_names: str) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for name in param_names:
+        if not str(name).strip():
+            continue
+        for raw_value in request.args.getlist(name):
+            for part in str(raw_value or "").split(","):
+                value = str(part or "").strip().lower()
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                values.append(value)
+    return values
+
+
 def _request_payload_from_form() -> dict[str, Any]:
     payload: dict[str, Any] = {}
     for key in (
@@ -1316,6 +1332,61 @@ def documentTreePreviewAPI():
         return jsonify({"status": "error", "message": str(error)}), 403
 
     return jsonify({"status": "ok", "scope": scope, "tree": tree})
+
+
+@app.get("/api/documents/chunks")
+def documentChunksListAPI():
+    member = _require_member_api()
+    if member is None:
+        return _api_auth_error()
+
+    memberID = int(member.get("member_id", 0))
+    roles = _member_roles(member)
+    try:
+        _, scope = _document_scope_from_request(member)
+    except DocumentScopeValidationError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    try:
+        limit = int(request.args.get("limit", "500"))
+    except ValueError:
+        limit = 500
+
+    version_id = _optional_int(request.args.get("document_version_id"))
+    if version_id is None or version_id <= 0:
+        return jsonify({"status": "error", "message": "document_version_id must be a positive integer."}), 400
+
+    topic_tags = _optional_str_list("topic_tags", "topic_tag", "topic")
+    domain_labels = _optional_str_list("domain_labels", "domain_label", "domain")
+    format_labels = _optional_str_list("format_labels", "format_label", "format")
+
+    try:
+        rows = DocumentManager().getDocumentChunks(
+            {"scope": scope},
+            document_version_id=version_id,
+            topic_tags=topic_tags or None,
+            domain_labels=domain_labels or None,
+            format_labels=format_labels or None,
+            actor_member_id=memberID,
+            actor_roles=roles,
+            limit=limit,
+        )
+    except (DocumentScopeValidationError, PermissionError) as error:
+        return jsonify({"status": "error", "message": str(error)}), 403
+
+    return jsonify(
+        {
+            "status": "ok",
+            "scope": scope,
+            "document_version_id": version_id,
+            "filters": {
+                "topic_tags": topic_tags,
+                "domain_labels": domain_labels,
+                "format_labels": format_labels,
+            },
+            "chunks": rows,
+        }
+    )
 
 
 @app.get("/api/documents/retrieval-events")

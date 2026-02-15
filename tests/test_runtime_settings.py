@@ -119,6 +119,27 @@ class TestRuntimeSettings(unittest.TestCase):
         self.assertEqual(settings["retrieval"]["progressive_history_round_windows_hours"], ["6", "24", "72"])
         self.assertEqual(settings["retrieval"]["progressive_history_match_threshold"], 0.51)
 
+    def test_build_runtime_settings_supports_document_taxonomy_overrides(self):
+        settings = build_runtime_settings(
+            config_data={
+                "runtime": {
+                    "documents": {
+                        "taxonomy_enabled": False,
+                        "taxonomy_topic_limit": 6,
+                        "taxonomy_topic_min_confidence": 0.4,
+                    }
+                }
+            },
+            env_data={
+                "RYO_DOCUMENT_TAXONOMY_ENABLED": "true",
+                "RYO_DOCUMENT_TAXONOMY_TOPIC_LIMIT": "3",
+                "RYO_DOCUMENT_TAXONOMY_TOPIC_MIN_CONFIDENCE": "0.15",
+            },
+        )
+        self.assertTrue(settings["documents"]["taxonomy_enabled"])
+        self.assertEqual(settings["documents"]["taxonomy_topic_limit"], 3)
+        self.assertEqual(settings["documents"]["taxonomy_topic_min_confidence"], 0.15)
+
     def test_build_runtime_settings_supports_personality_overrides(self):
         settings = build_runtime_settings(
             config_data={

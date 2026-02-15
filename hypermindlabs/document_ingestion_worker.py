@@ -22,6 +22,7 @@ from hypermindlabs.document_chunker import (
     build_chunk_artifact_summary,
     build_document_chunks,
 )
+from hypermindlabs.document_metadata import enrich_document_metadata
 from hypermindlabs.document_tree_builder import (
     build_canonical_document_tree,
     build_tree_artifact_summary,
@@ -33,6 +34,11 @@ IngestionJobProcessor = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _as_text(value: Any, default: str = "") -> str:
+    text = str(value if value is not None else "").strip()
+    return text if text else default
 
 
 class DocumentIngestionWorkerCancelled(RuntimeError):
@@ -144,6 +150,18 @@ class DocumentIngestionWorker:
             document_version_id=version_id,
             config_manager=self._config,
         )
+        metadata_enrichment = enrich_document_metadata(
+            canonical_output=canonical_output,
+            tree_payload=tree_payload,
+            chunk_payload=chunk_payload,
+            config_manager=self._config,
+        )
+        tree_payload = self._dict_patch(metadata_enrichment.get("tree_payload"))
+        chunk_payload = self._dict_patch(metadata_enrichment.get("chunk_payload"))
+        metadata_summary = self._dict_patch(metadata_enrichment.get("summary"))
+        source_taxonomy = self._dict_patch(metadata_enrichment.get("source_taxonomy"))
+        version_taxonomy = self._dict_patch(metadata_enrichment.get("version_taxonomy"))
+        tree_summary = build_tree_artifact_summary(tree_payload)
         chunk_summary = build_chunk_artifact_summary(chunk_payload)
         parse_artifact_patch = build_document_parse_artifact_patch(canonical_output)
         artifact = parse_artifact_patch.get("artifact")
@@ -152,6 +170,7 @@ class DocumentIngestionWorker:
             parse_artifact_patch["artifact"] = artifact
         artifact["tree"] = tree_summary
         artifact["chunks"] = chunk_summary
+        artifact["taxonomy"] = metadata_summary
         provenance = dict(canonical_output.get("provenance") or {})
         selected_adapter = str(provenance.get("selected_adapter") or "unknown-parser").strip() or "unknown-parser"
         selected_version = str(provenance.get("selected_adapter_version") or "").strip() or pipeline_version
@@ -171,6 +190,8 @@ class DocumentIngestionWorker:
             "tree_repaired": bool(tree_summary.get("integrity", {}).get("was_repaired")),
             "chunk_count": chunk_summary.get("chunk_count"),
             "chunk_truncated": bool(chunk_summary.get("truncated")),
+            "taxonomy_primary_domain": _as_text(metadata_summary.get("primary_domain"), "general"),
+            "taxonomy_topic_count": len(list(metadata_summary.get("topic_tags") or [])),
         }
         return {
             "parser_name": selected_adapter,
@@ -184,12 +205,14 @@ class DocumentIngestionWorker:
                 "profile_summary": dict(provenance.get("profile_summary") or {}),
                 "tree": tree_summary,
                 "chunks": chunk_summary,
+                "taxonomy": metadata_summary,
             },
             "source_metadata_patch": {
                 "ingestion": {
                     **metadata_common,
                     "status": "parsed",
-                }
+                },
+                "taxonomy": source_taxonomy or metadata_summary,
             },
             "storage_metadata_patch": {
                 "ingestion": {
@@ -204,6 +227,7 @@ class DocumentIngestionWorker:
                 },
                 "tree": tree_summary,
                 "chunks": chunk_summary,
+                "taxonomy": version_taxonomy or metadata_summary,
             },
         }
 

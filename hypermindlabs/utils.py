@@ -156,6 +156,7 @@ STARTUP_CORE_MIGRATIONS: tuple[str, ...] = (
     "098_document_ingestion_attempts.sql",
     "099_document_node_edges.sql",
     "100_document_chunk_metadata.sql",
+    "101_document_metadata_taxonomy.sql",
 )
 STARTUP_VECTOR_MIGRATIONS: tuple[str, ...] = (
     "011_create_vector_extension.sql",
@@ -3735,6 +3736,7 @@ class DocumentManager:
                 execute_migration(cursor, "098_document_ingestion_attempts.sql")
                 execute_migration(cursor, "099_document_node_edges.sql")
                 execute_migration(cursor, "100_document_chunk_metadata.sql")
+                execute_migration(cursor, "101_document_metadata_taxonomy.sql")
 
                 connection.commit()
                 cursor.close()
@@ -5875,6 +5877,9 @@ class DocumentManager:
         scope_payload: dict[str, Any],
         *,
         document_version_id: int,
+        topic_tags: list[str] | tuple[str, ...] | None = None,
+        domain_labels: list[str] | tuple[str, ...] | None = None,
+        format_labels: list[str] | tuple[str, ...] | None = None,
         actor_member_id: int | None = None,
         actor_roles: list[str] | tuple[str, ...] | None = None,
         limit: int | None = None,
@@ -5908,9 +5913,35 @@ class DocumentManager:
                 "LEFT JOIN document_nodes n ON n.document_node_id = c.document_node_id "
                 "WHERE c.document_version_id = %s AND "
                 + where_sql
-                + " ORDER BY c.chunk_index ASC, c.document_chunk_id ASC LIMIT %s"
             )
-            cursor.execute(query_sql, (version_id, *where_params, query_limit))
+            params: list[Any] = [version_id, *where_params]
+            normalized_topic_tags = [
+                str(item).strip().lower()
+                for item in list(topic_tags or [])
+                if str(item).strip()
+            ]
+            normalized_domain_labels = [
+                str(item).strip().lower()
+                for item in list(domain_labels or [])
+                if str(item).strip()
+            ]
+            normalized_format_labels = [
+                str(item).strip().lower()
+                for item in list(format_labels or [])
+                if str(item).strip()
+            ]
+            if normalized_topic_tags:
+                query_sql += " AND COALESCE(c.chunk_metadata->'topic_tags', '[]'::jsonb) ?| %s"
+                params.append(normalized_topic_tags)
+            if normalized_domain_labels:
+                query_sql += " AND COALESCE(c.chunk_metadata->'domain_labels', '[]'::jsonb) ?| %s"
+                params.append(normalized_domain_labels)
+            if normalized_format_labels:
+                query_sql += " AND COALESCE(c.chunk_metadata->'format_labels', '[]'::jsonb) ?| %s"
+                params.append(normalized_format_labels)
+            query_sql += " ORDER BY c.chunk_index ASC, c.document_chunk_id ASC LIMIT %s"
+            params.append(query_limit)
+            cursor.execute(query_sql, tuple(params))
             results = cursor.fetchall()
             response = self._accessPolicy.filter_records(results, scope=scope)
             cursor.close()
