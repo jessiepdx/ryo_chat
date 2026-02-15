@@ -148,6 +148,7 @@ class _FakeDocumentManager:
         self.source_updates: list[dict[str, Any]] = []
         self.storage_updates: list[dict[str, Any]] = []
         self.tree_replacements: list[dict[str, Any]] = []
+        self.chunk_replacements: list[dict[str, Any]] = []
         self.storage_rows: list[dict[str, Any]] = []
 
     def updateDocumentVersionParserStatus(
@@ -228,6 +229,23 @@ class _FakeDocumentManager:
         payload["node_count"] = len(payload["nodes"])
         payload["edge_count"] = len(payload["edges"])
         self.tree_replacements.append(payload)
+        return payload
+
+    def replaceDocumentVersionChunks(
+        self,
+        document_version_id: int,
+        *,
+        scope_payload: dict[str, Any],
+        chunks: list[dict[str, Any]] | None,
+        **__: Any,
+    ) -> dict[str, Any]:
+        payload = {
+            "document_version_id": int(document_version_id),
+            "scope": dict(scope_payload.get("scope", {})),
+            "chunks": list(chunks or []),
+        }
+        payload["chunk_count"] = len(payload["chunks"])
+        self.chunk_replacements.append(payload)
         return payload
 
 
@@ -392,6 +410,8 @@ class DocumentIngestionWorkerTests(unittest.TestCase):
             self.assertEqual(len(documents.tree_replacements), 1)
             self.assertGreaterEqual(documents.tree_replacements[0]["node_count"], 2)
             self.assertGreaterEqual(documents.tree_replacements[0]["edge_count"], 1)
+            self.assertEqual(len(documents.chunk_replacements), 1)
+            self.assertGreaterEqual(documents.chunk_replacements[0]["chunk_count"], 1)
 
 
 if __name__ == "__main__":

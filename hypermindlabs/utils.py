@@ -42,6 +42,7 @@ from hypermindlabs.document_access_policy import (
     DocumentScopeAccessError,
 )
 from hypermindlabs.document_contracts import (
+    validate_document_chunk_contract,
     validate_document_node_contract,
     validate_document_node_edge_contract,
     validate_document_retrieval_event_contract,
@@ -154,6 +155,7 @@ STARTUP_CORE_MIGRATIONS: tuple[str, ...] = (
     "097_document_ingestion_jobs.sql",
     "098_document_ingestion_attempts.sql",
     "099_document_node_edges.sql",
+    "100_document_chunk_metadata.sql",
 )
 STARTUP_VECTOR_MIGRATIONS: tuple[str, ...] = (
     "011_create_vector_extension.sql",
@@ -3732,6 +3734,7 @@ class DocumentManager:
                 execute_migration(cursor, "097_document_ingestion_jobs.sql")
                 execute_migration(cursor, "098_document_ingestion_attempts.sql")
                 execute_migration(cursor, "099_document_node_edges.sql")
+                execute_migration(cursor, "100_document_chunk_metadata.sql")
 
                 connection.commit()
                 cursor.close()
@@ -5711,6 +5714,213 @@ class DocumentManager:
             "node_count": len(nodes),
             "edge_count": len(edges),
         }
+
+    def replaceDocumentVersionChunks(
+        self,
+        document_version_id: int,
+        *,
+        scope_payload: dict[str, Any],
+        chunks: list[dict[str, Any]] | None,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any] | None:
+        try:
+            version_id = int(document_version_id)
+        except (TypeError, ValueError):
+            version_id = 0
+        if version_id <= 0:
+            raise ValueError("document_version_id must be greater than zero.")
+
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        scope_dict = scope.to_dict()
+
+        prepared_chunks: list[dict[str, Any]] = []
+        for fallback_index, raw_chunk in enumerate(list(chunks or [])):
+            source = dict(raw_chunk) if isinstance(raw_chunk, dict) else {}
+            payload = dict(source)
+            payload["schema_version"] = int(payload.get("schema_version", 1) or 1)
+            payload["scope"] = scope_dict
+            payload["document_version_id"] = version_id
+            payload["chunk_index"] = int(payload.get("chunk_index", fallback_index) or fallback_index)
+            payload["chunk_metadata"] = self._optional_dict(payload.get("chunk_metadata"))
+            contract = validate_document_chunk_contract(payload)
+            prepared_chunks.append(
+                {
+                    "contract": contract,
+                    "document_node_key": str(source.get("document_node_key") or "").strip(),
+                }
+            )
+
+        response: dict[str, Any] = {
+            "document_version_id": version_id,
+            "chunk_count": 0,
+            "chunks": [],
+        }
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            self._assert_scoped_version_exists(cursor, version_id, scope)
+
+            node_id_by_key: dict[str, int] = {}
+            cursor.execute(
+                """SELECT document_node_id, node_key
+                FROM document_nodes
+                WHERE document_version_id = %s
+                ORDER BY document_node_id ASC""",
+                (version_id,),
+            )
+            for row in cursor.fetchall() or []:
+                if not isinstance(row, dict):
+                    continue
+                node_key = str(row.get("node_key") or "").strip()
+                node_id = int(row.get("document_node_id", 0) or 0)
+                if node_key and node_id > 0:
+                    node_id_by_key[node_key] = node_id
+
+            cursor.execute("DELETE FROM document_chunks WHERE document_version_id = %s", (version_id,))
+            if not prepared_chunks:
+                connection.commit()
+                cursor.close()
+                return response
+
+            insert_sql = """INSERT INTO document_chunks (
+                document_version_id, document_node_id, schema_version, owner_member_id, chat_host_id, chat_type,
+                community_id, topic_id, platform, chunk_key, chunk_index, chunk_text, token_count,
+                start_char, end_char, start_page, end_page, chunk_digest, chunk_metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (document_version_id, chunk_key)
+            DO UPDATE SET
+                document_node_id = EXCLUDED.document_node_id,
+                chunk_index = EXCLUDED.chunk_index,
+                chunk_text = EXCLUDED.chunk_text,
+                token_count = EXCLUDED.token_count,
+                start_char = EXCLUDED.start_char,
+                end_char = EXCLUDED.end_char,
+                start_page = EXCLUDED.start_page,
+                end_page = EXCLUDED.end_page,
+                chunk_digest = EXCLUDED.chunk_digest,
+                chunk_metadata = EXCLUDED.chunk_metadata
+            RETURNING document_chunk_id, document_version_id, document_node_id, schema_version, owner_member_id,
+                chat_host_id, chat_type, community_id, topic_id, platform, chunk_key, chunk_index, chunk_text,
+                token_count, start_char, end_char, start_page, end_page, chunk_digest, chunk_metadata, created_at;"""
+            rows: list[dict[str, Any]] = []
+            for item in prepared_chunks:
+                contract = item["contract"]
+                chunk_node_id = contract.document_node_id
+                chunk_node_key = str(item.get("document_node_key") or "").strip()
+                if chunk_node_id is None and chunk_node_key:
+                    mapped_id = int(node_id_by_key.get(chunk_node_key, 0) or 0)
+                    if mapped_id > 0:
+                        chunk_node_id = mapped_id
+                if chunk_node_id is not None and int(chunk_node_id) <= 0:
+                    chunk_node_id = None
+
+                cursor.execute(
+                    insert_sql,
+                    (
+                        version_id,
+                        chunk_node_id,
+                        contract.schema_version,
+                        scope.owner_member_id,
+                        scope.chat_host_id,
+                        scope.chat_type,
+                        scope.community_id,
+                        scope.topic_id,
+                        scope.platform,
+                        contract.chunk_key,
+                        contract.chunk_index,
+                        contract.chunk_text,
+                        contract.token_count,
+                        contract.start_char,
+                        contract.end_char,
+                        contract.start_page,
+                        contract.end_page,
+                        contract.chunk_digest or None,
+                        json.dumps(contract.chunk_metadata),
+                    ),
+                )
+                row = cursor.fetchone()
+                if isinstance(row, dict):
+                    node_id = int(row.get("document_node_id", 0) or 0)
+                    row["document_node_key"] = None
+                    if node_id > 0:
+                        for node_key, mapped_id in node_id_by_key.items():
+                            if mapped_id == node_id:
+                                row["document_node_key"] = node_key
+                                break
+                    rows.append(row)
+
+            response["chunks"] = rows
+            response["chunk_count"] = len(rows)
+            connection.commit()
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+            response = None
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
+
+    def getDocumentChunks(
+        self,
+        scope_payload: dict[str, Any],
+        *,
+        document_version_id: int,
+        actor_member_id: int | None = None,
+        actor_roles: list[str] | tuple[str, ...] | None = None,
+        limit: int | None = None,
+    ) -> list:
+        try:
+            version_id = int(document_version_id)
+        except (TypeError, ValueError):
+            version_id = 0
+        if version_id <= 0:
+            return list()
+        scope = self._resolved_scope(
+            scope_payload,
+            actor_member_id=actor_member_id,
+            actor_roles=actor_roles,
+        )
+        query_limit = self._safe_limit(limit, default=500, max_limit=10000)
+        response: list = list()
+        connection = None
+        try:
+            connection = psycopg.connect(conninfo=ConfigManager()._instance.db_conninfo, row_factory=dict_row)
+            cursor = connection.cursor()
+            logger.debug("PostgreSQL connection established.")
+            apply_pg_scope_settings(cursor, scope)
+            where_sql, where_params = build_scope_where_clause(scope, table_alias="c")
+            query_sql = (
+                "SELECT c.document_chunk_id, c.document_version_id, c.document_node_id, n.node_key AS document_node_key, "
+                "c.schema_version, c.owner_member_id, c.chat_host_id, c.chat_type, c.community_id, c.topic_id, c.platform, "
+                "c.chunk_key, c.chunk_index, c.chunk_text, c.token_count, c.start_char, c.end_char, c.start_page, c.end_page, "
+                "c.chunk_digest, c.chunk_metadata, c.created_at "
+                "FROM document_chunks c "
+                "LEFT JOIN document_nodes n ON n.document_node_id = c.document_node_id "
+                "WHERE c.document_version_id = %s AND "
+                + where_sql
+                + " ORDER BY c.chunk_index ASC, c.document_chunk_id ASC LIMIT %s"
+            )
+            cursor.execute(query_sql, (version_id, *where_params, query_limit))
+            results = cursor.fetchall()
+            response = self._accessPolicy.filter_records(results, scope=scope)
+            cursor.close()
+        except (Exception, psycopg.DatabaseError) as error:
+            logger.error(f"Exception while working with psycopg and PostgreSQL:\n{error}")
+        finally:
+            if connection is not None:
+                connection.close()
+                logger.debug("PostgreSQL connection is closed.")
+            return response
 
     def getDocumentStorageObjects(
         self,

@@ -18,6 +18,10 @@ from hypermindlabs.document_parser.router import (
     DocumentParserRouter,
     DocumentParserRoutingError,
 )
+from hypermindlabs.document_chunker import (
+    build_chunk_artifact_summary,
+    build_document_chunks,
+)
 from hypermindlabs.document_tree_builder import (
     build_canonical_document_tree,
     build_tree_artifact_summary,
@@ -134,12 +138,20 @@ class DocumentIngestionWorker:
             document_version_id=version_id,
         )
         tree_summary = build_tree_artifact_summary(tree_payload)
+        chunk_payload = build_document_chunks(
+            tree_payload=tree_payload,
+            canonical_output=canonical_output,
+            document_version_id=version_id,
+            config_manager=self._config,
+        )
+        chunk_summary = build_chunk_artifact_summary(chunk_payload)
         parse_artifact_patch = build_document_parse_artifact_patch(canonical_output)
         artifact = parse_artifact_patch.get("artifact")
         if not isinstance(artifact, dict):
             artifact = {}
             parse_artifact_patch["artifact"] = artifact
         artifact["tree"] = tree_summary
+        artifact["chunks"] = chunk_summary
         provenance = dict(canonical_output.get("provenance") or {})
         selected_adapter = str(provenance.get("selected_adapter") or "unknown-parser").strip() or "unknown-parser"
         selected_version = str(provenance.get("selected_adapter_version") or "").strip() or pipeline_version
@@ -157,17 +169,21 @@ class DocumentIngestionWorker:
             "tree_node_count": tree_summary.get("node_count"),
             "tree_edge_count": tree_summary.get("edge_count"),
             "tree_repaired": bool(tree_summary.get("integrity", {}).get("was_repaired")),
+            "chunk_count": chunk_summary.get("chunk_count"),
+            "chunk_truncated": bool(chunk_summary.get("truncated")),
         }
         return {
             "parser_name": selected_adapter,
             "parser_version": selected_version,
             "parse_artifact_patch": parse_artifact_patch,
             "tree_payload": tree_payload,
+            "chunk_payload": chunk_payload,
             "job_metadata_patch": {
                 **metadata_common,
                 "route_debug": dict(provenance.get("route_debug") or {}),
                 "profile_summary": dict(provenance.get("profile_summary") or {}),
                 "tree": tree_summary,
+                "chunks": chunk_summary,
             },
             "source_metadata_patch": {
                 "ingestion": {
@@ -187,6 +203,7 @@ class DocumentIngestionWorker:
                     "status": "parsed",
                 },
                 "tree": tree_summary,
+                "chunks": chunk_summary,
             },
         }
 
@@ -583,6 +600,25 @@ class DocumentIngestionWorker:
             tree_metadata["node_count"] = int(tree_write.get("node_count", len(tree_nodes)) or 0)
             tree_metadata["edge_count"] = int(tree_write.get("edge_count", len(tree_edges)) or 0)
             tree_metadata["persisted_at"] = _utc_now_iso()
+
+        chunk_payload = self._dict_patch(processed_payload.get("chunk_payload"))
+        if chunk_payload:
+            chunk_rows = list(chunk_payload.get("chunks") or [])
+            chunk_write = self._documents.replaceDocumentVersionChunks(
+                version_id,
+                scope_payload=scope_payload,
+                chunks=chunk_rows,
+                actor_member_id=actor_member_id,
+                actor_roles=["owner"],
+            )
+            if not isinstance(chunk_write, dict):
+                raise RuntimeError("Failed to persist document chunks.")
+            chunk_metadata = version_metadata_patch.get("chunks")
+            if not isinstance(chunk_metadata, dict):
+                chunk_metadata = {}
+                version_metadata_patch["chunks"] = chunk_metadata
+            chunk_metadata["chunk_count"] = int(chunk_write.get("chunk_count", len(chunk_rows)) or 0)
+            chunk_metadata["persisted_at"] = _utc_now_iso()
 
         self._documents.updateDocumentVersionParserStatus(
             version_id,
